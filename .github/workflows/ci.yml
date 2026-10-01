@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Se activa solo cuando exista go.mod (esqueleto Go llega post-S0)
+      - name: setup go
+        if: hashFiles('go.mod') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: go vet
+        if: hashFiles('go.mod') != ''
+        run: go vet ./...
+
+      - name: gofmt
+        if: hashFiles('go.mod') != ''
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
