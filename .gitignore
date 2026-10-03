@@ -1,0 +1,20 @@
+# Go
+bin/
+*.exe
+*.test
+*.out
+vendor/
+
+# Secretos y entornos locales — NUNCA commitear (repo publico)
+*.env
+!.env.example
+*.pem
+*.key
+*.crt
+
+# SO / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
