@@ -5,10 +5,14 @@ package ports
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/Alejo-Basile/doc-service/internal/domain"
 )
+
+// ErrNotFound se devuelve cuando un recurso no existe.
+var ErrNotFound = errors.New("recurso no encontrado")
 
 // DocumentRepository define las operaciones de persistencia del agregado Document.
 type DocumentRepository interface {
@@ -52,6 +56,7 @@ type ObjectStorage interface {
 
 // PresignPostOptions configura la política de la URL prefirmada.
 type PresignPostOptions struct {
+	Bucket         string
 	MaxSizeBytes   int64
 	ContentType    string
 	Expiration     time.Duration
