@@ -57,14 +57,16 @@ type CreateDocumentRequest struct {
 	SizeBytes int64 `json:"size_bytes,omitempty"`
 }
 
-// CreateDocumentResponse es la respuesta del POST /api/v2/documents.
+// CreateDocumentResponse es la respuesta del POST /api/v2/documents (S3-P2-03).
 type CreateDocumentResponse struct {
-	DocumentID string            `json:"document_id"`
-	Status     string            `json:"status"`
-	UploadURL  string            `json:"upload_url"`
-	Method     string            `json:"method"`
-	Fields     map[string]string `json:"form_fields"`
-	ExpiresIn  int               `json:"expires_in"` // segundos
+	DocumentID      string            `json:"document_id"`
+	Status          string            `json:"status"`
+	UploadURL       string            `json:"upload_url"`
+	Method          string            `json:"method"`
+	Fields          map[string]string `json:"form_fields"`
+	RequiredHeaders map[string]string `json:"required_headers"` // headers que el cliente DEBE enviar
+	ExpiresIn       int               `json:"expires_in"`       // segundos de la URL prefirmada
+	ExpiresAt       string            `json:"expires_at"`       // RFC3339: fin de la ventana de subida + gracia
 }
 
 // CreateDocument maneja POST /api/v2/documents (S3-P2-01, S3-P2-02).
@@ -168,14 +170,7 @@ func (h *DocumentHandler) CreateDocument(c *gin.Context) {
 		"object_key", doc.ObjectKey,
 	)
 
-	c.JSON(http.StatusCreated, CreateDocumentResponse{
-		DocumentID: doc.ID,
-		Status:     string(doc.Status),
-		UploadURL:  result.UploadURL,
-		Method:     "POST",
-		Fields:     result.Fields,
-		ExpiresIn:  int(result.ExpiresIn.Seconds()),
-	})
+	c.JSON(http.StatusCreated, h.buildResponse(doc, result))
 }
 
 // GetDocument maneja GET /api/v2/documents/:id (S2-P2-05).
@@ -233,14 +228,39 @@ func (h *DocumentHandler) respondExisting(c *gin.Context, doc *domain.Document) 
 		return
 	}
 
-	c.JSON(http.StatusOK, CreateDocumentResponse{
-		DocumentID: doc.ID,
-		Status:     string(doc.Status),
-		UploadURL:  result.UploadURL,
-		Method:     "POST",
-		Fields:     result.Fields,
-		ExpiresIn:  int(result.ExpiresIn.Seconds()),
-	})
+	c.JSON(http.StatusOK, h.buildResponse(doc, result))
+}
+
+// buildResponse construye la respuesta de creación con required_headers (S3-P2-03).
+func (h *DocumentHandler) buildResponse(doc *domain.Document, presign *ports.PresignPostResult) CreateDocumentResponse {
+	return CreateDocumentResponse{
+		DocumentID:      doc.ID,
+		Status:          string(doc.Status),
+		UploadURL:       presign.UploadURL,
+		Method:          "POST",
+		Fields:          presign.Fields,
+		RequiredHeaders: requiredHeaders(presign.Fields),
+		ExpiresIn:       int(presign.ExpiresIn.Seconds()),
+		ExpiresAt:       doc.ExpiresAt.Format(time.RFC3339),
+	}
+}
+
+// requiredHeaders extrae los campos de firma S3 que el cliente debe enviar
+// como headers HTTP (SPEC §5.1, S3-P2-03).
+func requiredHeaders(fields map[string]string) map[string]string {
+	required := make(map[string]string)
+	for _, key := range []string{
+		"X-Amz-Algorithm",
+		"X-Amz-Credential",
+		"X-Amz-Date",
+		"policy",
+		"X-Amz-Signature",
+	} {
+		if v, ok := fields[key]; ok {
+			required[key] = v
+		}
+	}
+	return required
 }
 
 // --- helpers ---
