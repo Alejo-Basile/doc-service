@@ -35,6 +35,14 @@ func (s *Server) Engine() *gin.Engine { return s.engine }
 
 // registerRoutes registra todas las rutas del servicio.
 func (s *Server) registerRoutes() {
+	// Middlewares globales: correlation_id → request logging → error logging → recovery.
+	s.engine.Use(
+		CorrelationIDMiddleware(),
+		RequestLoggerMiddleware(),
+		ErrorLogMiddleware(),
+		gin.Recovery(),
+	)
+
 	// Health checks (SPEC §10: /healthz y /readyz deben verificar dependencias reales,
 	// pero en esta fase solo responden proceso vivo).
 	s.engine.GET("/healthz", handleHealthz)
