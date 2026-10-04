@@ -12,32 +12,40 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Alejo-Basile/doc-service/internal/config"
 	httpserver "github.com/Alejo-Basile/doc-service/internal/transport/http"
 )
 
 const shutdownTimeout = 10 * time.Second
 
 func main() {
-	// Logger JSON estructurado (S0-P2-03 completará la propagación de correlation_id).
+	// Logger JSON estructurado.
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 	slog.SetDefault(logger)
 
-	// Configuración básica de arranque (S0-P2-02 agregará validación completa).
-	addr := os.Getenv("HTTP_ADDR")
-	if addr == "" {
-		addr = ":8080"
+	// Fail-fast: si falta una variable obligatoria, abortamos ANTES de abrir puertos.
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Error("configuración inválida, el servicio no puede arrancar",
+			"service", "doc-service",
+			"error", err.Error(),
+		)
+		os.Exit(1)
 	}
-	debug := os.Getenv("DEBUG") == "true"
 
 	slog.Info("iniciando doc-service",
 		"service", "doc-service",
-		"addr", addr,
-		"debug", debug,
+		"addr", cfg.Addr(),
+		"debug", cfg.Debug,
+		"mongo_database", cfg.MongoDatabase,
+		"minio_bucket_raw", cfg.MinIOBucketRaw,
+		"redis_stream_key", cfg.RedisStreamKey,
+		"max_pdf_bytes", cfg.MaxPDFBytes,
 	)
 
-	server := httpserver.NewServer(debug)
+	server := httpserver.NewServer(cfg.Debug)
 
 	// Canal para capturar señales del SO.
 	quit := make(chan os.Signal, 1)
@@ -46,7 +54,7 @@ func main() {
 	// Goroutine del servidor HTTP.
 	errCh := make(chan error, 1)
 	go func() {
-		if err := server.Run(addr); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Run(cfg.Addr()); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
 	}()
@@ -63,7 +71,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	if err := shutdownHTTPServer(server, ctx); err != nil {
+	if err := shutdownHTTPServer(server, cfg.Addr(), ctx); err != nil {
 		slog.Error("error en graceful shutdown", "error", err)
 		os.Exit(1)
 	}
@@ -72,9 +80,9 @@ func main() {
 }
 
 // shutdownHTTPServer orquesta el apagado ordenado del servidor HTTP.
-func shutdownHTTPServer(server *httpserver.Server, ctx context.Context) error {
+func shutdownHTTPServer(server *httpserver.Server, addr string, ctx context.Context) error {
 	httpServer := &http.Server{
-		Addr:    ":8080",
+		Addr:    addr,
 		Handler: server.Handler(),
 	}
 	return httpServer.Shutdown(ctx)
