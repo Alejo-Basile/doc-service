@@ -73,6 +73,16 @@ func (m *mockRepo) ListByCursor(ctx context.Context, filter ports.CursorFilter) 
 	return result, "", nil
 }
 
+func (m *mockRepo) UpdateStatusWithHistory(ctx context.Context, id string, from, to domain.Status, entry domain.StatusEntry, extraSet map[string]any) (bool, error) {
+	m.updateCalls = append(m.updateCalls, updateCall{id: id, from: from, to: to})
+	doc, ok := m.docs[id]
+	if !ok || doc.Status != from {
+		return false, nil
+	}
+	doc.Status = to
+	return true, nil
+}
+
 // mockStorage implementa ports.ObjectStorage para tests.
 type mockStorage struct {
 	pdfHeader []byte
@@ -105,6 +115,10 @@ func (m *mockStorage) PresignGet(ctx context.Context, objectKey string, expiry t
 
 func (m *mockStorage) PresignGetTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
 	return "", nil
+}
+
+func (m *mockStorage) ListObjects(ctx context.Context) ([]ports.ObjectInfo, error) {
+	return nil, nil
 }
 
 func newTestEngine(h *Handler) *gin.Engine {

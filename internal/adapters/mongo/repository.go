@@ -224,7 +224,7 @@ func (r *DocumentRepository) UpdateStatusWithHistory(
 	id string,
 	from, to domain.Status,
 	entry domain.StatusEntry,
-	extraSet bson.M,
+	extraSet map[string]any,
 ) (bool, error) {
 	now := time.Now().UTC()
 	entry.At = now

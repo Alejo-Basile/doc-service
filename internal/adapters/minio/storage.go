@@ -204,3 +204,22 @@ func (o *ObjectStorage) MakeBucket(ctx context.Context, bucket string) error {
 	}
 	return nil
 }
+
+// ListObjects lista todos los objetos del bucket raw (para purga de huérfanos, S4-P2-02).
+func (o *ObjectStorage) ListObjects(ctx context.Context) ([]ports.ObjectInfo, error) {
+	var objects []ports.ObjectInfo
+
+	for obj := range o.client.ListObjects(ctx, o.bucketRaw, miniogo.ListObjectsOptions{}) {
+		if obj.Err != nil {
+			return nil, fmt.Errorf("list objects %s: %w", o.bucketRaw, obj.Err)
+		}
+		objects = append(objects, ports.ObjectInfo{
+			Key:          obj.Key,
+			Size:         obj.Size,
+			ContentType:  obj.ContentType,
+			LastModified: obj.LastModified,
+		})
+	}
+
+	return objects, nil
+}

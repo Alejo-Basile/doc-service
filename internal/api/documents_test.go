@@ -51,6 +51,25 @@ func (m *mockRepo) UpdateStatus(ctx context.Context, id string, from, to domain.
 	return true, nil
 }
 
+func (m *mockRepo) UpdateStatusWithHistory(ctx context.Context, id string, from, to domain.Status, entry domain.StatusEntry, extraSet map[string]any) (bool, error) {
+	doc, ok := m.docs[id]
+	if !ok || doc.Status != from {
+		return false, nil
+	}
+	doc.Status = to
+	entry.At = time.Now().UTC()
+	doc.History = append(doc.History, entry)
+	if entry.Reason != "" && (to == domain.StatusFailed || to == domain.StatusRejected || to == domain.StatusExtractionFailed || to == domain.StatusUploadExpired) {
+		doc.FailureReason = entry.Reason
+	}
+	for k, v := range extraSet {
+		if k == "failure_reason" {
+			doc.FailureReason = fmt.Sprintf("%v", v)
+		}
+	}
+	return true, nil
+}
+
 func (m *mockRepo) List(ctx context.Context, filter ports.ListFilter) ([]*domain.Document, int64, error) {
 	var docs []*domain.Document
 	for _, d := range m.docs {
@@ -117,6 +136,10 @@ func (m *mockStorage) PresignGet(ctx context.Context, objectKey string, expiry t
 
 func (m *mockStorage) PresignGetTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
 	return "https://s3.example.com/extracted-txt/" + objectKey, nil
+}
+
+func (m *mockStorage) ListObjects(ctx context.Context) ([]ports.ObjectInfo, error) {
+	return nil, nil
 }
 
 // --- helpers ---

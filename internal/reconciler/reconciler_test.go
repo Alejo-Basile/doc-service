@@ -73,6 +73,17 @@ func (m *mockRepo) ListByCursor(ctx context.Context, filter ports.CursorFilter) 
 	return result, "", nil
 }
 
+func (m *mockRepo) UpdateStatusWithHistory(ctx context.Context, id string, from, to domain.Status, entry domain.StatusEntry, extraSet map[string]any) (bool, error) {
+	doc, ok := m.docs[id]
+	if !ok || doc.Status != from {
+		return false, nil
+	}
+	doc.Status = to
+	entry.At = time.Now().UTC()
+	doc.History = append(doc.History, entry)
+	return true, nil
+}
+
 // mockStorage implementa ports.ObjectStorage.
 type mockStorage struct {
 	objects map[string]bool // key → exists
@@ -111,6 +122,10 @@ func (m *mockStorage) PresignGetTXT(ctx context.Context, objectKey string, expir
 	return "", nil
 }
 
+func (m *mockStorage) ListObjects(ctx context.Context) ([]ports.ObjectInfo, error) {
+	return nil, nil
+}
+
 // errNotFound simula "not found" del SDK MinIO.
 type notFoundError struct{}
 
@@ -131,7 +146,7 @@ func TestRunOnce_ExpiredPending_ObjectAbsent(t *testing.T) {
 	}
 	repo.docs["doc-expired"] = doc
 
-	r := New(repo, storage, &mockClock{now}, 10*time.Minute, 30*time.Minute)
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute)
 	result, err := r.RunOnce(context.Background())
 	if err != nil {
 		t.Fatalf("RunOnce error: %v", err)
@@ -170,7 +185,7 @@ func TestRunOnce_ExpiredPending_ObjectExists_RecoversToUploaded(t *testing.T) {
 	}
 	repo.docs["doc-1"] = doc
 
-	r := New(repo, storage, &mockClock{now}, 10*time.Minute, 30*time.Minute)
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute)
 	result, err := r.RunOnce(context.Background())
 	if err != nil {
 		t.Fatalf("RunOnce error: %v", err)
@@ -207,7 +222,7 @@ func TestRunOnce_ExpiredPending_ObjectExists_NotPDF_Rejected(t *testing.T) {
 	}
 	repo.docs["doc-1"] = doc
 
-	r := New(repo, storage, &mockClock{now}, 10*time.Minute, 30*time.Minute)
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute)
 	result, err := r.RunOnce(context.Background())
 	if err != nil {
 		t.Fatalf("RunOnce error: %v", err)
@@ -242,7 +257,7 @@ func TestRunOnce_NotExpired_Skipped(t *testing.T) {
 	}
 	repo.docs["doc-active"] = doc
 
-	r := New(repo, storage, &mockClock{now}, 10*time.Minute, 30*time.Minute)
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute)
 	result, err := r.RunOnce(context.Background())
 	if err != nil {
 		t.Fatalf("RunOnce error: %v", err)
@@ -270,7 +285,7 @@ func TestRunOnce_StuckIntermediate_Detected(t *testing.T) {
 	}
 	repo.docs["doc-stuck"] = doc
 
-	r := New(repo, storage, &mockClock{now}, 10*time.Minute, 30*time.Minute)
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute)
 	result, err := r.RunOnce(context.Background())
 	if err != nil {
 		t.Fatalf("RunOnce error: %v", err)
@@ -300,7 +315,7 @@ func TestRunOnce_StuckIntermediate_Recent_NotDetected(t *testing.T) {
 	}
 	repo.docs["doc-recent"] = doc
 
-	r := New(repo, storage, &mockClock{now}, 10*time.Minute, 30*time.Minute)
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute)
 	result, err := r.RunOnce(context.Background())
 	if err != nil {
 		t.Fatalf("RunOnce error: %v", err)

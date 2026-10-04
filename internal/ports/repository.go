@@ -22,6 +22,9 @@ type DocumentRepository interface {
 	// updateOne({_id, status: from}, {$set: {status: to, ...}}).
 	// Devuelve (false, nil) si el filtro no matcheó (documento no está en `from`).
 	UpdateStatus(ctx context.Context, id string, from, to domain.Status, fields map[string]any) (bool, error)
+	// UpdateStatusWithHistory aplica la transición condicional y agrega una
+	// entrada al historial en la misma operación (pipeline update).
+	UpdateStatusWithHistory(ctx context.Context, id string, from, to domain.Status, entry domain.StatusEntry, extraSet map[string]any) (bool, error)
 	List(ctx context.Context, filter ListFilter) ([]*domain.Document, int64, error)
 	// ListByCursor pagina por cursor compuesto (created_at, _id) en orden descendente.
 	// No salta ni repite registros ante inserciones concurrentes (SPEC §5.2).
@@ -66,6 +69,8 @@ type ObjectStorage interface {
 	PresignGet(ctx context.Context, objectKey string, expiry time.Duration) (string, error)
 	// PresignGetTXT genera una URL prefirmada de lectura del bucket extracted-txt.
 	PresignGetTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error)
+	// ListObjects lista todos los objetos del bucket raw (para purga de huérfanos).
+	ListObjects(ctx context.Context) ([]ObjectInfo, error)
 }
 
 // PresignPostOptions configura la política de la URL prefirmada.
@@ -119,3 +124,12 @@ type Clock interface {
 type SystemClock struct{}
 
 func (SystemClock) Now() time.Time { return time.Now().UTC() }
+
+// DistributedLease abstracte un bloqueo distribuido (lease con TTL).
+// Se usa para evitar ejecución concurrente del reconciliador entre réplicas (S4-P2-03).
+type DistributedLease interface {
+	// Acquire intenta adquirir el lease. Devuelve false si otro holder lo tiene.
+	Acquire(ctx context.Context, key string, ttl time.Duration) (bool, error)
+	// Release libera el lease (debe ser el holder actual).
+	Release(ctx context.Context, key string) error
+}

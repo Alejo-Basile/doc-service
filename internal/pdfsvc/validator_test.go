@@ -56,6 +56,10 @@ func (m *mockStorage) PresignGetTXT(ctx context.Context, objectKey string, expir
 	return "", nil
 }
 
+func (m *mockStorage) ListObjects(ctx context.Context) ([]ports.ObjectInfo, error) {
+	return nil, nil
+}
+
 func TestIsPDF_HeaderCorrecto(t *testing.T) {
 	casos := []struct {
 		nombre   string
