@@ -23,6 +23,9 @@ type DocumentRepository interface {
 	// Devuelve (false, nil) si el filtro no matcheó (documento no está en `from`).
 	UpdateStatus(ctx context.Context, id string, from, to domain.Status, fields map[string]any) (bool, error)
 	List(ctx context.Context, filter ListFilter) ([]*domain.Document, int64, error)
+	// ListByCursor pagina por cursor compuesto (created_at, _id) en orden descendente.
+	// No salta ni repite registros ante inserciones concurrentes (SPEC §5.2).
+	ListByCursor(ctx context.Context, filter CursorFilter) ([]*domain.Document, string, error)
 }
 
 // ListFilter representa los criterios de listado paginado.
@@ -32,6 +35,15 @@ type ListFilter struct {
 	Limit      int64
 	BeforeTime time.Time
 	BeforeID   string
+}
+
+// CursorFilter representa los criterios de paginación por cursor (S3-P2-10).
+type CursorFilter struct {
+	Status domain.Status
+	// Cursor es el token opaco devuelto en la página anterior.
+	// Formato: base64("RFC3339Nano|_id").
+	Cursor string
+	Limit  int64
 }
 
 // ResumeTokenStore persiste el resume token del Change Stream (SPEC §5.3).
@@ -52,6 +64,8 @@ type ObjectStorage interface {
 	Delete(ctx context.Context, objectKey string) error
 	// PresignGet genera una URL prefirmada de lectura.
 	PresignGet(ctx context.Context, objectKey string, expiry time.Duration) (string, error)
+	// PresignGetTXT genera una URL prefirmada de lectura del bucket extracted-txt.
+	PresignGetTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error)
 }
 
 // PresignPostOptions configura la política de la URL prefirmada.

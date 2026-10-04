@@ -427,3 +427,142 @@ func TestDocumentRepository_UpdateStatusWithHistory(t *testing.T) {
 		t.Errorf("history longitud esperada 2, got %d", len(got.History))
 	}
 }
+
+// --- Cursor encode/decode (S3-P2-10) ---
+
+func TestEncodeDecodeCursor(t *testing.T) {
+	now := time.Date(2026, 1, 15, 10, 30, 0, 0, time.UTC)
+	id := "01JQ000000000000000000000"
+
+	cursor := EncodeCursor(now, id)
+	if cursor == "" {
+		t.Fatal("EncodeCursor retornó vacío")
+	}
+
+	gotTime, gotID, err := DecodeCursor(cursor)
+	if err != nil {
+		t.Fatalf("DecodeCursor falló: %v", err)
+	}
+	if !gotTime.Equal(now) {
+		t.Errorf("time = %v, want %v", gotTime, now)
+	}
+	if gotID != id {
+		t.Errorf("id = %q, want %q", gotID, id)
+	}
+}
+
+func TestDecodeCursor_Invalido(t *testing.T) {
+	_, _, err := DecodeCursor("no-es-base64-valido!!!")
+	if err == nil {
+		t.Error("DecodeCursor debía fallar con base64 inválido")
+	}
+
+	_, _, err = DecodeCursor("") // vacío
+	if err == nil {
+		t.Error("DecodeCursor debía fallar con cursor vacío")
+	}
+
+	// base64 válido pero formato incorrecto (sin pipe).
+	_, _, err = DecodeCursor("aGVsbG8=") // "hello"
+	if err == nil {
+		t.Error("DecodeCursor debía fallar sin separador |")
+	}
+}
+
+// --- ListByCursor integration (S3-P2-10) ---
+
+func TestListByCursor_SinCursor(t *testing.T) {
+	_, repo, ctx, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Insertar 5 documentos con created_at decreciente.
+	base := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		doc := domain.NewDocument(fmt.Sprintf("corr-c%d", i), base.Add(24*time.Hour))
+		doc.CreatedAt = base.Add(-time.Duration(i) * time.Minute)
+		if err := repo.Insert(ctx, doc); err != nil {
+			t.Fatalf("Insert falló: %v", err)
+		}
+	}
+
+	docs, nextCursor, err := repo.ListByCursor(ctx, ports.CursorFilter{Limit: 3})
+	if err != nil {
+		t.Fatalf("ListByCursor falló: %v", err)
+	}
+	if len(docs) != 3 {
+		t.Fatalf("docs = %d, want 3", len(docs))
+	}
+	if nextCursor == "" {
+		t.Error("nextCursor vacío pero hay más páginas")
+	}
+
+	// Segunda página con el cursor.
+	docs2, nextCursor2, err := repo.ListByCursor(ctx, ports.CursorFilter{Limit: 3, Cursor: nextCursor})
+	if err != nil {
+		t.Fatalf("ListByCursor (página 2) falló: %v", err)
+	}
+	if len(docs2) != 2 {
+		t.Errorf("docs2 = %d, want 2", len(docs2))
+	}
+	if nextCursor2 != "" {
+		t.Errorf("nextCursor2 = %q, want vacío (última página)", nextCursor2)
+	}
+
+	// No debe repetir IDs entre páginas.
+	ids1 := map[string]bool{}
+	for _, d := range docs {
+		ids1[d.ID] = true
+	}
+	for _, d := range docs2 {
+		if ids1[d.ID] {
+			t.Errorf("documento %s repetido entre páginas", d.ID)
+		}
+	}
+}
+
+func TestListByCursor_ConStatusFilter(t *testing.T) {
+	_, repo, ctx, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	base := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
+
+	docCompleted := domain.NewDocument("corr-c-done", base.Add(24*time.Hour))
+	docCompleted.Status = domain.StatusCompleted
+	docCompleted.CreatedAt = base
+	_ = repo.Insert(ctx, docCompleted)
+
+	docPending := domain.NewDocument("corr-c-pending", base.Add(24*time.Hour))
+	docPending.Status = domain.StatusPendingUpload
+	docPending.CreatedAt = base.Add(-time.Minute)
+	_ = repo.Insert(ctx, docPending)
+
+	docs, _, err := repo.ListByCursor(ctx, ports.CursorFilter{
+		Status: domain.StatusCompleted,
+		Limit:  10,
+	})
+	if err != nil {
+		t.Fatalf("ListByCursor falló: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("docs = %d, want 1", len(docs))
+	}
+	if docs[0].ID != docCompleted.ID {
+		t.Errorf("doc = %s, want %s", docs[0].ID, docCompleted.ID)
+	}
+}
+
+func TestListByCursor_Vacio(t *testing.T) {
+	_, repo, ctx, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	docs, nextCursor, err := repo.ListByCursor(ctx, ports.CursorFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListByCursor falló: %v", err)
+	}
+	if len(docs) != 0 {
+		t.Errorf("docs = %d, want 0", len(docs))
+	}
+	if nextCursor != "" {
+		t.Errorf("nextCursor = %q, want vacío", nextCursor)
+	}
+}

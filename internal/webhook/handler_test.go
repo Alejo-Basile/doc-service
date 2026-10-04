@@ -63,6 +63,16 @@ func (m *mockRepo) List(ctx context.Context, filter ports.ListFilter) ([]*domain
 	return result, int64(len(result)), nil
 }
 
+func (m *mockRepo) ListByCursor(ctx context.Context, filter ports.CursorFilter) ([]*domain.Document, string, error) {
+	var result []*domain.Document
+	for _, doc := range m.docs {
+		if filter.Status == "" || doc.Status == filter.Status {
+			result = append(result, doc)
+		}
+	}
+	return result, "", nil
+}
+
 // mockStorage implementa ports.ObjectStorage para tests.
 type mockStorage struct {
 	pdfHeader []byte
@@ -90,6 +100,10 @@ func (m *mockStorage) GetRange(ctx context.Context, objectKey string, start, end
 func (m *mockStorage) Delete(ctx context.Context, objectKey string) error { return nil }
 
 func (m *mockStorage) PresignGet(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
+	return "", nil
+}
+
+func (m *mockStorage) PresignGetTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
 	return "", nil
 }
 

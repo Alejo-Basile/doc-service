@@ -59,6 +59,34 @@ func (m *mockRepo) List(ctx context.Context, filter ports.ListFilter) ([]*domain
 	return docs, int64(len(docs)), nil
 }
 
+func (m *mockRepo) ListByCursor(ctx context.Context, filter ports.CursorFilter) ([]*domain.Document, string, error) {
+	// Ordenar por created_at descendente (suficiente para tests).
+	var docs []*domain.Document
+	for _, d := range m.docs {
+		if filter.Status != "" && d.Status != filter.Status {
+			continue
+		}
+		docs = append(docs, d)
+	}
+	// Orden simple por created_at desc.
+	for i := 0; i < len(docs); i++ {
+		for j := i + 1; j < len(docs); j++ {
+			if docs[j].CreatedAt.After(docs[i].CreatedAt) {
+				docs[i], docs[j] = docs[j], docs[i]
+			}
+		}
+	}
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if int64(len(docs)) > limit {
+		docs = docs[:limit]
+		return docs, "mock-cursor", nil
+	}
+	return docs, "", nil
+}
+
 // mockStorage implementa ports.ObjectStorage.
 type mockStorage struct{}
 
@@ -85,6 +113,10 @@ func (m *mockStorage) Delete(ctx context.Context, objectKey string) error { retu
 
 func (m *mockStorage) PresignGet(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
 	return "", nil
+}
+
+func (m *mockStorage) PresignGetTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
+	return "https://s3.example.com/extracted-txt/" + objectKey, nil
 }
 
 // --- helpers ---
@@ -308,5 +340,134 @@ func TestGetDocument_ConCampos(t *testing.T) {
 		if _, ok := resp[c]; !ok {
 			t.Errorf("campo %q no encontrado en la respuesta", c)
 		}
+	}
+}
+
+// --- DownloadDocument (S3-P2-09) ---
+
+func TestDownloadDocument_Completed_OK(t *testing.T) {
+	engine, repo := setupTestServer(t)
+
+	doc := domain.NewDocument("corr-dl-1", time.Now().UTC().Add(30*time.Minute))
+	doc.Status = domain.StatusCompleted
+	doc.TxtRef = "extracted-txt/doc-dl-1.txt"
+	_ = repo.Insert(context.Background(), doc)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/documents/"+doc.ID+"/download", nil)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status esperado 200, got %d; body=%s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("JSON inválido: %v", err)
+	}
+	if resp["download_url"] == "" {
+		t.Error("download_url vacío")
+	}
+	if resp["method"] != "GET" {
+		t.Errorf("method esperado GET, got %v", resp["method"])
+	}
+}
+
+func TestDownloadDocument_NoCompleted_Conflict(t *testing.T) {
+	engine, repo := setupTestServer(t)
+
+	doc := domain.NewDocument("corr-dl-2", time.Now().UTC().Add(30*time.Minute))
+	doc.Status = domain.StatusUploaded // no COMPLETED
+	_ = repo.Insert(context.Background(), doc)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/documents/"+doc.ID+"/download", nil)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status esperado 409, got %d", w.Code)
+	}
+}
+
+func TestDownloadDocument_NoExiste_NotFound(t *testing.T) {
+	engine, _ := setupTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/documents/no-existe/download", nil)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status esperado 404, got %d", w.Code)
+	}
+}
+
+// --- ListDocuments (S3-P2-10) ---
+
+func TestListDocuments_SinCursor(t *testing.T) {
+	engine, repo := setupTestServer(t)
+
+	for i := 0; i < 3; i++ {
+		doc := domain.NewDocument(fmt.Sprintf("corr-list-%d", i), time.Now().UTC().Add(30*time.Minute))
+		doc.CreatedAt = time.Now().UTC().Add(time.Duration(i) * time.Minute)
+		_ = repo.Insert(context.Background(), doc)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/documents", nil)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status esperado 200, got %d", w.Code)
+	}
+
+	var resp ListDocumentsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("JSON inválido: %v", err)
+	}
+	if len(resp.Documents) != 3 {
+		t.Errorf("documents = %d, want 3", len(resp.Documents))
+	}
+	if resp.HasMore {
+		t.Error("HasMore = true, want false")
+	}
+}
+
+func TestListDocuments_ConStatusFilter(t *testing.T) {
+	engine, repo := setupTestServer(t)
+
+	doc1 := domain.NewDocument("corr-s1", time.Now().UTC().Add(30*time.Minute))
+	doc1.Status = domain.StatusCompleted
+	_ = repo.Insert(context.Background(), doc1)
+
+	doc2 := domain.NewDocument("corr-s2", time.Now().UTC().Add(30*time.Minute))
+	doc2.Status = domain.StatusPendingUpload
+	_ = repo.Insert(context.Background(), doc2)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/documents?status=COMPLETED", nil)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status esperado 200, got %d", w.Code)
+	}
+
+	var resp ListDocumentsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("JSON inválido: %v", err)
+	}
+	if len(resp.Documents) != 1 {
+		t.Errorf("documents = %d, want 1 (solo COMPLETED)", len(resp.Documents))
+	}
+}
+
+func TestListDocuments_StatusInvalido_BadRequest(t *testing.T) {
+	engine, _ := setupTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/documents?status=INVALIDO", nil)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status esperado 400, got %d", w.Code)
 	}
 }

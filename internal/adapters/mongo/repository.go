@@ -2,9 +2,11 @@ package mongo
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/Alejo-Basile/doc-service/internal/domain"
@@ -13,6 +15,29 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
+
+// EncodeCursor construye un cursor opaco base64("RFC3339Nano|_id").
+func EncodeCursor(createdAt time.Time, id string) string {
+	raw := createdAt.Format(time.RFC3339Nano) + "|" + id
+	return base64.StdEncoding.EncodeToString([]byte(raw))
+}
+
+// DecodeCursor extrae (createdAt, id) de un cursor opaco.
+func DecodeCursor(cursor string) (time.Time, string, error) {
+	raw, err := base64.StdEncoding.DecodeString(cursor)
+	if err != nil {
+		return time.Time{}, "", fmt.Errorf("base64: %w", err)
+	}
+	parts := strings.SplitN(string(raw), "|", 2)
+	if len(parts) != 2 {
+		return time.Time{}, "", errors.New("formato inválido: esperado RFC3339Nano|_id")
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, parts[0])
+	if err != nil {
+		return time.Time{}, "", fmt.Errorf("parse time: %w", err)
+	}
+	return createdAt, parts[1], nil
+}
 
 // ErrNotFound se devuelve cuando el documento no existe.
 var ErrNotFound = errors.New("documento no encontrado")
@@ -129,6 +154,66 @@ func (r *DocumentRepository) List(ctx context.Context, filter ports.ListFilter) 
 	}
 
 	return docs, total, nil
+}
+
+// ListByCursor pagina por cursor compuesto (created_at, _id) en orden descendente (S3-P2-10).
+// El filtro es estricto: created_at < cursorTime OR (created_at = cursorTime AND _id < cursorID).
+// Esto garantiza que inserciones concurrentes no salten ni repitan registros.
+func (r *DocumentRepository) ListByCursor(ctx context.Context, filter ports.CursorFilter) ([]*domain.Document, string, error) {
+	q := bson.M{}
+	if filter.Status != "" {
+		q["status"] = filter.Status
+	}
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	// Pedimos limit+1 para saber si hay más páginas.
+	opts := options.Find().
+		SetSort(bson.D{
+			{Key: "created_at", Value: -1},
+			{Key: "_id", Value: -1},
+		}).
+		SetLimit(limit + 1)
+
+	// Aplicar cursor si se provee.
+	if filter.Cursor != "" {
+		created, id, err := DecodeCursor(filter.Cursor)
+		if err != nil {
+			return nil, "", fmt.Errorf("cursor inválido: %w", err)
+		}
+		q["$or"] = []bson.M{
+			{"created_at": bson.M{"$lt": created}},
+			{"created_at": created, "_id": bson.M{"$lt": id}},
+		}
+	}
+
+	cursor, err := r.coll.Find(ctx, q, opts)
+	if err != nil {
+		return nil, "", fmt.Errorf("list by cursor: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var docs []*domain.Document
+	if err := cursor.All(ctx, &docs); err != nil {
+		return nil, "", fmt.Errorf("decode list: %w", err)
+	}
+
+	// ¿Hay más páginas?
+	hasMore := int64(len(docs)) > limit
+	if hasMore {
+		docs = docs[:limit]
+	}
+
+	// Generar next cursor del último documento.
+	nextCursor := ""
+	if hasMore && len(docs) > 0 {
+		last := docs[len(docs)-1]
+		nextCursor = EncodeCursor(last.CreatedAt, last.ID)
+	}
+
+	return docs, nextCursor, nil
 }
 
 // UpdateStatusWithHistory aplica la transición condicional y agrega una

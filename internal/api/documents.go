@@ -3,8 +3,11 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Alejo-Basile/doc-service/internal/domain"
@@ -44,7 +47,9 @@ func (h *DocumentHandler) RegisterRoutes(engine *gin.Engine) {
 	v2 := engine.Group("/api/v2")
 	{
 		v2.POST("/documents", h.CreateDocument)
+		v2.GET("/documents", h.ListDocuments)
 		v2.GET("/documents/:id", h.GetDocument)
+		v2.GET("/documents/:id/download", h.DownloadDocument)
 	}
 }
 
@@ -203,6 +208,133 @@ func (h *DocumentHandler) GetDocument(c *gin.Context) {
 		"created_at":     doc.CreatedAt,
 		"updated_at":     doc.UpdatedAt,
 		"expires_at":     doc.ExpiresAt,
+	})
+}
+
+// DownloadDocument maneja GET /api/v2/documents/:id/download (S3-P2-09).
+// Entrega una URL prefirmada de lectura del bucket extracted-txt
+// únicamente si el documento está en COMPLETED.
+func (h *DocumentHandler) DownloadDocument(c *gin.Context) {
+	id := c.Param("id")
+	if id == "" {
+		respondProblem(c, http.StatusBadRequest, "validation", "id de documento requerido", "")
+		return
+	}
+
+	doc, err := h.repo.GetByID(c.Request.Context(), id)
+	if err != nil {
+		if errors.Is(err, ports.ErrNotFound) {
+			respondProblem(c, http.StatusNotFound, "not_found", "Recurso no encontrado", "id="+id)
+			return
+		}
+		slog.Error("download: get document", "error", err, "document_id", id)
+		respondProblem(c, http.StatusInternalServerError, "internal", "Error interno del servidor", "")
+		return
+	}
+
+	// Solo COMPLETED permite descarga (S3-P2-09).
+	if doc.Status != domain.StatusCompleted {
+		respondProblem(c, http.StatusConflict, "conflict",
+			"Documento no disponible para descarga",
+			fmt.Sprintf("estado actual: %s; se requiere COMPLETED", doc.Status))
+		return
+	}
+
+	// txt_ref es la clave del objeto en extracted-txt.
+	if doc.TxtRef == "" {
+		respondProblem(c, http.StatusConflict, "conflict",
+			"Resultado no disponible",
+			"el documento está COMPLETED pero no tiene txt_ref")
+		return
+	}
+
+	// URL prefirmada de lectura con expiración corta (5 min).
+	downloadURL, err := h.storage.PresignGetTXT(c.Request.Context(), doc.TxtRef, 5*time.Minute)
+	if err != nil {
+		slog.Error("download: presign GET TXT", "error", err, "document_id", id, "txt_ref", doc.TxtRef)
+		respondProblem(c, http.StatusInternalServerError, "internal", "Error generando URL de descarga", "")
+		return
+	}
+
+	slog.Info("download URL generada",
+		"document_id", id, "txt_ref", doc.TxtRef,
+	)
+
+	c.JSON(http.StatusOK, gin.H{
+		"document_id":    doc.ID,
+		"status":         string(doc.Status),
+		"download_url":   downloadURL,
+		"method":         "GET",
+		"expires_in":     int((5 * time.Minute).Seconds()),
+		"correlation_id": doc.CorrelationID,
+	})
+}
+
+// ListDocumentsResponse es la respuesta de GET /api/v2/documents (S3-P2-10).
+type ListDocumentsResponse struct {
+	Documents  []gin.H `json:"documents"`
+	NextCursor string  `json:"next_cursor,omitempty"`
+	HasMore    bool    `json:"has_more"`
+}
+
+// ListDocuments maneja GET /api/v2/documents con paginación por cursor (S3-P2-10).
+// Query params: status (opcional), cursor (opcional), limit (default 50, max 200).
+func (h *DocumentHandler) ListDocuments(c *gin.Context) {
+	statusStr := c.Query("status")
+	cursor := c.Query("cursor")
+	limitStr := c.Query("limit")
+
+	limit := int64(50)
+	if limitStr != "" {
+		if n, err := strconv.ParseInt(limitStr, 10, 64); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	var status domain.Status
+	if statusStr != "" {
+		status = domain.Status(statusStr)
+		if !status.IsValid() {
+			respondProblem(c, http.StatusBadRequest, "validation",
+				"Status inválido", "status="+statusStr)
+			return
+		}
+	}
+
+	docs, nextCursor, err := h.repo.ListByCursor(c.Request.Context(), ports.CursorFilter{
+		Status: status,
+		Cursor: cursor,
+		Limit:  limit,
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "cursor inválido") {
+			respondProblem(c, http.StatusBadRequest, "validation", "Cursor inválido", "")
+			return
+		}
+		slog.Error("list documents", "error", err)
+		respondProblem(c, http.StatusInternalServerError, "internal", "Error listando documentos", "")
+		return
+	}
+
+	items := make([]gin.H, 0, len(docs))
+	for _, doc := range docs {
+		items = append(items, gin.H{
+			"document_id":    doc.ID,
+			"status":         string(doc.Status),
+			"correlation_id": doc.CorrelationID,
+			"created_at":     doc.CreatedAt,
+			"updated_at":     doc.UpdatedAt,
+			"expires_at":     doc.ExpiresAt,
+		})
+	}
+
+	c.JSON(http.StatusOK, ListDocumentsResponse{
+		Documents:  items,
+		NextCursor: nextCursor,
+		HasMore:    nextCursor != "",
 	})
 }
 
