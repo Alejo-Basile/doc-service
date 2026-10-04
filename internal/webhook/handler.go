@@ -188,7 +188,7 @@ func (h *Handler) validatePDF(ctx context.Context, docID, objectKey string) erro
 		// Transición UPLOADED → REJECTED (terminal, sin reintentos).
 		_, err := h.repo.UpdateStatus(ctx, docID,
 			domain.StatusUploaded, domain.StatusRejected,
-			map[string]any{"failure_reason": "NOT_A_PDF"},
+			map[string]any{"failure_reason": domain.FailureReasonNotAPDF},
 		)
 		if err != nil {
 			return fmt.Errorf("marcar REJECTED: %w", err)

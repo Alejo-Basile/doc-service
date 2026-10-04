@@ -26,13 +26,14 @@ import (
 
 // Reconciler ejecuta el sweep periódico de documentos inconsistentes.
 type Reconciler struct {
-	repo       ports.DocumentRepository
-	storage    ports.ObjectStorage
-	queue      ports.WorkQueue
-	lease      ports.DistributedLease
-	clock      ports.Clock
-	interval   time.Duration
-	stuckAfter time.Duration // umbral para UPLOADED estancados / reencolado
+	repo         ports.DocumentRepository
+	storage      ports.ObjectStorage
+	queue        ports.WorkQueue
+	lease        ports.DistributedLease
+	clock        ports.Clock
+	interval     time.Duration
+	stuckAfter   time.Duration // umbral para UPLOADED estancados / reencolado
+	minSafetyAge time.Duration // edad mínima: documentos más jóvenes nunca se tocan (S6-P2-02)
 }
 
 // New crea un Reconciler con dependencias inyectadas.
@@ -45,18 +46,23 @@ func New(
 	clock ports.Clock,
 	interval time.Duration,
 	stuckAfter time.Duration,
+	minSafetyAge time.Duration,
 ) *Reconciler {
 	if stuckAfter <= 0 {
 		stuckAfter = 30 * time.Minute
 	}
+	if minSafetyAge <= 0 {
+		minSafetyAge = interval // default: al menos 1x intervalo
+	}
 	return &Reconciler{
-		repo:       repo,
-		storage:    storage,
-		queue:      queue,
-		lease:      lease,
-		clock:      clock,
-		interval:   interval,
-		stuckAfter: stuckAfter,
+		repo:         repo,
+		storage:      storage,
+		queue:        queue,
+		lease:        lease,
+		clock:        clock,
+		interval:     interval,
+		stuckAfter:   stuckAfter,
+		minSafetyAge: minSafetyAge,
 	}
 }
 
@@ -74,13 +80,34 @@ func (r *Reconciler) RegisterRoutes(engine *gin.Engine) {
 
 // Result resume lo que hizo un sweep.
 type Result struct {
-	ExpiredPending    int  `json:"expired_pending"`
-	RecoveredUploaded int  `json:"recovered_uploaded"`
-	Reenqueued        int  `json:"reenqueued"`
-	StuckDetected     int  `json:"stuck_detected"`
-	OrphansPurged     int  `json:"orphans_purged"`
-	Errors            int  `json:"errors"`
-	LockAcquired      bool `json:"lock_acquired"`
+	ExpiredPending    int               `json:"expired_pending"`
+	RecoveredUploaded int               `json:"recovered_uploaded"`
+	Reenqueued        int               `json:"reenqueued"`
+	StuckDetected     int               `json:"stuck_detected"`
+	OrphansPurged     int               `json:"orphans_purged"`
+	CompletedNoTxt    int               `json:"completed_no_txt"` // COMPLETED sin .txt en MinIO (S5-P2-03)
+	Errors            int               `json:"errors"`
+	LockAcquired      bool              `json:"lock_acquired"`
+	CrossCheckReport  *CrossCheckReport `json:"cross_check,omitempty"` // S6-P2-01
+}
+
+// CrossCheckReport resume la verificación cruzada MongoDB ↔ MinIO ↔ Redis (S6-P2-01).
+type CrossCheckReport struct {
+	// MongoDB
+	TotalDocuments int64            `json:"total_documents"`
+	ByStatus       map[string]int64 `json:"by_status"`
+	// MinIO
+	RawBucketObjects int64 `json:"raw_bucket_objects"`
+	TXTBucketObjects int64 `json:"txt_bucket_objects"`
+	// Redis
+	StreamLength int64 `json:"stream_length"`
+	// Discrepancias
+	OrphanRawObjects  []string `json:"orphan_raw_objects"`  // en MinIO sin documento
+	MissingRawObjects []string `json:"missing_raw_objects"` // documento sin objeto en MinIO
+	CompletedNoTxt    []string `json:"completed_no_txt"`    // COMPLETED sin .txt
+	FailedNoReason    []string `json:"failed_no_reason"`    // FAILED sin failure_reason
+	// Seguridad
+	YoungUntouched int64 `json:"young_untouched"` // documentos < minSafetyAge no tocados
 }
 
 // Start ejecuta el sweep en loop con el intervalo configurado.
@@ -168,12 +195,25 @@ func (r *Reconciler) RunOnce(ctx context.Context) (*Result, error) {
 	result.StuckDetected = stuck
 
 	// 4. Purga de objetos huérfanos en MinIO (S4-P2-02).
-	// Solo si hay lease y storage disponibles; con umbral conservador.
 	orphans, err := r.sweepOrphans(ctx, now)
 	if err != nil {
 		slog.Warn("reconciler: sweep orphans falló (no crítico)", "error", err)
 	}
 	result.OrphansPurged = orphans
+
+	// 5. Documentos COMPLETED sin .txt en MinIO (S5-P2-03).
+	completedNoTxt, err := r.sweepCompletedMissingTxt(ctx, now)
+	if err != nil {
+		slog.Warn("reconciler: sweep completed-no-txt falló (no crítico)", "error", err)
+	}
+	result.CompletedNoTxt = completedNoTxt
+
+	// 6. Reporte de verificación cruzada (S6-P2-01).
+	report, err := r.crossCheck(ctx, now)
+	if err != nil {
+		slog.Warn("reconciler: cross-check falló (no crítico)", "error", err)
+	}
+	result.CrossCheckReport = report
 
 	return result, nil
 }
@@ -185,6 +225,7 @@ type sweepResult struct {
 }
 
 // sweepExpiredPending busca documentos PENDING_UPLOAD vencidos y actúa.
+// Respeta el umbral de seguridad: documentos más jóvenes que minSafetyAge no se tocan.
 func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time) (*sweepResult, error) {
 	result := &sweepResult{}
 
@@ -197,6 +238,10 @@ func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time) (*s
 	}
 
 	for _, doc := range docs {
+		// S6-P2-02: umbral de seguridad — documentos recién creados no se tocan.
+		if now.Sub(doc.CreatedAt) < r.minSafetyAge {
+			continue
+		}
 		if !doc.ExpiresAt.Before(now) {
 			continue // aún está dentro de la ventana
 		}
@@ -225,7 +270,7 @@ func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time) (*s
 			// Objeto no existe → UPLOAD_EXPIRED.
 			ok, err := r.repo.UpdateStatus(ctx, doc.ID,
 				domain.StatusPendingUpload, domain.StatusUploadExpired,
-				map[string]any{"failure_reason": "UPLOAD_WINDOW_EXPIRED"},
+				map[string]any{"failure_reason": domain.FailureReasonUploadExpired},
 			)
 			if err != nil {
 				slog.Error("reconciler: error marcando UPLOAD_EXPIRED",
@@ -262,6 +307,10 @@ func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time) (int
 	}
 
 	for _, doc := range docs {
+		// S6-P2-02: umbral de seguridad.
+		if now.Sub(doc.CreatedAt) < r.minSafetyAge {
+			continue
+		}
 		// Solo documentos estancados (updated_at antiguo).
 		if !doc.UpdatedAt.Before(cutoff) {
 			continue
@@ -275,10 +324,10 @@ func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time) (int
 			continue
 		}
 		if !exists {
-			// Objeto no existe: marcar FAILED con causa.
+			// Objeto no existe: marcar FAILED con causa normalizada.
 			_, _ = r.repo.UpdateStatus(ctx, doc.ID,
 				domain.StatusUploaded, domain.StatusFailed,
-				map[string]any{"failure_reason": "OBJECT_MISSING"},
+				map[string]any{"failure_reason": domain.FailureReasonObjectMissing},
 			)
 			continue
 		}
@@ -406,7 +455,7 @@ func (r *Reconciler) validateAndRecover(ctx context.Context, doc *domain.Documen
 	if len(data) < 5 || string(data[:5]) != "%PDF-" {
 		_, err := r.repo.UpdateStatus(ctx, doc.ID,
 			domain.StatusPendingUpload, domain.StatusRejected,
-			map[string]any{"failure_reason": "NOT_A_PDF"},
+			map[string]any{"failure_reason": domain.FailureReasonNotAPDF},
 		)
 		return false, err
 	}
@@ -469,6 +518,165 @@ func (r *Reconciler) sweepStuckIntermediate(ctx context.Context, now time.Time) 
 	}
 
 	return stuckCount, nil
+}
+
+// sweepCompletedMissingTxt detecta documentos COMPLETED cuyo .txt no existe en MinIO (S5-P2-03).
+// Solo detecta y alerta: no transiciona automáticamente (eso es trabajo del operador).
+// Respeta el umbral de seguridad.
+func (r *Reconciler) sweepCompletedMissingTxt(ctx context.Context, now time.Time) (int, error) {
+	docs, _, err := r.repo.List(ctx, ports.ListFilter{
+		Status: domain.StatusCompleted,
+		Limit:  200,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("list completed: %w", err)
+	}
+
+	count := 0
+	for _, doc := range docs {
+		// S6-P2-02: umbral de seguridad.
+		if now.Sub(doc.CreatedAt) < r.minSafetyAge {
+			continue
+		}
+		if doc.TxtRef == "" {
+			count++
+			slog.Warn("reconciler: documento COMPLETED sin txt_ref",
+				"document_id", doc.ID,
+			)
+			continue
+		}
+		// Verificar que el .txt exista en MinIO.
+		_, err := r.storage.Stat(ctx, doc.TxtRef)
+		if err != nil {
+			if isNotFound(err) {
+				count++
+				slog.Warn("reconciler: documento COMPLETED pero .txt no existe en MinIO",
+					"document_id", doc.ID,
+					"txt_ref", doc.TxtRef,
+				)
+			} else {
+				slog.Error("reconciler: error verificando .txt",
+					"document_id", doc.ID, "txt_ref", doc.TxtRef, "error", err)
+			}
+		}
+	}
+
+	return count, nil
+}
+
+// crossCheck genera un reporte de verificación cruzada MongoDB ↔ MinIO ↔ Redis (S6-P2-01).
+// Solo lectura: no modifica ningún estado.
+func (r *Reconciler) crossCheck(ctx context.Context, now time.Time) (*CrossCheckReport, error) {
+	report := &CrossCheckReport{
+		ByStatus: make(map[string]int64),
+	}
+
+	// 1. Listar todos los documentos de MongoDB.
+	docs, _, err := r.repo.List(ctx, ports.ListFilter{Limit: 10000})
+	if err != nil {
+		return nil, fmt.Errorf("list all docs: %w", err)
+	}
+	report.TotalDocuments = int64(len(docs))
+
+	// 2. Contar por estado y detectar discrepancias.
+	docKeys := make(map[string]*domain.Document)
+	validRawKeys := make(map[string]bool)
+	validTxtKeys := make(map[string]bool)
+
+	for _, doc := range docs {
+		report.ByStatus[string(doc.Status)]++
+
+		// Documentos jóvenes: no tocar (S6-P2-02).
+		if now.Sub(doc.CreatedAt) < r.minSafetyAge {
+			report.YoungUntouched++
+		}
+
+		if doc.ObjectKey != "" {
+			docKeys[doc.ObjectKey] = doc
+			validRawKeys[doc.ObjectKey] = true
+		}
+		if doc.TxtRef != "" {
+			validTxtKeys[doc.TxtRef] = true
+		}
+
+		// FAILED sin failure_reason (S5-P2-02).
+		if doc.Status == domain.StatusFailed && doc.FailureReason == "" {
+			report.FailedNoReason = append(report.FailedNoReason, doc.ID)
+		}
+
+		// COMPLETED sin .txt (S5-P2-03).
+		if doc.Status == domain.StatusCompleted {
+			if doc.TxtRef == "" {
+				report.CompletedNoTxt = append(report.CompletedNoTxt, doc.ID)
+			} else if now.Sub(doc.CreatedAt) >= r.minSafetyAge {
+				// Solo verificar si pasó el umbral de seguridad.
+				if _, err := r.storage.Stat(ctx, doc.TxtRef); err != nil && isNotFound(err) {
+					report.CompletedNoTxt = append(report.CompletedNoTxt, doc.ID)
+				}
+			}
+		}
+
+		// Documentos activos sin objeto en MinIO.
+		if doc.ObjectKey != "" && isDocActive(doc.Status) {
+			if _, err := r.storage.Stat(ctx, doc.ObjectKey); err != nil && isNotFound(err) {
+				report.MissingRawObjects = append(report.MissingRawObjects, doc.ID)
+			}
+		}
+	}
+
+	// 3. Listar objetos de MinIO bucket raw y detectar huérfanos.
+	type lister interface {
+		ListObjects(ctx context.Context) ([]ports.ObjectInfo, error)
+	}
+	if l, ok := r.storage.(lister); ok {
+		objects, err := l.ListObjects(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list raw objects: %w", err)
+		}
+		report.RawBucketObjects = int64(len(objects))
+		for _, obj := range objects {
+			if !validRawKeys[obj.Key] {
+				report.OrphanRawObjects = append(report.OrphanRawObjects, obj.Key)
+			}
+		}
+	}
+
+	// 4. Redis stream length.
+	if r.queue != nil {
+		if q, ok := r.queue.(interface {
+			XLen(ctx context.Context) (int64, error)
+		}); ok {
+			if n, err := q.XLen(ctx); err == nil {
+				report.StreamLength = n
+			}
+		}
+	}
+
+	// Log del reporte.
+	slog.Info("reconciler: cross-check report",
+		"total_documents", report.TotalDocuments,
+		"by_status", report.ByStatus,
+		"raw_objects", report.RawBucketObjects,
+		"stream_length", report.StreamLength,
+		"orphan_raw", len(report.OrphanRawObjects),
+		"missing_raw", len(report.MissingRawObjects),
+		"completed_no_txt", len(report.CompletedNoTxt),
+		"failed_no_reason", len(report.FailedNoReason),
+		"young_untouched", report.YoungUntouched,
+	)
+
+	return report, nil
+}
+
+// isDocActive indica si un estado es "activo" (no terminal, en tránsito).
+func isDocActive(s domain.Status) bool {
+	switch s {
+	case domain.StatusPendingUpload, domain.StatusUploaded, domain.StatusQueued,
+		domain.StatusProcessing, domain.StatusRetrying:
+		return true
+	default:
+		return false
+	}
 }
 
 // isNotFound verifica si un error indica que el objeto no existe.

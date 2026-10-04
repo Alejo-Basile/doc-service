@@ -233,7 +233,7 @@ func (h *InternalHandler) CancelDocument(c *gin.Context) {
 
 	ok, err := h.repo.UpdateStatusWithHistory(c.Request.Context(), id,
 		domain.StatusPendingUpload, domain.StatusUploadExpired,
-		entry, map[string]any{"failure_reason": "CANCELLED_BY_OPERATOR"},
+		entry, map[string]any{"failure_reason": domain.FailureReasonCancelled},
 	)
 	if err != nil {
 		slog.Error("internal cancel: update status", "error", err, "document_id", id)

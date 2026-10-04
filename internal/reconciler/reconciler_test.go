@@ -146,7 +146,7 @@ func TestRunOnce_ExpiredPending_ObjectAbsent(t *testing.T) {
 	}
 	repo.docs["doc-expired"] = doc
 
-	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute)
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
 	result, err := r.RunOnce(context.Background())
 	if err != nil {
 		t.Fatalf("RunOnce error: %v", err)
@@ -185,7 +185,7 @@ func TestRunOnce_ExpiredPending_ObjectExists_RecoversToUploaded(t *testing.T) {
 	}
 	repo.docs["doc-1"] = doc
 
-	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute)
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
 	result, err := r.RunOnce(context.Background())
 	if err != nil {
 		t.Fatalf("RunOnce error: %v", err)
@@ -222,7 +222,7 @@ func TestRunOnce_ExpiredPending_ObjectExists_NotPDF_Rejected(t *testing.T) {
 	}
 	repo.docs["doc-1"] = doc
 
-	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute)
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
 	result, err := r.RunOnce(context.Background())
 	if err != nil {
 		t.Fatalf("RunOnce error: %v", err)
@@ -257,7 +257,7 @@ func TestRunOnce_NotExpired_Skipped(t *testing.T) {
 	}
 	repo.docs["doc-active"] = doc
 
-	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute)
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
 	result, err := r.RunOnce(context.Background())
 	if err != nil {
 		t.Fatalf("RunOnce error: %v", err)
@@ -285,7 +285,7 @@ func TestRunOnce_StuckIntermediate_Detected(t *testing.T) {
 	}
 	repo.docs["doc-stuck"] = doc
 
-	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute)
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
 	result, err := r.RunOnce(context.Background())
 	if err != nil {
 		t.Fatalf("RunOnce error: %v", err)
@@ -315,7 +315,7 @@ func TestRunOnce_StuckIntermediate_Recent_NotDetected(t *testing.T) {
 	}
 	repo.docs["doc-recent"] = doc
 
-	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute)
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
 	result, err := r.RunOnce(context.Background())
 	if err != nil {
 		t.Fatalf("RunOnce error: %v", err)
@@ -348,3 +348,157 @@ func TestIsNotFound(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// --- Safety age (S6-P2-02) ---
+
+func TestRunOnce_SafetyAge_NoTocaDocumentosRecientes(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage() // sin objetos
+
+	// Documento vencido pero creado hace 5 min (menor que safety age de 15 min).
+	doc := &domain.Document{
+		ID:        "doc-young",
+		Status:    domain.StatusPendingUpload,
+		ObjectKey: "raw-pdfs/doc-young.pdf",
+		ExpiresAt: now.Add(-time.Hour),       // vencido
+		CreatedAt: now.Add(-5 * time.Minute), // pero muy reciente
+	}
+	repo.docs["doc-young"] = doc
+
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	// No debe tocar el documento por safety age.
+	if result.ExpiredPending != 0 {
+		t.Errorf("ExpiredPending = %d, want 0 (safety age)", result.ExpiredPending)
+	}
+	if len(repo.updateCalls) != 0 {
+		t.Errorf("updateCalls = %d, want 0 (safety age)", len(repo.updateCalls))
+	}
+}
+
+// --- Completed sin .txt (S5-P2-03) ---
+
+func TestRunOnce_CompletedSinTxt_Detectado(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+
+	// Documento COMPLETED sin txt_ref, creado hace 1h (pasó safety age).
+	doc := &domain.Document{
+		ID:        "doc-no-txt",
+		Status:    domain.StatusCompleted,
+		ObjectKey: "raw-pdfs/doc-no-txt.pdf",
+		CreatedAt: now.Add(-time.Hour),
+		UpdatedAt: now.Add(-time.Hour),
+	}
+	repo.docs["doc-no-txt"] = doc
+
+	// Segundo documento COMPLETED con txt_ref que no existe en MinIO.
+	doc2 := &domain.Document{
+		ID:        "doc-txt-missing",
+		Status:    domain.StatusCompleted,
+		ObjectKey: "raw-pdfs/doc-txt-missing.pdf",
+		TxtRef:    "extracted-txt/doc-txt-missing.txt",
+		CreatedAt: now.Add(-time.Hour),
+		UpdatedAt: now.Add(-time.Hour),
+	}
+	repo.docs["doc-txt-missing"] = doc2
+
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	// Ambos deben ser detectados.
+	if result.CompletedNoTxt != 2 {
+		t.Errorf("CompletedNoTxt = %d, want 2", result.CompletedNoTxt)
+	}
+
+	// No debe transicionar (solo detección).
+	if len(repo.updateCalls) != 0 {
+		t.Errorf("updateCalls = %d, want 0 (solo detección)", len(repo.updateCalls))
+	}
+}
+
+// --- Cross-check (S6-P2-01) ---
+
+func TestCrossCheck_GeneraReporte(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+
+	// Documento FAILED sin failure_reason.
+	docFailed := &domain.Document{
+		ID:        "doc-failed",
+		Status:    domain.StatusFailed,
+		CreatedAt: now.Add(-time.Hour),
+	}
+	repo.docs["doc-failed"] = docFailed
+
+	// Documento COMPLETED sin txt_ref.
+	docCompleted := &domain.Document{
+		ID:        "doc-completed",
+		Status:    domain.StatusCompleted,
+		CreatedAt: now.Add(-time.Hour),
+	}
+	repo.docs["doc-completed"] = docCompleted
+
+	// Documento joven (no tocar).
+	docYoung := &domain.Document{
+		ID:        "doc-young",
+		Status:    domain.StatusPendingUpload,
+		CreatedAt: now.Add(-2 * time.Minute),
+	}
+	repo.docs["doc-young"] = docYoung
+
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	report, err := r.crossCheck(context.Background(), now)
+	if err != nil {
+		t.Fatalf("crossCheck error: %v", err)
+	}
+
+	if report.TotalDocuments != 3 {
+		t.Errorf("TotalDocuments = %d, want 3", report.TotalDocuments)
+	}
+	if len(report.FailedNoReason) != 1 {
+		t.Errorf("FailedNoReason = %v, want 1 doc", report.FailedNoReason)
+	}
+	if len(report.CompletedNoTxt) != 1 {
+		t.Errorf("CompletedNoTxt = %v, want 1 doc", report.CompletedNoTxt)
+	}
+	if report.YoungUntouched != 1 {
+		t.Errorf("YoungUntouched = %d, want 1", report.YoungUntouched)
+	}
+}
+
+// --- Failure reasons normalizados (S5-P2-02) ---
+
+func TestIsValidFailureReason(t *testing.T) {
+	valid := []string{
+		domain.FailureReasonObjectMissing,
+		domain.FailureReasonNotAPDF,
+		domain.FailureReasonUploadExpired,
+		domain.FailureReasonCancelled,
+		domain.FailureReasonExtractionError,
+		domain.FailureReasonCompensateFail,
+		domain.FailureReasonTxtMissing,
+	}
+	for _, r := range valid {
+		if !domain.IsValidFailureReason(r) {
+			t.Errorf("IsValidFailureReason(%q) = false, want true", r)
+		}
+	}
+
+	invalid := []string{"", "SOME_RANDOM_ERROR", "not_a_reason"}
+	for _, r := range invalid {
+		if domain.IsValidFailureReason(r) {
+			t.Errorf("IsValidFailureReason(%q) = true, want false", r)
+		}
+	}
+}

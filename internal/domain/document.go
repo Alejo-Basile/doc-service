@@ -46,6 +46,30 @@ var ErrInvalidTransition = errors.New("transición de estado no permitida")
 // ErrTerminalState se devuelve cuando se intenta transicionar un estado terminal.
 var ErrTerminalState = errors.New("el documento está en un estado terminal")
 
+// FailureReasons normalizados para documentos FAILED (S5-P2-02).
+// Todo documento en FAILED debe tener uno de estos códigos en failure_reason.
+const (
+	FailureReasonObjectMissing   = "OBJECT_MISSING"
+	FailureReasonNotAPDF         = "NOT_A_PDF"
+	FailureReasonUploadExpired   = "UPLOAD_WINDOW_EXPIRED"
+	FailureReasonCancelled       = "CANCELLED_BY_OPERATOR"
+	FailureReasonExtractionError = "EXTRACTION_ERROR"
+	FailureReasonCompensateFail  = "COMPENSATION_FAILED"
+	FailureReasonTxtMissing      = "TXT_REF_MISSING"
+)
+
+// IsValidFailureReason verifica si un código de fallo está en la taxonomía.
+func IsValidFailureReason(reason string) bool {
+	switch reason {
+	case FailureReasonObjectMissing, FailureReasonNotAPDF, FailureReasonUploadExpired,
+		FailureReasonCancelled, FailureReasonExtractionError, FailureReasonCompensateFail,
+		FailureReasonTxtMissing:
+		return true
+	default:
+		return false
+	}
+}
+
 // IsTerminal indica si el estado es terminal (nada sale de él).
 func (s Status) IsTerminal() bool {
 	switch s {

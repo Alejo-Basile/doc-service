@@ -39,6 +39,9 @@ type Config struct {
 	MaxPDFBytes       int64
 	ReconcileInterval time.Duration
 	DocUploadGrace    time.Duration
+	// MinSafetyAge es la edad mínima antes de que el reconciliador toque un documento (S6-P2-02).
+	// Documentos más jóvenes que esto nunca son alterados bajo ninguna condición.
+	MinSafetyAge time.Duration
 }
 
 // default values documentados en SPEC §11.5.
@@ -51,6 +54,7 @@ const (
 	defaultMaxPDFBytes       = 26214400 // 25 MB (SPEC §5.1)
 	defaultReconcileMin      = 10
 	defaultDocUploadGraceMin = 30 // >= 2x reconcil interval (SPEC §4)
+	defaultMinSafetyAgeMin   = 15 // >= 1x reconcil interval (S6-P2-02)
 )
 
 // Load lee las variables de entorno, aplica defaults y valida.
@@ -73,6 +77,7 @@ func Load() (*Config, error) {
 		MaxPDFBytes:         envInt64("MAX_PDF_BYTES", defaultMaxPDFBytes),
 		ReconcileInterval:   time.Duration(envInt("RECONCILE_INTERVAL_MIN", defaultReconcileMin)) * time.Minute,
 		DocUploadGrace:      time.Duration(envInt("DOC_UPLOAD_GRACE_MIN", defaultDocUploadGraceMin)) * time.Minute,
+		MinSafetyAge:        time.Duration(envInt("MIN_SAFETY_AGE_MIN", defaultMinSafetyAgeMin)) * time.Minute,
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -129,6 +134,14 @@ func (c *Config) Validate() error {
 		return fmt.Errorf(
 			"configuración inválida: DOC_UPLOAD_GRACE_MIN (%s) debe ser >= 2x RECONCILE_INTERVAL_MIN (%s)",
 			c.DocUploadGrace, minGrace,
+		)
+	}
+	// S6-P2-02: la edad mínima de seguridad debe ser >= 1x el intervalo,
+	// para que el reconciliador nunca toque documentos en tránsito legítimo.
+	if c.MinSafetyAge < c.ReconcileInterval {
+		return fmt.Errorf(
+			"configuración inválida: MIN_SAFETY_AGE_MIN (%s) debe ser >= RECONCILE_INTERVAL_MIN (%s)",
+			c.MinSafetyAge, c.ReconcileInterval,
 		)
 	}
 
