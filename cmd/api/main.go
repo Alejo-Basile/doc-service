@@ -16,7 +16,9 @@ import (
 	httpserver "github.com/Alejo-Basile/doc-service/internal/transport/http"
 )
 
-const shutdownTimeout = 10 * time.Second
+// shutdownTimeout es el tiempo máximo que se le da al servidor para drenar
+// requests en vuelo antes de forzar el corte.
+const shutdownTimeout = 15 * time.Second
 
 func main() {
 	// Logger JSON estructurado.
@@ -46,15 +48,17 @@ func main() {
 	)
 
 	server := httpserver.NewServer(cfg.Debug)
+	httpSrv := server.NewHTTPServer(cfg.Addr())
 
-	// Canal para capturar señales del SO.
+	// Canal para capturar señales del SO (SIGINT y SIGTERM).
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	// Goroutine del servidor HTTP.
 	errCh := make(chan error, 1)
 	go func() {
-		if err := server.Run(cfg.Addr()); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		slog.Info("servidor HTTP escuchando", "addr", cfg.Addr())
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
 	}()
@@ -62,28 +66,27 @@ func main() {
 	// Esperar señal de apagado o error del servidor.
 	select {
 	case sig := <-quit:
-		slog.Info("recibida señal, iniciando graceful shutdown", "signal", sig.String())
+		slog.Info("recibida señal, iniciando graceful shutdown",
+			"signal", sig.String(),
+			"timeout", shutdownTimeout.String(),
+		)
 	case err := <-errCh:
 		slog.Error("el servidor HTTP falló", "error", err)
 	}
 
-	// Graceful shutdown con timeout (S0-P2-04 completará el drenaje del relay).
+	// Graceful shutdown: http.Server.Shutdown drena las requests en vuelo
+	// y espera a que terminen, hasta agotar el timeout.
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	if err := shutdownHTTPServer(server, cfg.Addr(), ctx); err != nil {
-		slog.Error("error en graceful shutdown", "error", err)
+	if err := httpSrv.Shutdown(ctx); err != nil {
+		slog.Error("error en graceful shutdown (se agotó el timeout, forzando cierre)",
+			"error", err,
+		)
+		// ForceClose para no quedar procesos zombies si el drenaje se colgó.
+		_ = httpSrv.Close()
 		os.Exit(1)
 	}
 
 	slog.Info("doc-service detenido correctamente")
-}
-
-// shutdownHTTPServer orquesta el apagado ordenado del servidor HTTP.
-func shutdownHTTPServer(server *httpserver.Server, addr string, ctx context.Context) error {
-	httpServer := &http.Server{
-		Addr:    addr,
-		Handler: server.Handler(),
-	}
-	return httpServer.Shutdown(ctx)
 }
