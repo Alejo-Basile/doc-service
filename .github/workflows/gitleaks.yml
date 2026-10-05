@@ -21,6 +21,6 @@ jobs:
           fetch-depth: 0
       - uses: gitleaks/gitleaks-action@v2
         env:
-          # Requerido por gitleaks-action v2 para escanear PRs (repo publico:
-          # no necesita licencia ni token extra, solo el GITHUB_TOKEN del runner)
-          GITLEAKS_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Requerido por gitleaks-action para escanear PRs (repo publico:
+          # no necesita licencia, solo el GITHUB_TOKEN del runner)
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
