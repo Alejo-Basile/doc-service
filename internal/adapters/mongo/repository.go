@@ -40,7 +40,9 @@ func DecodeCursor(cursor string) (time.Time, string, error) {
 }
 
 // ErrNotFound se devuelve cuando el documento no existe.
-var ErrNotFound = errors.New("documento no encontrado")
+// Es alias de ports.ErrNotFound: los consumidores (API) validan con
+// errors.Is(err, ports.ErrNotFound), por lo que deben ser el mismo valor.
+var ErrNotFound = ports.ErrNotFound
 
 // DocumentRepository implementa ports.DocumentRepository sobre MongoDB.
 // Toda escritura de estado usa transición condicional (SPEC §4, §11.1).
