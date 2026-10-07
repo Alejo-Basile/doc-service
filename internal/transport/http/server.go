@@ -4,6 +4,7 @@ package httpserver
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -34,6 +35,14 @@ func (s *Server) Engine() *gin.Engine { return s.engine }
 
 // registerRoutes registra todas las rutas del servicio.
 func (s *Server) registerRoutes() {
+	// Middlewares globales: correlation_id → request logging → error logging → recovery.
+	s.engine.Use(
+		CorrelationIDMiddleware(),
+		RequestLoggerMiddleware(),
+		ErrorLogMiddleware(),
+		gin.Recovery(),
+	)
+
 	// Health checks (SPEC §10: /healthz y /readyz deben verificar dependencias reales,
 	// pero en esta fase solo responden proceso vivo).
 	s.engine.GET("/healthz", handleHealthz)
@@ -45,10 +54,17 @@ func (s *Server) registerRoutes() {
 	// s.engine.Group("/internal", ...)
 }
 
-// Run inicia el servidor HTTP.
-func (s *Server) Run(addr string) error {
-	return s.engine.Run(addr)
+// NewHTTPServer crea un *http.Server configurado para graceful shutdown.
+// Los timeouts evitan que conexiones colgadas bloqueen el drenaje.
+func (s *Server) NewHTTPServer(addr string) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           s.engine,
+		ReadHeaderTimeout: 5 * time.Second,
+		// No se fija WriteTimeout para no cortar requests largas en vuelo;
+		// el Shutdown(ctx) con timeout es el que limita el drenaje.
+	}
 }
 
-// Handler retorna el http.Handler del servidor (para graceful shutdown).
+// Handler retorna el http.Handler del servidor (para tests o montaje externo).
 func (s *Server) Handler() http.Handler { return s.engine }

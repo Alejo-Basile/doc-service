@@ -124,18 +124,21 @@ type StatusEntry struct {
 }
 
 // Document es el agregado raíz del dominio. Es puro: sin dependencias de infraestructura.
+// Los tags `bson` mapean al esquema MongoDB (SPEC §3.6, ADR-0005).
+// NOTA: no hay campo `attempts`: el contador de reintentos es el delivery
+// count de Redis XPENDING (SPEC §5.4, decisión de diseño).
 type Document struct {
-	ID            string
-	Status        Status
-	ObjectKey     string
-	TxtRef        string
-	FailureReason string
-	CorrelationID string
-	SchemaVersion int
-	ExpiresAt     time.Time
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
-	History       []StatusEntry
+	ID            string        `bson:"_id" json:"id"`
+	Status        Status        `bson:"status" json:"status"`
+	ObjectKey     string        `bson:"object_key,omitempty" json:"object_key,omitempty"`
+	TxtRef        string        `bson:"txt_ref,omitempty" json:"txt_ref,omitempty"`
+	FailureReason string        `bson:"failure_reason,omitempty" json:"failure_reason,omitempty"`
+	CorrelationID string        `bson:"correlation_id" json:"correlation_id"`
+	SchemaVersion int           `bson:"schema_version" json:"schema_version"`
+	ExpiresAt     time.Time     `bson:"expires_at" json:"expires_at"`
+	CreatedAt     time.Time     `bson:"created_at" json:"created_at"`
+	UpdatedAt     time.Time     `bson:"updated_at" json:"updated_at"`
+	History       []StatusEntry `bson:"history" json:"history"`
 }
 
 // NewDocument crea un documento en estado inicial PENDING_UPLOAD.
