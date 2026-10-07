@@ -35,6 +35,9 @@ type Config struct {
 	RedisAddr      string
 	RedisStreamKey string
 
+	// Seguridad interna: token de los endpoints /internal/* (header X-Internal-Token).
+	InternalToken string
+
 	// Reglas de negocio
 	MaxPDFBytes       int64
 	ReconcileInterval time.Duration
@@ -74,6 +77,7 @@ func Load() (*Config, error) {
 		MinIOWebhookSecret:  strings.TrimSpace(os.Getenv("MINIO_WEBHOOK_SECRET")),
 		RedisAddr:           strings.TrimSpace(os.Getenv("REDIS_ADDR")),
 		RedisStreamKey:      envStr("REDIS_STREAM_KEY", defaultRedisStreamKey),
+		InternalToken:       strings.TrimSpace(os.Getenv("INTERNAL_TOKEN")),
 		MaxPDFBytes:         envInt64("MAX_PDF_BYTES", defaultMaxPDFBytes),
 		ReconcileInterval:   time.Duration(envInt("RECONCILE_INTERVAL_MIN", defaultReconcileMin)) * time.Minute,
 		DocUploadGrace:      time.Duration(envInt("DOC_UPLOAD_GRACE_MIN", defaultDocUploadGraceMin)) * time.Minute,
@@ -103,6 +107,7 @@ func (c *Config) Validate() error {
 		{"MINIO_SECRET_KEY", c.MinIOSecretKey, "secret key del servicio"},
 		{"MINIO_WEBHOOK_SECRET", c.MinIOWebhookSecret, "secreto compartido del webhook (SPEC §9)"},
 		{"REDIS_ADDR", c.RedisAddr, "host:puerto de Redis Streams"},
+		{"INTERNAL_TOKEN", c.InternalToken, "token de los endpoints internos (header X-Internal-Token)"},
 	}
 
 	for _, r := range required {
