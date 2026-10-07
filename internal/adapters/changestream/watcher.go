@@ -5,8 +5,10 @@ package changestream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	mongoadapter "github.com/Alejo-Basile/doc-service/internal/adapters/mongo"
@@ -14,6 +16,42 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
+
+// errResumeTokenInvalid señala que el resume token persistido fue rechazado
+// por el servidor (p.ej. entró en rotación del oplog) y el watcher debe
+// descartarlo y reiniciar el stream fresco en vez de reintentar el mismo
+// token en loop (S1-P2-07/08).
+var errResumeTokenInvalid = errors.New("resume token invalido, descartando y reiniciando stream")
+
+// maxConsecutiveResets limita los reinicios frescos consecutivos disparados
+// por un token invalidado, para no entrar en un tight-loop si el fallo persiste
+// (p.ej. Mongo inaccesible al mismo tiempo).
+const maxConsecutiveResets = 3
+
+// isResumeTokenInvalid detecta los errores fatales de Change Stream que Mongo
+// emite cuando no puede reanudar desde el resume token guardado. Se dispara
+// ante cualquier error del servidor que implique que el token persistido ya no
+// puede usarse:
+//
+//   - "cannot resume stream; the resume token was not found": token válido
+//     estructuralmente pero su opTime ya no está en el oplog (rotación).
+//     Error fatal en getMore ("stream error:") o al abrir ("watch:").
+//   - "Bad resume token" (Location40647) / "KeyString format error"
+//     (Location50810/50811): token corrupto o malformado en disco.
+//   - "resume token string was not a valid hex string" (FailedToParse):
+//     token ilegible que no deja validar la reanudación.
+//
+// En todos los casos reintentar el mismo token en loop es inútil: hay que
+// descartarlo y reiniciar el stream fresco (S1-P2-07/08).
+func isResumeTokenInvalid(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "cannot resume stream") ||
+		strings.Contains(msg, "resume token") ||
+		strings.Contains(msg, "KeyString format error")
+}
 
 // Event representa un evento del Change Stream filtrado.
 type Event struct {
@@ -76,9 +114,12 @@ func NewWatcher(
 
 // Run escucha el Change Stream hasta que el contexto se cancela (SIGTERM).
 // Reintenta con backoff exponencial y reanuda desde el último token
-// persistido (S1-P2-07, S1-P2-08).
+// persistido (S1-P2-07, S1-P2-08). Ante un resume token invalidado por el
+// servidor (rotación del oplog), el watcher descarta el token y reinicia el
+// stream fresco en vez de reintentar el mismo token en loop (S1-P2-07/08).
 func (w *Watcher) Run(ctx context.Context) error {
 	backoff := w.retryBackoff
+	resets := 0
 
 	for {
 		// Verificar cancelación antes de cada intento.
@@ -94,6 +135,25 @@ func (w *Watcher) Run(ctx context.Context) error {
 				return nil
 			}
 			return nil
+		}
+
+		// Token invalidado: se descartó dentro de watchOnce. Reiniciar fresco
+		// sin backoff creciente, con tope de resets consecutivos para no caer
+		// en un tight-loop si el fallo persiste por otra causa.
+		if errors.Is(err, errResumeTokenInvalid) {
+			if resets < maxConsecutiveResets {
+				resets++
+				slog.Warn("resume token invalidado: stream reiniciado fresco",
+					"reset", resets,
+					"max_resets", maxConsecutiveResets,
+				)
+				backoff = w.retryBackoff
+				continue
+			}
+			slog.Error("demasiados resets por resume token inválido, pasando a backoff normal",
+				"resets", resets,
+				"error", err,
+			)
 		}
 
 		slog.Error("change stream error, reintentando",
@@ -145,6 +205,9 @@ func (w *Watcher) watchOnce(ctx context.Context) error {
 
 	stream, err := w.coll.Watch(ctx, pipeline, opts)
 	if err != nil {
+		if token != "" && isResumeTokenInvalid(err) {
+			return w.discardToken(ctx, err)
+		}
 		return fmt.Errorf("watch: %w", err)
 	}
 	defer func() {
@@ -183,10 +246,27 @@ func (w *Watcher) watchOnce(ctx context.Context) error {
 	}
 
 	if err := stream.Err(); err != nil {
+		if token != "" && isResumeTokenInvalid(err) {
+			return w.discardToken(ctx, err)
+		}
 		return fmt.Errorf("stream error: %w", err)
 	}
 
 	return nil
+}
+
+// discardToken elimina el resume token persistido cuando Mongo rechaza
+// reanudar desde él (error fatal "cannot resume stream"), permitiendo que Run
+// reinicie el stream fresco en vez de reintentar el mismo token en loop.
+func (w *Watcher) discardToken(ctx context.Context, cause error) error {
+	if err := w.tokenStore.Delete(ctx); err != nil {
+		slog.Error("no se pudo eliminar el resume token invalidado", "error", err)
+		return errResumeTokenInvalid
+	}
+	slog.Warn("resume token invalidado: eliminado para reiniciar el stream fresco",
+		"error", cause,
+	)
+	return errResumeTokenInvalid
 }
 
 // parseEvent extrae los campos relevantes del evento del Change Stream.

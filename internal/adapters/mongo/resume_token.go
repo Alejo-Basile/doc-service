@@ -50,3 +50,14 @@ func (s *ResumeTokenStore) Save(ctx context.Context, token string) error {
 	}
 	return nil
 }
+
+// Delete elimina el resume token persistido. Permite al watcher reiniciar el
+// Change Stream desde cero cuando el token guardado quedó invalidado (p.ej.
+// rotación del oplog) y Mongo rechaza reanudar (SPEC §5.3, S1-P2-07/08).
+func (s *ResumeTokenStore) Delete(ctx context.Context) error {
+	_, err := s.coll.DeleteOne(ctx, bson.M{"_id": "change_stream"})
+	if err != nil {
+		return fmt.Errorf("resume token delete: %w", err)
+	}
+	return nil
+}
