@@ -43,8 +43,9 @@ func DefaultWorkQueueConfig() WorkQueueConfig {
 }
 
 // NewWorkQueue crea un WorkQueue sobre la dirección Redis indicada.
-func NewWorkQueue(addr string, cfg WorkQueueConfig) *WorkQueue {
-	client := redis.NewClient(&redis.Options{Addr: addr})
+// password autentica contra el servidor (vacío en instancias sin ACL).
+func NewWorkQueue(addr, password string, cfg WorkQueueConfig) *WorkQueue {
+	client := redis.NewClient(&redis.Options{Addr: addr, Password: password})
 	return &WorkQueue{
 		client:      client,
 		streamKey:   cfg.StreamKey,

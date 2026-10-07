@@ -13,7 +13,7 @@ import (
 	"github.com/Alejo-Basile/doc-service/internal/domain"
 )
 
-func testAddrs(t *testing.T) (string, string) {
+func testAddrs(t *testing.T) (string, string, string) {
 	t.Helper()
 	mongoURI := os.Getenv("MONGO_TEST_URI")
 	if mongoURI == "" {
@@ -23,11 +23,12 @@ func testAddrs(t *testing.T) (string, string) {
 	if redisAddr == "" {
 		redisAddr = "127.0.0.1:6379"
 	}
-	return mongoURI, redisAddr
+	redisPassword := os.Getenv("REDIS_TEST_PASSWORD")
+	return mongoURI, redisAddr, redisPassword
 }
 
 func TestRelay_EncolaEventoUPLOADED(t *testing.T) {
-	mongoURI, redisAddr := testAddrs(t)
+	mongoURI, redisAddr, redisPassword := testAddrs(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -48,7 +49,7 @@ func TestRelay_EncolaEventoUPLOADED(t *testing.T) {
 
 	queueCfg := redidadapter.DefaultWorkQueueConfig()
 	queueCfg.StreamKey = fmt.Sprintf("test:relay:%d", time.Now().UnixNano())
-	queue := redidadapter.NewWorkQueue(redisAddr, queueCfg)
+	queue := redidadapter.NewWorkQueue(redisAddr, redisPassword, queueCfg)
 	defer queue.Close()
 
 	if err := queue.Ping(ctx); err != nil {
@@ -117,7 +118,7 @@ func TestRelay_EncolaEventoUPLOADED(t *testing.T) {
 }
 
 func TestRelay_DosWatchersUnSoloMensaje(t *testing.T) {
-	mongoURI, redisAddr := testAddrs(t)
+	mongoURI, redisAddr, redisPassword := testAddrs(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -138,7 +139,7 @@ func TestRelay_DosWatchersUnSoloMensaje(t *testing.T) {
 
 	queueCfg := redidadapter.DefaultWorkQueueConfig()
 	queueCfg.StreamKey = fmt.Sprintf("test:relay2:%d", time.Now().UnixNano())
-	queue := redidadapter.NewWorkQueue(redisAddr, queueCfg)
+	queue := redidadapter.NewWorkQueue(redisAddr, redisPassword, queueCfg)
 	defer queue.Close()
 
 	r1 := New(queue, 1)

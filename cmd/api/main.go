@@ -108,13 +108,13 @@ func main() {
 
 	queueCfg := redisadapter.DefaultWorkQueueConfig()
 	queueCfg.StreamKey = cfg.RedisStreamKey
-	queue := redisadapter.NewWorkQueue(cfg.RedisAddr, queueCfg)
+	queue := redisadapter.NewWorkQueue(cfg.RedisAddr, cfg.RedisPassword, queueCfg)
 	if err := queue.Ping(startupCtx); err != nil {
 		slog.Error("no se pudo conectar a Redis", "error", err.Error())
 		_ = mongoClient.Close(context.Background())
 		os.Exit(1)
 	}
-	lease := redisadapter.NewLease(cfg.RedisAddr)
+	lease := redisadapter.NewLease(cfg.RedisAddr, cfg.RedisPassword)
 
 	// Cliente EXCLUSIVO del watcher sin timeout de cliente (Timeout=0).
 	// El driver v2 (csot) aplica ClientOptions.Timeout como deadline de toda

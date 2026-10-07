@@ -20,6 +20,11 @@ func testRedisAddr(t *testing.T) string {
 	return addr
 }
 
+func testRedisPassword(t *testing.T) string {
+	t.Helper()
+	return os.Getenv("REDIS_TEST_PASSWORD")
+}
+
 func setupTestQueue(t *testing.T) (*WorkQueue, context.Context, func()) {
 	t.Helper()
 
@@ -32,7 +37,7 @@ func setupTestQueue(t *testing.T) (*WorkQueue, context.Context, func()) {
 	cfg.WaitTimeout = 200 * time.Millisecond
 	cfg.DedupTTL = 1 * time.Minute
 
-	q := NewWorkQueue(testRedisAddr(t), cfg)
+	q := NewWorkQueue(testRedisAddr(t), testRedisPassword(t), cfg)
 
 	// Verificar conectividad.
 	if err := q.Ping(ctx); err != nil {
@@ -247,7 +252,7 @@ func TestWorkQueue_IntegracionConRedisReal(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	client := redis.NewClient(&redis.Options{Addr: testRedisAddr(t)})
+	client := redis.NewClient(&redis.Options{Addr: testRedisAddr(t), Password: testRedisPassword(t)})
 	defer client.Close()
 
 	if err := client.Ping(ctx).Err(); err != nil {
