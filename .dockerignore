@@ -1,0 +1,10 @@
+# Contexto de build minimo para el doc-service.
+.git
+.github
+docs
+*.md
+LICENSE
+SECURITY.md
+.env
+.env.*
+compose*.yml
