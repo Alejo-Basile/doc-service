@@ -16,8 +16,9 @@ func setEnv(t *testing.T, vars map[string]string) {
 		"MONGO_URI", "MONGO_DATABASE",
 		"MINIO_ENDPOINT", "MINIO_PUBLIC_ENDPOINT", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY",
 		"MINIO_BUCKET_RAW", "MINIO_BUCKET_TXT", "MINIO_WEBHOOK_SECRET",
-		"REDIS_ADDR", "REDIS_STREAM_KEY",
+		"REDIS_ADDR", "REDIS_STREAM_KEY", "INTERNAL_TOKEN",
 		"MAX_PDF_BYTES", "RECONCILE_INTERVAL_MIN", "DOC_UPLOAD_GRACE_MIN",
+		"MIN_SAFETY_AGE_MIN",
 	}
 	for _, k := range claves {
 		os.Unsetenv(k)
@@ -42,6 +43,7 @@ func completeVars() map[string]string {
 		"MINIO_SECRET_KEY":      "minioadmin",
 		"MINIO_WEBHOOK_SECRET":  "shared-secret",
 		"REDIS_ADDR":            "localhost:6379",
+		"INTERNAL_TOKEN":        "internal-test-token",
 	}
 }
 
@@ -122,6 +124,7 @@ func TestLoad_MultiplesVariablesFaltantes_AcumulaErrores(t *testing.T) {
 	esperadas := []string{
 		"MONGO_URI", "MINIO_ENDPOINT", "MINIO_PUBLIC_ENDPOINT",
 		"MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "MINIO_WEBHOOK_SECRET", "REDIS_ADDR",
+		"INTERNAL_TOKEN",
 	}
 	for _, e := range esperadas {
 		if !strings.Contains(err.Error(), e) {
@@ -129,8 +132,8 @@ func TestLoad_MultiplesVariablesFaltantes_AcumulaErrores(t *testing.T) {
 		}
 	}
 	// Debe indicar cuántas faltan.
-	if !strings.Contains(err.Error(), "faltan 7 variables") {
-		t.Errorf("el error debe indicar 'faltan 7 variables', got: %v", err)
+	if !strings.Contains(err.Error(), "faltan 8 variables") {
+		t.Errorf("el error debe indicar 'faltan 8 variables', got: %v", err)
 	}
 }
 

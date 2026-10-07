@@ -35,10 +35,16 @@ type Config struct {
 	RedisAddr      string
 	RedisStreamKey string
 
+	// Seguridad interna: token de los endpoints /internal/* (header X-Internal-Token).
+	InternalToken string
+
 	// Reglas de negocio
 	MaxPDFBytes       int64
 	ReconcileInterval time.Duration
 	DocUploadGrace    time.Duration
+	// MinSafetyAge es la edad mínima antes de que el reconciliador toque un documento (S6-P2-02).
+	// Documentos más jóvenes que esto nunca son alterados bajo ninguna condición.
+	MinSafetyAge time.Duration
 }
 
 // default values documentados en SPEC §11.5.
@@ -51,6 +57,7 @@ const (
 	defaultMaxPDFBytes       = 26214400 // 25 MB (SPEC §5.1)
 	defaultReconcileMin      = 10
 	defaultDocUploadGraceMin = 30 // >= 2x reconcil interval (SPEC §4)
+	defaultMinSafetyAgeMin   = 15 // >= 1x reconcil interval (S6-P2-02)
 )
 
 // Load lee las variables de entorno, aplica defaults y valida.
@@ -70,9 +77,11 @@ func Load() (*Config, error) {
 		MinIOWebhookSecret:  strings.TrimSpace(os.Getenv("MINIO_WEBHOOK_SECRET")),
 		RedisAddr:           strings.TrimSpace(os.Getenv("REDIS_ADDR")),
 		RedisStreamKey:      envStr("REDIS_STREAM_KEY", defaultRedisStreamKey),
+		InternalToken:       strings.TrimSpace(os.Getenv("INTERNAL_TOKEN")),
 		MaxPDFBytes:         envInt64("MAX_PDF_BYTES", defaultMaxPDFBytes),
 		ReconcileInterval:   time.Duration(envInt("RECONCILE_INTERVAL_MIN", defaultReconcileMin)) * time.Minute,
 		DocUploadGrace:      time.Duration(envInt("DOC_UPLOAD_GRACE_MIN", defaultDocUploadGraceMin)) * time.Minute,
+		MinSafetyAge:        time.Duration(envInt("MIN_SAFETY_AGE_MIN", defaultMinSafetyAgeMin)) * time.Minute,
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -98,6 +107,7 @@ func (c *Config) Validate() error {
 		{"MINIO_SECRET_KEY", c.MinIOSecretKey, "secret key del servicio"},
 		{"MINIO_WEBHOOK_SECRET", c.MinIOWebhookSecret, "secreto compartido del webhook (SPEC §9)"},
 		{"REDIS_ADDR", c.RedisAddr, "host:puerto de Redis Streams"},
+		{"INTERNAL_TOKEN", c.InternalToken, "token de los endpoints internos (header X-Internal-Token)"},
 	}
 
 	for _, r := range required {
@@ -129,6 +139,14 @@ func (c *Config) Validate() error {
 		return fmt.Errorf(
 			"configuración inválida: DOC_UPLOAD_GRACE_MIN (%s) debe ser >= 2x RECONCILE_INTERVAL_MIN (%s)",
 			c.DocUploadGrace, minGrace,
+		)
+	}
+	// S6-P2-02: la edad mínima de seguridad debe ser >= 1x el intervalo,
+	// para que el reconciliador nunca toque documentos en tránsito legítimo.
+	if c.MinSafetyAge < c.ReconcileInterval {
+		return fmt.Errorf(
+			"configuración inválida: MIN_SAFETY_AGE_MIN (%s) debe ser >= RECONCILE_INTERVAL_MIN (%s)",
+			c.MinSafetyAge, c.ReconcileInterval,
 		)
 	}
 

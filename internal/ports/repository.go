@@ -5,10 +5,14 @@ package ports
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/Alejo-Basile/doc-service/internal/domain"
 )
+
+// ErrNotFound se devuelve cuando un recurso no existe.
+var ErrNotFound = errors.New("recurso no encontrado")
 
 // DocumentRepository define las operaciones de persistencia del agregado Document.
 type DocumentRepository interface {
@@ -18,7 +22,13 @@ type DocumentRepository interface {
 	// updateOne({_id, status: from}, {$set: {status: to, ...}}).
 	// Devuelve (false, nil) si el filtro no matcheó (documento no está en `from`).
 	UpdateStatus(ctx context.Context, id string, from, to domain.Status, fields map[string]any) (bool, error)
+	// UpdateStatusWithHistory aplica la transición condicional y agrega una
+	// entrada al historial en la misma operación (pipeline update).
+	UpdateStatusWithHistory(ctx context.Context, id string, from, to domain.Status, entry domain.StatusEntry, extraSet map[string]any) (bool, error)
 	List(ctx context.Context, filter ListFilter) ([]*domain.Document, int64, error)
+	// ListByCursor pagina por cursor compuesto (created_at, _id) en orden descendente.
+	// No salta ni repite registros ante inserciones concurrentes (SPEC §5.2).
+	ListByCursor(ctx context.Context, filter CursorFilter) ([]*domain.Document, string, error)
 }
 
 // ListFilter representa los criterios de listado paginado.
@@ -28,6 +38,15 @@ type ListFilter struct {
 	Limit      int64
 	BeforeTime time.Time
 	BeforeID   string
+}
+
+// CursorFilter representa los criterios de paginación por cursor (S3-P2-10).
+type CursorFilter struct {
+	Status domain.Status
+	// Cursor es el token opaco devuelto en la página anterior.
+	// Formato: base64("RFC3339Nano|_id").
+	Cursor string
+	Limit  int64
 }
 
 // ResumeTokenStore persiste el resume token del Change Stream (SPEC §5.3).
@@ -48,10 +67,15 @@ type ObjectStorage interface {
 	Delete(ctx context.Context, objectKey string) error
 	// PresignGet genera una URL prefirmada de lectura.
 	PresignGet(ctx context.Context, objectKey string, expiry time.Duration) (string, error)
+	// PresignGetTXT genera una URL prefirmada de lectura del bucket extracted-txt.
+	PresignGetTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error)
+	// ListObjects lista todos los objetos del bucket raw (para purga de huérfanos).
+	ListObjects(ctx context.Context) ([]ObjectInfo, error)
 }
 
 // PresignPostOptions configura la política de la URL prefirmada.
 type PresignPostOptions struct {
+	Bucket         string
 	MaxSizeBytes   int64
 	ContentType    string
 	Expiration     time.Duration
@@ -100,3 +124,12 @@ type Clock interface {
 type SystemClock struct{}
 
 func (SystemClock) Now() time.Time { return time.Now().UTC() }
+
+// DistributedLease abstracte un bloqueo distribuido (lease con TTL).
+// Se usa para evitar ejecución concurrente del reconciliador entre réplicas (S4-P2-03).
+type DistributedLease interface {
+	// Acquire intenta adquirir el lease. Devuelve false si otro holder lo tiene.
+	Acquire(ctx context.Context, key string, ttl time.Duration) (bool, error)
+	// Release libera el lease (debe ser el holder actual).
+	Release(ctx context.Context, key string) error
+}

@@ -33,6 +33,21 @@ func NewServer(debug bool) *Server {
 // Engine retorna el motor Gin (útil para tests con httptest).
 func (s *Server) Engine() *gin.Engine { return s.engine }
 
+// RouteRegistrar es cualquier handler capaz de registrar sus rutas
+// sobre el motor Gin (DocumentHandler, WebhookHandler, etc.).
+type RouteRegistrar interface {
+	RegisterRoutes(engine *gin.Engine)
+}
+
+// RegisterAPI registra las rutas de la API y los endpoints internos.
+// Debe invocarse después de NewServer y antes de NewHTTPServer, con los
+// handlers ya construidos por inyección de dependencias en main.
+func (s *Server) RegisterAPI(registrars ...RouteRegistrar) {
+	for _, r := range registrars {
+		r.RegisterRoutes(s.engine)
+	}
+}
+
 // registerRoutes registra todas las rutas del servicio.
 func (s *Server) registerRoutes() {
 	// Middlewares globales: correlation_id → request logging → error logging → recovery.
@@ -48,10 +63,8 @@ func (s *Server) registerRoutes() {
 	s.engine.GET("/healthz", handleHealthz)
 	s.engine.GET("/readyz", handleReadyz)
 
-	// Rutas de la API v2 se registran en fases posteriores:
-	// s.engine.Group("/api/v2/documents", ...)
-	// Rutas internas (webhook MinIO, etc.):
-	// s.engine.Group("/internal", ...)
+	// Rutas de la API v2 y endpoints internos se registran vía RegisterAPI
+	// (inyección de dependencias desde cmd/api/main.go).
 }
 
 // NewHTTPServer crea un *http.Server configurado para graceful shutdown.
