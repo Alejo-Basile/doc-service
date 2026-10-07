@@ -19,7 +19,7 @@ type PoolConfig struct {
 	MaxPoolSize     uint64
 	MinPoolSize     uint64
 	ConnectTimeout  time.Duration
-	Timeout         time.Duration // timeout global de operaciones (antes socketTimeoutMS)
+	Timeout         time.Duration // timeout global de operaciones (antes socketTimeoutMS); 0 = sin deadline de cliente. OJO: el driver v2 lo aplica también a change streams: un stream con Timeout muere exactamente al vencer (usar 0 para el cliente del watcher)
 	MaxConnIdleTime time.Duration
 	RetryWrites     bool
 }

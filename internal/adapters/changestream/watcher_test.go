@@ -359,3 +359,80 @@ func TestWatcher_ParseEvent(t *testing.T) {
 		t.Errorf("SchemaVersion esperado 1, got %d", event.SchemaVersion)
 	}
 }
+
+// TestWatcher_ClienteSinTimeout_SuperaVentanaDeOperacion verifica que el
+// watcher construido con un cliente SIN Timeout de cliente (Timeout=0,
+// igual que cmd/api/main.go) mantenga el stream vivo y entregue eventos
+// que ocurren después de la ventana típica de timeout de operación.
+//
+// Contexto: el driver v2 (csot) aplica ClientOptions.Timeout como deadline
+// de toda operación, incluidos los getMore del change stream. Con el
+// Timeout de 30s de DefaultPoolConfig el stream moría exactamente a los
+// 30s, sin resume token persistido (nunca llegaba un evento), y entraba en
+// un ciclo reinicio→muerte que perdía eventos del relay del SAGA
+// (verificado en smoke test end-to-end). Este test fija la construcción
+// correcta: cliente propio con Timeout=0.
+func TestWatcher_ClienteSinTimeout_SuperaVentanaDeOperacion(t *testing.T) {
+	h, ctx, cleanup := setupHarness(t)
+	defer cleanup()
+
+	// Cliente dedicado al watcher con Timeout=0 (patrón de main.go).
+	pool := mongo.DefaultPoolConfig()
+	pool.Timeout = 0
+	watcherClient, err := mongo.NewClient(ctx, testMongoURI(t), h.dbName, pool)
+	if err != nil {
+		t.Fatalf("cliente del watcher: %v", err)
+	}
+	defer func() { _ = watcherClient.Close(context.Background()) }()
+
+	tokenStore := mongo.NewResumeTokenStore(watcherClient)
+
+	var mu sync.Mutex
+	var received []Event
+	handler := func(ctx context.Context, event Event) error {
+		mu.Lock()
+		received = append(received, event)
+		mu.Unlock()
+		return nil
+	}
+
+	w := NewWatcher(watcherClient, tokenStore, handler, DefaultWatcherConfig())
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		_ = w.Run(ctx)
+	}()
+
+	// Ventana deliberadamente mayor que un timeout de operación corto:
+	// si el cliente llevara Timeout activo, el stream habría muerto y
+	// reiniciado sin resume token, perdiendo el evento de abajo.
+	time.Sleep(6 * time.Second)
+
+	doc := domain.NewDocument("corr-cs-notimeout", time.Now().UTC().Add(24*time.Hour))
+	doc.SetObjectKey("raw-pdfs")
+	if err := h.repo.Insert(ctx, doc); err != nil {
+		t.Fatalf("Insert falló: %v", err)
+	}
+	ok, err := h.repo.UpdateStatus(ctx, doc.ID,
+		domain.StatusPendingUpload, domain.StatusUploaded,
+		map[string]any{"object_key": doc.ObjectKey},
+	)
+	if err != nil || !ok {
+		t.Fatalf("UpdateStatus falló: ok=%v err=%v", ok, err)
+	}
+
+	deadline := time.After(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(received)
+		mu.Unlock()
+		if n >= 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("el watcher no entregó el evento UPLOADED: stream murió por Timeout de cliente reintroducido")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
