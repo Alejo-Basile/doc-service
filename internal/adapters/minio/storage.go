@@ -112,14 +112,11 @@ func (o *ObjectStorage) PresignPost(
 		policy.SetContentType(opts.ContentType)
 	}
 
-	// Para presign, usamos un cliente apuntando al host público (SNI, certificación
-	// y esquema correctos). Si no hay host público configurado, caemos al interno.
-	presignCli := o.presignClient
-	if presignCli == nil {
-		presignCli = o.client
-	}
-
-	u, formData, err := presignCli.PresignedPostPolicy(ctx, policy)
+	// POST policy: la firma SigV4 de la politica NO depende del Host header
+	// (se firma el documento de la politica, no el request). Se usa el cliente
+	// interno para el round-trip de region/signatura y luego se reescribe el
+	// host al publico para el navegador. Si no hay host publico, queda el interno.
+	u, formData, err := o.client.PresignedPostPolicy(ctx, policy)
 	if err != nil {
 		return nil, fmt.Errorf("presign POST %s/%s: %w", bucket, objectKey, err)
 	}
