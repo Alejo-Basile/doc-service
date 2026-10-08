@@ -33,6 +33,7 @@ type Config struct {
 
 	// Redis
 	RedisAddr      string
+	RedisPassword  string
 	RedisStreamKey string
 
 	// Seguridad interna: token de los endpoints /internal/* (header X-Internal-Token).
@@ -76,6 +77,7 @@ func Load() (*Config, error) {
 		MinIOBucketTXT:      envStr("MINIO_BUCKET_TXT", defaultMinIOBucketTXT),
 		MinIOWebhookSecret:  strings.TrimSpace(os.Getenv("MINIO_WEBHOOK_SECRET")),
 		RedisAddr:           strings.TrimSpace(os.Getenv("REDIS_ADDR")),
+		RedisPassword:       strings.TrimSpace(os.Getenv("REDIS_PASSWORD")),
 		RedisStreamKey:      envStr("REDIS_STREAM_KEY", defaultRedisStreamKey),
 		InternalToken:       strings.TrimSpace(os.Getenv("INTERNAL_TOKEN")),
 		MaxPDFBytes:         envInt64("MAX_PDF_BYTES", defaultMaxPDFBytes),
@@ -107,6 +109,7 @@ func (c *Config) Validate() error {
 		{"MINIO_SECRET_KEY", c.MinIOSecretKey, "secret key del servicio"},
 		{"MINIO_WEBHOOK_SECRET", c.MinIOWebhookSecret, "secreto compartido del webhook (SPEC §9)"},
 		{"REDIS_ADDR", c.RedisAddr, "host:puerto de Redis Streams"},
+		{"REDIS_PASSWORD", c.RedisPassword, "contraseña de Redis Streams (SPEC §9.4)"},
 		{"INTERNAL_TOKEN", c.InternalToken, "token de los endpoints internos (header X-Internal-Token)"},
 	}
 

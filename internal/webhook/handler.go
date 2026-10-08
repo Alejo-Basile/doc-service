@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/Alejo-Basile/doc-service/internal/domain"
@@ -18,9 +19,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// Evento mínimo de MinIO Bucket Notifications que nos interesa.
+// Evento minimo de MinIO Bucket Notifications que nos interesa.
+// Soporta el formato con s3 anidado en Records (payload real de MinIO, CI-D)
+// y el formato legado con s3 en la raiz (compatibilidad con tests existentes).
 type minioEvent struct {
 	EventName string `json:"EventName"`
+	Key       string `json:"Key"`
 	S3        struct {
 		Bucket struct {
 			Name string `json:"name"`
@@ -29,6 +33,17 @@ type minioEvent struct {
 			Key string `json:"key"`
 		} `json:"object"`
 	} `json:"s3"`
+	Records []struct {
+		EventName string `json:"eventName"`
+		S3        struct {
+			Bucket struct {
+				Name string `json:"name"`
+			} `json:"bucket"`
+			Object struct {
+				Key string `json:"key"`
+			} `json:"object"`
+		} `json:"s3"`
+	} `json:"Records"`
 }
 
 // Handler procesa los eventos del webhook de MinIO.
@@ -106,21 +121,53 @@ func (h *Handler) HandleEvent(c *gin.Context) {
 	}
 
 	// Verificar que es un evento ObjectCreated.
-	if !strings.Contains(event.EventName, "ObjectCreated") {
-		slog.Debug("webhook: evento ignorado (no ObjectCreated)", "event", event.EventName)
+	// El evento puede traer EventName en la raiz o por record (formato AWS).
+	eventName := event.EventName
+	if eventName == "" && len(event.Records) > 0 {
+		eventName = event.Records[0].EventName
+	}
+	if !strings.Contains(eventName, "ObjectCreated") {
+		slog.Debug("webhook: evento ignorado (no ObjectCreated)", "event", eventName)
 		c.JSON(http.StatusOK, gin.H{"status": "ignored", "reason": "not ObjectCreated"})
 		return
 	}
 
 	// 3. Filtrar por bucket y prefijo (S3-P2-05).
-	if event.S3.Bucket.Name != h.bucketRaw {
+	// Payload real de MinIO: s3 anidado dentro de Records[0]. Payload legado: s3 en raiz.
+	bucket := event.S3.Bucket.Name
+	objectKey := event.S3.Object.Key
+	if len(event.Records) > 0 {
+		if event.Records[0].S3.Bucket.Name != "" {
+			bucket = event.Records[0].S3.Bucket.Name
+		}
+		if event.Records[0].S3.Object.Key != "" {
+			objectKey = event.Records[0].S3.Object.Key
+		}
+	}
+	// Fallback: algunos formatos exponen la clave en la raiz del evento.
+	if objectKey == "" {
+		objectKey = event.Key
+	}
+	// MinIO puede URL-encodear la clave (espacios, caracteres especiales).
+	if objectKey != "" {
+		if decoded, err := url.QueryUnescape(objectKey); err == nil {
+			objectKey = decoded
+		}
+	}
+
+	if bucket != h.bucketRaw {
 		slog.Debug("webhook: evento de bucket distinto ignorado",
-			"bucket", event.S3.Bucket.Name, "esperado", h.bucketRaw)
+			"bucket", bucket, "esperado", h.bucketRaw)
 		c.JSON(http.StatusOK, gin.H{"status": "ignored", "reason": "wrong bucket"})
 		return
 	}
 
-	objectKey := event.S3.Object.Key
+	if objectKey == "" {
+		slog.Warn("webhook: key vacia en evento")
+		c.JSON(http.StatusOK, gin.H{"status": "ignored", "reason": "empty key"})
+		return
+	}
+
 	if !strings.HasPrefix(objectKey, h.keyPrefix) {
 		slog.Debug("webhook: clave con prefijo inesperado ignorada",
 			"key", objectKey, "prefijo_esperado", h.keyPrefix)
@@ -139,7 +186,7 @@ func (h *Handler) HandleEvent(c *gin.Context) {
 	slog.Info("webhook: evento procesado",
 		"document_id", docID,
 		"object_key", objectKey,
-		"event", event.EventName,
+		"event", eventName,
 	)
 
 	// 5. Transición condicional PENDING_UPLOAD → UPLOADED (S3-P2-07).

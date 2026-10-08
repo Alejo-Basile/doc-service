@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -357,6 +358,248 @@ func TestWatcher_ParseEvent(t *testing.T) {
 	}
 	if event.SchemaVersion != 1 {
 		t.Errorf("SchemaVersion esperado 1, got %d", event.SchemaVersion)
+	}
+}
+
+// TestIsResumeTokenInvalid verifica el matcher que detecta el error fatal de
+// Change Stream ante un resume token invalidado por el servidor (rotación del
+// oplog). Cubre los dos wrappers observados en runtime: la apertura del stream
+// ("watch:") y el getMore ("stream error:").
+func TestIsResumeTokenInvalid(t *testing.T) {
+	tt := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "nil",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "watch wrapper",
+			err:  fmt.Errorf("watch: (ChangeStreamFatalError) Executor error during getMore :: caused by :: cannot resume stream; the resume token was not found"),
+			want: true,
+		},
+		{
+			name: "stream error wrapper",
+			err:  fmt.Errorf("stream error: (ChangeStreamFatalError) Executor error during getMore :: caused by :: cannot resume stream; the resume token was not found"),
+			want: true,
+		},
+		{
+			name: "error no relacionado",
+			err:  fmt.Errorf("stream error: connection refused"),
+			want: false,
+		},
+		{
+			name: "token corrupto en disco (Location40647)",
+			err:  fmt.Errorf(`watch: (Location40647) Bad resume token: error deserialization feature is not enabled`),
+			want: true,
+		},
+		{
+			name: "token malformado (FailedToParse)",
+			err:  fmt.Errorf(`watch: (FailedToParse) resume token string was not a valid hex string`),
+			want: true,
+		},
+		{
+			name: "keystring corrupto (Location50811)",
+			err:  fmt.Errorf(`watch: (Location50811) KeyString format error: Unknown type: 0`),
+			want: true,
+		},
+		{
+			name: "error relacionado pero sin substring clave",
+			err:  fmt.Errorf("watch: (NetworkTimeout) timed out"),
+			want: false,
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isResumeTokenInvalid(tc.err); got != tc.want {
+				t.Errorf("isResumeTokenInvalid(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWatcher_RecuperaTrasTokenInvalido verifica la auto-recuperación
+// (S1-P2-07/08): cuando Mongo rechaza reanudar desde el resume token
+// persistido ("cannot resume stream; the resume token was not found"), el
+// watcher debe descartar el token, reiniciar el stream fresco y seguir
+// procesando eventos sin intervención manual.
+//
+// Para reproducir el fallo de forma determinista se genera un resume token
+// REAL (watcher procesa un evento y lo persiste), se corrompe su clusterTime
+// llevándolo a opTime 0,0 (anterior al oplog) y se vuelve a sembrar: Mongo
+// rechaza la reanudación tal como ocurre tras una rotación del oplog.
+func TestWatcher_RecuperaTrasTokenInvalido(t *testing.T) {
+	h, ctx, cleanup := setupHarness(t)
+	defer cleanup()
+
+	// Fase A: watcher real procesa un evento y persiste un token válido.
+	{
+		var mu sync.Mutex
+		var received []Event
+		handler := func(ctx context.Context, event Event) error {
+			mu.Lock()
+			received = append(received, event)
+			mu.Unlock()
+			return nil
+		}
+		phaseA, cancelA := context.WithCancel(ctx)
+		w := NewWatcher(h.client, h.tokenStore, handler, DefaultWatcherConfig())
+		done := make(chan struct{})
+		go func() { defer close(done); _ = w.Run(phaseA) }()
+
+		time.Sleep(500 * time.Millisecond)
+		doc := domain.NewDocument("corr-cs-heal-a", time.Now().UTC().Add(24*time.Hour))
+		doc.SetObjectKey("raw-pdfs")
+		if err := h.repo.Insert(ctx, doc); err != nil {
+			t.Fatalf("Insert falló: %v", err)
+		}
+		ok, err := h.repo.UpdateStatus(ctx, doc.ID,
+			domain.StatusPendingUpload, domain.StatusUploaded,
+			map[string]any{"object_key": doc.ObjectKey},
+		)
+		if err != nil || !ok {
+			t.Fatalf("UpdateStatus falló: ok=%v err=%v", ok, err)
+		}
+
+		deadline := time.After(3 * time.Second)
+		for {
+			mu.Lock()
+			n := len(received)
+			mu.Unlock()
+			if n >= 1 {
+				break
+			}
+			select {
+			case <-deadline:
+				t.Fatal("no se recibió evento en fase A")
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+		// Dejar que el watcher persista el token antes de cerrar la fase.
+		time.Sleep(500 * time.Millisecond)
+		cancelA()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	}
+
+	// Fase B: corromper el clusterTime del token persistido (opTime 0,0).
+	token, err := h.tokenStore.Get(ctx)
+	if err != nil {
+		t.Fatalf("tokenStore.Get: %v", err)
+	}
+	if token == "" {
+		t.Fatal("el watcher debió persistir un resume token en fase A")
+	}
+
+	var raw bson.Raw
+	if err := bson.UnmarshalExtJSON([]byte(token), true, &raw); err != nil {
+		t.Fatalf("deserializar token real: %v", err)
+	}
+	var doc bson.M
+	if err := bson.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("deserializar raw token: %v", err)
+	}
+	dataHex, ok := doc["_data"].(string)
+	if !ok || len(dataHex) < 16 {
+		t.Fatalf("token sin campo _data hex válido: %v", doc)
+	}
+	staleHex := strings.Repeat("0", 16) + dataHex[16:]
+	staleDoc, err := bson.MarshalExtJSON(
+		bson.D{{Key: "_data", Value: staleHex}}, true, false,
+	)
+	if err != nil {
+		t.Fatalf("serializar token stale: %v", err)
+	}
+	if err := h.tokenStore.Save(ctx, string(staleDoc)); err != nil {
+		t.Fatalf("sembrar token stale: %v", err)
+	}
+
+	// Fase C: nuevo watcher debe auto-recuperarse.
+	var mu sync.Mutex
+	var received []Event
+	handler := func(ctx context.Context, event Event) error {
+		mu.Lock()
+		received = append(received, event)
+		mu.Unlock()
+		return nil
+	}
+	w := NewWatcher(h.client, h.tokenStore, handler, DefaultWatcherConfig())
+
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		_ = w.Run(ctx)
+	}()
+
+	// 1) El watcher debe darse cuenta solo: eliminar el token inválido.
+	deadline := time.After(8 * time.Second)
+	for {
+		cur, err := h.tokenStore.Get(ctx)
+		if err != nil {
+			t.Fatalf("tokenStore.Get: %v", err)
+		}
+		if cur == "" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("el watcher no descartó el resume token inválido en 8s")
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+
+	// 2) El stream reiniciado fresco debe seguir procesando eventos.
+	time.Sleep(500 * time.Millisecond)
+
+	docB := domain.NewDocument("corr-cs-heal-b", time.Now().UTC().Add(24*time.Hour))
+	docB.SetObjectKey("raw-pdfs")
+	if err := h.repo.Insert(ctx, docB); err != nil {
+		t.Fatalf("Insert falló: %v", err)
+	}
+	ok, err = h.repo.UpdateStatus(ctx, docB.ID,
+		domain.StatusPendingUpload, domain.StatusUploaded,
+		map[string]any{"object_key": docB.ObjectKey},
+	)
+	if err != nil || !ok {
+		t.Fatalf("UpdateStatus falló: ok=%v err=%v", ok, err)
+	}
+
+	deadline = time.After(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(received)
+		mu.Unlock()
+		if n >= 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("el watcher no procesó eventos tras la auto-recuperación")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	mu.Lock()
+	got := received[0]
+	mu.Unlock()
+	if got.DocumentID != docB.ID || got.Status != "UPLOADED" {
+		t.Errorf("evento recibido inesperado: %+v", got)
+	}
+
+	// 3) A partir de acá el resume token se persiste de nuevo (reanudación sana).
+	time.Sleep(500 * time.Millisecond)
+	token, err = h.tokenStore.Get(ctx)
+	if err != nil {
+		t.Fatalf("tokenStore.Get tras heal: %v", err)
+	}
+	if token == "" {
+		t.Error("esperaba un resume token persistido tras el heal")
 	}
 }
 

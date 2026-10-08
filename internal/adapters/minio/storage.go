@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/Alejo-Basile/doc-service/internal/ports"
@@ -33,10 +35,12 @@ type Config struct {
 // ObjectStorage implementa ports.ObjectStorage sobre MinIO.
 // Los buckets se configuran al crear el adaptador (no se pasan por llamada).
 type ObjectStorage struct {
-	client         *miniogo.Client
-	publicEndpoint string
-	bucketRaw      string
-	bucketTXT      string
+	client          *miniogo.Client
+	presignClient   *miniogo.Client
+	publicEndpoint  string
+	publicEndpointU *url.URL
+	bucketRaw       string
+	bucketTXT       string
 }
 
 // New crea un ObjectStorage conectado a MinIO.
@@ -49,11 +53,35 @@ func New(cfg Config) (*ObjectStorage, error) {
 		return nil, fmt.Errorf("minio client: %w", err)
 	}
 
+	var presignClient *miniogo.Client
+	var pubEP string
+	var pubU *url.URL
+	if strings.TrimSpace(cfg.PublicEndpoint) != "" {
+		pubEP = strings.TrimRight(cfg.PublicEndpoint, "/")
+		u, err := url.Parse(pubEP)
+		if err != nil {
+			return nil, fmt.Errorf("public endpoint inválido: %w", err)
+		}
+		pubU = u
+		secure := u.Scheme == "https"
+		presignClient, err = miniogo.New(u.Host, &miniogo.Options{
+			Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
+			Secure: secure,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("minio presign client: %w", err)
+		}
+	} else {
+		presignClient = client
+	}
+
 	return &ObjectStorage{
-		client:         client,
-		publicEndpoint: cfg.PublicEndpoint,
-		bucketRaw:      cfg.BucketRaw,
-		bucketTXT:      cfg.BucketTXT,
+		client:          client,
+		presignClient:   presignClient,
+		publicEndpoint:  pubEP,
+		publicEndpointU: pubU,
+		bucketRaw:       cfg.BucketRaw,
+		bucketTXT:       cfg.BucketTXT,
 	}, nil
 }
 
@@ -84,12 +112,27 @@ func (o *ObjectStorage) PresignPost(
 		policy.SetContentType(opts.ContentType)
 	}
 
+	// POST policy: la firma SigV4 de la politica NO depende del Host header
+	// (se firma el documento de la politica, no el request). Se usa el cliente
+	// interno para el round-trip de region/signatura y luego se reescribe el
+	// host al publico para el navegador. Si no hay host publico, queda el interno.
 	u, formData, err := o.client.PresignedPostPolicy(ctx, policy)
 	if err != nil {
 		return nil, fmt.Errorf("presign POST %s/%s: %w", bucket, objectKey, err)
 	}
 
 	uploadURL := u.String()
+	// Reemplazar host por el público si lo indicaron explícitamente (evita redirects
+	// hacia el endpoint interno en flujos navegador/S3 POST).
+	if o.publicEndpointU != nil && o.publicEndpoint != "" {
+		// reconstruir con esquema+host públicos
+		up, perr := url.Parse(uploadURL)
+		if perr == nil {
+			up.Scheme = o.publicEndpointU.Scheme
+			up.Host = o.publicEndpointU.Host
+			uploadURL = up.String()
+		}
+	}
 
 	// Merge de los campos del formulario con los que ya tenemos.
 	fields := map[string]string{
@@ -160,20 +203,38 @@ func (o *ObjectStorage) Delete(ctx context.Context, objectKey string) error {
 
 // PresignGet genera una URL prefirmada de lectura del bucket raw.
 func (o *ObjectStorage) PresignGet(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
-	u, err := o.client.PresignedGetObject(ctx, o.bucketRaw, objectKey, expiry, nil)
+	u, err := o.presignClient.PresignedGetObject(ctx, o.bucketRaw, objectKey, expiry, nil)
 	if err != nil {
 		return "", fmt.Errorf("presign GET %s/%s: %w", o.bucketRaw, objectKey, err)
 	}
-	return u.String(), nil
+	res := u.String()
+	if o.publicEndpointU != nil && o.publicEndpoint != "" {
+		up, perr := url.Parse(res)
+		if perr == nil {
+			up.Scheme = o.publicEndpointU.Scheme
+			up.Host = o.publicEndpointU.Host
+			res = up.String()
+		}
+	}
+	return res, nil
 }
 
 // PresignGetTXT genera una URL prefirmada de lectura del bucket de textos.
 func (o *ObjectStorage) PresignGetTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
-	u, err := o.client.PresignedGetObject(ctx, o.bucketTXT, objectKey, expiry, nil)
+	u, err := o.presignClient.PresignedGetObject(ctx, o.bucketTXT, objectKey, expiry, nil)
 	if err != nil {
 		return "", fmt.Errorf("presign GET TXT %s/%s: %w", o.bucketTXT, objectKey, err)
 	}
-	return u.String(), nil
+	res := u.String()
+	if o.publicEndpointU != nil && o.publicEndpoint != "" {
+		up, perr := url.Parse(res)
+		if perr == nil {
+			up.Scheme = o.publicEndpointU.Scheme
+			up.Host = o.publicEndpointU.Host
+			res = up.String()
+		}
+	}
+	return res, nil
 }
 
 // Upload sube datos crudos al bucket raw (para tests y uso interno).

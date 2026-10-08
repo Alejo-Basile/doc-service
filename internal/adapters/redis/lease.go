@@ -16,8 +16,9 @@ type Lease struct {
 }
 
 // NewLease crea un Lease sobre la dirección Redis indicada.
-func NewLease(addr string) *Lease {
-	return &Lease{client: redis.NewClient(&redis.Options{Addr: addr})}
+// password autentica contra el servidor (vacío en instancias sin ACL).
+func NewLease(addr, password string) *Lease {
+	return &Lease{client: redis.NewClient(&redis.Options{Addr: addr, Password: password})}
 }
 
 // NewLeaseFromClient crea un Lease sobre un cliente Redis existente.

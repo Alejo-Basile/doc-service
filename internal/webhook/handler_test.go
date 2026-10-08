@@ -365,3 +365,93 @@ func TestVerifyToken_ConstantTime(t *testing.T) {
 		t.Error("verifyToken without secret = true, want false")
 	}
 }
+
+func TestHandleEvent_RealMinIOPayload_RecordsFormat_Transitions(t *testing.T) {
+	repo := newMockRepo()
+	repo.docs["doc-1"] = &domain.Document{ID: "doc-1", Status: domain.StatusPendingUpload}
+
+	h := NewHandler(repo, &mockStorage{}, "secret123", "raw-pdfs", "raw-pdfs/")
+	engine := newTestEngine(h)
+
+	// Payload real de MinIO: s3 anidado dentro de Records, sin s3 en la raiz.
+	w := postEvent(engine, "secret123", map[string]any{
+		"EventName": "s3:ObjectCreated:Put",
+		"Records": []map[string]any{
+			{
+				"eventName": "s3:ObjectCreated:Put",
+				"s3": map[string]any{
+					"bucket": map[string]any{"name": "raw-pdfs"},
+					"object": map[string]any{"key": "raw-pdfs/doc-1.pdf"},
+				},
+			},
+		},
+	})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if len(repo.updateCalls) != 1 {
+		t.Fatalf("updateCalls = %d, want 1", len(repo.updateCalls))
+	}
+	if repo.updateCalls[0].to != domain.StatusUploaded {
+		t.Errorf("transition to = %s, want UPLOADED", repo.updateCalls[0].to)
+	}
+}
+
+func TestHandleEvent_RecordsPayloadURLEncodedKey_Unescapes(t *testing.T) {
+	repo := newMockRepo()
+	repo.docs["doc 1"] = &domain.Document{ID: "doc 1", Status: domain.StatusPendingUpload}
+
+	h := NewHandler(repo, &mockStorage{}, "secret123", "raw-pdfs", "raw-pdfs/")
+	engine := newTestEngine(h)
+
+	w := postEvent(engine, "secret123", map[string]any{
+		"EventName": "s3:ObjectCreated:Put",
+		"Records": []map[string]any{
+			{
+				"s3": map[string]any{
+					"bucket": map[string]any{"name": "raw-pdfs"},
+					"object": map[string]any{"key": "raw-pdfs/doc+1.pdf"},
+				},
+			},
+		},
+	})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	// QueryUnescape convierte '+' a espacio en application/x-www-form-urlencoded.
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] != "ok" && resp["status"] != "no_transition" {
+		t.Errorf("status = %v, want ok/no_transition", resp["status"])
+	}
+}
+
+func TestHandleEvent_RecordsPayload_EventNameOnlyInRecord_Transitions(t *testing.T) {
+	repo := newMockRepo()
+	repo.docs["doc-2"] = &domain.Document{ID: "doc-2", Status: domain.StatusPendingUpload}
+
+	h := NewHandler(repo, &mockStorage{}, "secret123", "raw-pdfs", "raw-pdfs/")
+	engine := newTestEngine(h)
+
+	// Sin EventName en la raiz: solo en el record (formato AWS estandar).
+	w := postEvent(engine, "secret123", map[string]any{
+		"Records": []map[string]any{
+			{
+				"eventName": "s3:ObjectCreated:Put",
+				"s3": map[string]any{
+					"bucket": map[string]any{"name": "raw-pdfs"},
+					"object": map[string]any{"key": "raw-pdfs/doc-2.pdf"},
+				},
+			},
+		},
+	})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if len(repo.updateCalls) != 1 {
+		t.Fatalf("updateCalls = %d, want 1", len(repo.updateCalls))
+	}
+}

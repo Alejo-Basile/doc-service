@@ -16,9 +16,14 @@ func leaseRedisAddr(t *testing.T) string {
 	return addr
 }
 
+func leaseRedisPassword(t *testing.T) string {
+	t.Helper()
+	return os.Getenv("REDIS_TEST_PASSWORD")
+}
+
 func setupLease(t *testing.T) (*Lease, func()) {
 	t.Helper()
-	lease := NewLease(leaseRedisAddr(t))
+	lease := NewLease(leaseRedisAddr(t), leaseRedisPassword(t))
 	if err := lease.Ping(context.Background()); err != nil {
 		t.Skipf("Redis no disponible: %v", err)
 	}
