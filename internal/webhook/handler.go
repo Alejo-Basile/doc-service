@@ -219,7 +219,7 @@ func (h *Handler) HandleEvent(c *gin.Context) {
 	if err := h.validatePDF(ctx, docID, objectKey); err != nil {
 		slog.Warn("webhook: PDF inválido, marcando REJECTED",
 			"document_id", docID, "error", err)
-		c.JSON(http.StatusOK, gin.H{"status": "rejected", "document_id", docID})
+		c.JSON(http.StatusOK, gin.H{"status": "rejected", "document_id": docID})
 		return
 	}
 
