@@ -33,6 +33,38 @@ func TestHealthz_Responde200(t *testing.T) {
 	}
 }
 
+func TestMetrics_Responde200(t *testing.T) {
+	server := NewServer(false)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	server.Engine().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status esperado 200, got %d", w.Code)
+	}
+
+	body := w.Body.String()
+	if !contains(body, "docservice_api_documents_created_total") {
+		t.Fatalf("no se encontró docservice_api_documents_created_total en /metrics")
+	}
+	if !contains(body, "docservice_webhook_events_total") {
+		t.Fatalf("no se encontró docservice_webhook_events_total en /metrics")
+	}
+}
+
+func contains(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	if len(s) >= len(substr) && s[len(s)-len(substr):] == substr {
+		return true
+	}
+	return false
+}
+
 func TestReadyz_Responde200(t *testing.T) {
 	server := NewServer(false)
 
