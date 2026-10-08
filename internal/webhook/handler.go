@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/Alejo-Basile/doc-service/internal/domain"
+	"github.com/Alejo-Basile/doc-service/internal/metrics"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
 	"github.com/gin-gonic/gin"
 )
@@ -211,12 +212,14 @@ func (h *Handler) HandleEvent(c *gin.Context) {
 		return
 	}
 
+	metrics.WebhookEvents.Inc()
+
 	// 6. Validar %PDF- post-subida (S2-P2-02, defensa en profundidad).
 	// Si no es PDF → REJECTED (terminal, sin reintentos).
 	if err := h.validatePDF(ctx, docID, objectKey); err != nil {
 		slog.Warn("webhook: PDF inválido, marcando REJECTED",
 			"document_id", docID, "error", err)
-		c.JSON(http.StatusOK, gin.H{"status": "rejected", "document_id": docID})
+		c.JSON(http.StatusOK, gin.H{"status": "rejected", "document_id", docID})
 		return
 	}
 

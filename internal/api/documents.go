@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Alejo-Basile/doc-service/internal/domain"
+	"github.com/Alejo-Basile/doc-service/internal/metrics"
 	"github.com/Alejo-Basile/doc-service/internal/pdfsvc"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
 	"github.com/gin-gonic/gin"
@@ -174,6 +175,7 @@ func (h *DocumentHandler) CreateDocument(c *gin.Context) {
 		"correlation_id", corrID,
 		"object_key", doc.ObjectKey,
 	)
+	metrics.DocumentsCreated.Inc()
 
 	c.JSON(http.StatusCreated, h.buildResponse(doc, result))
 }
