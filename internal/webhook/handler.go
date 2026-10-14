@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/Alejo-Basile/doc-service/internal/domain"
+	"github.com/Alejo-Basile/doc-service/internal/metrics"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
 	"github.com/gin-gonic/gin"
 )
@@ -210,6 +211,8 @@ func (h *Handler) HandleEvent(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "no_transition", "document_id": docID})
 		return
 	}
+
+	metrics.WebhookEvents.Inc()
 
 	// 6. Validar %PDF- post-subida (S2-P2-02, defensa en profundidad).
 	// Si no es PDF → REJECTED (terminal, sin reintentos).

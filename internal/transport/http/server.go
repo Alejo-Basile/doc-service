@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"time"
 
+	_ "github.com/Alejo-Basile/doc-service/internal/metrics"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Server encapsula el motor Gin y sus rutas.
@@ -62,6 +64,10 @@ func (s *Server) registerRoutes() {
 	// pero en esta fase solo responden proceso vivo).
 	s.engine.GET("/healthz", handleHealthz)
 	s.engine.GET("/readyz", handleReadyz)
+
+	// Métricas Prometheus (SPEC §10): scrapeado por el stack de observabilidad.
+	// Se monta con gin.WrapH porque promhttp.Handler expone http.Handler, no gin.HandlerFunc.
+	s.engine.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// Rutas de la API v2 y endpoints internos se registran vía RegisterAPI
 	// (inyección de dependencias desde cmd/api/main.go).
