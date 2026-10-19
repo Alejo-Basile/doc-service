@@ -14,6 +14,15 @@ import (
 // ErrNotFound se devuelve cuando un recurso no existe.
 var ErrNotFound = errors.New("recurso no encontrado")
 
+// ErrDuplicate se devuelve cuando una inserción viola la unicidad de _id.
+// Los adaptadores traducen el error de duplicado del motor a este sentinel
+// para que las capas superiores no dependan de detalles del driver.
+var ErrDuplicate = errors.New("recurso duplicado")
+
+// ErrInvalidCursor se devuelve cuando un cursor de paginación no es válido.
+// Evita que los consumidores dependan del texto del error del adaptador.
+var ErrInvalidCursor = errors.New("cursor inválido")
+
 // DocumentRepository define las operaciones de persistencia del agregado Document.
 type DocumentRepository interface {
 	Insert(ctx context.Context, doc *domain.Document) error
