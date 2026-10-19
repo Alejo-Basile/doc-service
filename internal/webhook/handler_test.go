@@ -295,15 +295,17 @@ func TestHandleEvent_NotPDF_Rejected(t *testing.T) {
 		t.Errorf("status = %v, want rejected", resp["status"])
 	}
 
-	// Verificar que se intentó transicionar a REJECTED.
-	found := false
-	for _, call := range repo.updateCalls {
-		if call.to == domain.StatusRejected {
-			found = true
-		}
+	// Regresión (E2E-01): debe haber UNA sola transición, directo de
+	// PENDING_UPLOAD a REJECTED. Si hubiera pasado por UPLOADED, el Change Stream
+	// habría emitido un UPLOADED transitorio y el relay habría encolado el objeto.
+	if len(repo.updateCalls) != 1 {
+		t.Fatalf("updateCalls = %d, want 1 (sin pasar por UPLOADED); calls=%+v",
+			len(repo.updateCalls), repo.updateCalls)
 	}
-	if !found {
-		t.Errorf("no se intentó transicionar a REJECTED; calls=%+v", repo.updateCalls)
+	if repo.updateCalls[0].from != domain.StatusPendingUpload ||
+		repo.updateCalls[0].to != domain.StatusRejected {
+		t.Errorf("transición = %s→%s, want PENDING_UPLOAD→REJECTED",
+			repo.updateCalls[0].from, repo.updateCalls[0].to)
 	}
 }
 
