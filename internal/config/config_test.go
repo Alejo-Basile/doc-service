@@ -16,7 +16,8 @@ func setEnv(t *testing.T, vars map[string]string) {
 		"MONGO_URI", "MONGO_DATABASE",
 		"MINIO_ENDPOINT", "MINIO_PUBLIC_ENDPOINT", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY",
 		"MINIO_BUCKET_RAW", "MINIO_BUCKET_TXT", "MINIO_WEBHOOK_SECRET",
-		"REDIS_ADDR", "REDIS_PASSWORD", "REDIS_STREAM_KEY", "INTERNAL_TOKEN",
+		"REDIS_ADDR", "REDIS_PASSWORD", "REDIS_STREAM_KEY",
+		"REDIS_SENTINEL_ADDRS", "REDIS_MASTER_NAME", "INTERNAL_TOKEN",
 		"MAX_PDF_BYTES", "RECONCILE_INTERVAL_MIN", "DOC_UPLOAD_GRACE_MIN",
 		"MIN_SAFETY_AGE_MIN",
 	}
@@ -232,5 +233,67 @@ func TestValidate_VacioYSoloEspacios_SeTrataComoFaltante(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "MINIO_ENDPOINT") {
 		t.Errorf("el error debe mencionar MINIO_ENDPOINT, got: %v", err)
+	}
+}
+
+func TestLoad_Sentinel_ParseaAddrsConEspaciosYVacios(t *testing.T) {
+	vars := completeVars()
+	vars["REDIS_SENTINEL_ADDRS"] = " s1:26379 , ,s2:26379,"
+	vars["REDIS_MASTER_NAME"] = "mymaster"
+	setEnv(t, vars)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() no debía fallar en modo Sentinel: %v", err)
+	}
+	if len(cfg.RedisSentinelAddrs) != 2 {
+		t.Fatalf("esperados 2 sentinels, got %v", cfg.RedisSentinelAddrs)
+	}
+	if cfg.RedisSentinelAddrs[0] != "s1:26379" || cfg.RedisSentinelAddrs[1] != "s2:26379" {
+		t.Errorf("sentinels mal parseados: %v", cfg.RedisSentinelAddrs)
+	}
+	if cfg.RedisMasterName != "mymaster" {
+		t.Errorf("RedisMasterName esperado 'mymaster', got %q", cfg.RedisMasterName)
+	}
+}
+
+func TestLoad_SentinelSinMasterName_Falla(t *testing.T) {
+	vars := completeVars()
+	vars["REDIS_SENTINEL_ADDRS"] = "s1:26379"
+	setEnv(t, vars)
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() debía fallar con Sentinel sin REDIS_MASTER_NAME")
+	}
+	if !strings.Contains(err.Error(), "REDIS_MASTER_NAME") {
+		t.Errorf("el error debe mencionar REDIS_MASTER_NAME, got: %v", err)
+	}
+}
+
+func TestLoad_SinRedisAddrNiSentinel_Falla(t *testing.T) {
+	vars := completeVars()
+	delete(vars, "REDIS_ADDR")
+	setEnv(t, vars)
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() debía fallar sin REDIS_ADDR ni Sentinel")
+	}
+	if !strings.Contains(err.Error(), "REDIS_ADDR") {
+		t.Errorf("el error debe mencionar REDIS_ADDR, got: %v", err)
+	}
+}
+
+func TestLoad_SentinelIgnoraRedisAddr(t *testing.T) {
+	// En modo Sentinel, REDIS_ADDR no es obligatorio.
+	vars := completeVars()
+	delete(vars, "REDIS_ADDR")
+	vars["REDIS_SENTINEL_ADDRS"] = "s1:26379,s2:26379"
+	vars["REDIS_MASTER_NAME"] = "mymaster"
+	setEnv(t, vars)
+
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() no debía exigir REDIS_ADDR en modo Sentinel: %v", err)
 	}
 }

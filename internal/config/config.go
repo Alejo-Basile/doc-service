@@ -35,6 +35,12 @@ type Config struct {
 	RedisAddr      string
 	RedisPassword  string
 	RedisStreamKey string
+	// RedisSentinelAddrs, si no está vacío, activa el modo Sentinel (SPEC §3.5):
+	// el cliente resuelve el primario vía los sentinels en vez de una IP fija.
+	RedisSentinelAddrs []string
+	// RedisMasterName es el nombre del master que resuelve Sentinel (requerido
+	// cuando RedisSentinelAddrs está definido).
+	RedisMasterName string
 
 	// Seguridad interna: token de los endpoints /internal/* (header X-Internal-Token).
 	InternalToken string
@@ -79,6 +85,8 @@ func Load() (*Config, error) {
 		RedisAddr:           strings.TrimSpace(os.Getenv("REDIS_ADDR")),
 		RedisPassword:       strings.TrimSpace(os.Getenv("REDIS_PASSWORD")),
 		RedisStreamKey:      envStr("REDIS_STREAM_KEY", defaultRedisStreamKey),
+		RedisSentinelAddrs:  envList("REDIS_SENTINEL_ADDRS"),
+		RedisMasterName:     strings.TrimSpace(os.Getenv("REDIS_MASTER_NAME")),
 		InternalToken:       strings.TrimSpace(os.Getenv("INTERNAL_TOKEN")),
 		MaxPDFBytes:         envInt64("MAX_PDF_BYTES", defaultMaxPDFBytes),
 		ReconcileInterval:   time.Duration(envInt("RECONCILE_INTERVAL_MIN", defaultReconcileMin)) * time.Minute,
@@ -108,7 +116,6 @@ func (c *Config) Validate() error {
 		{"MINIO_ACCESS_KEY", c.MinIOAccessKey, "access key del servicio (nunca root)"},
 		{"MINIO_SECRET_KEY", c.MinIOSecretKey, "secret key del servicio"},
 		{"MINIO_WEBHOOK_SECRET", c.MinIOWebhookSecret, "secreto compartido del webhook (SPEC §9)"},
-		{"REDIS_ADDR", c.RedisAddr, "host:puerto de Redis Streams"},
 		{"REDIS_PASSWORD", c.RedisPassword, "contraseña de Redis Streams (SPEC §9.4)"},
 		{"INTERNAL_TOKEN", c.InternalToken, "token de los endpoints internos (header X-Internal-Token)"},
 	}
@@ -117,6 +124,16 @@ func (c *Config) Validate() error {
 		if r.value == "" {
 			missing = append(missing, fmt.Sprintf("  - %s (ejemplo: %s)", r.name, r.hint))
 		}
+	}
+
+	// Redis: o bien dirección fija (REDIS_ADDR) o bien modo Sentinel
+	// (REDIS_SENTINEL_ADDRS + REDIS_MASTER_NAME). No ambos obligatorios.
+	if len(c.RedisSentinelAddrs) > 0 {
+		if c.RedisMasterName == "" {
+			missing = append(missing, "  - REDIS_MASTER_NAME (nombre del master resuelto por Sentinel)")
+		}
+	} else if c.RedisAddr == "" {
+		missing = append(missing, "  - REDIS_ADDR (host:puerto de Redis) o REDIS_SENTINEL_ADDRS+REDIS_MASTER_NAME (Sentinel)")
 	}
 
 	if len(missing) > 0 {
@@ -168,6 +185,22 @@ func envStr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envList parsea una lista separada por comas, ignorando elementos vacíos.
+func envList(key string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func envInt(key string, def int) int {
