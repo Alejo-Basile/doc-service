@@ -102,15 +102,25 @@ func main() {
 	// --- Adaptadores y puertos ---
 	repo := mongoadapter.NewDocumentRepository(mongoClient, "documents")
 
+	redisClientCfg := redisadapter.ClientConfig{
+		Addr:          cfg.RedisAddr,
+		Password:      cfg.RedisPassword,
+		SentinelAddrs: cfg.RedisSentinelAddrs,
+		MasterName:    cfg.RedisMasterName,
+	}
+	if len(cfg.RedisSentinelAddrs) > 0 {
+		slog.Info("Redis en modo Sentinel",
+			"sentinels", len(cfg.RedisSentinelAddrs), "master_name", cfg.RedisMasterName)
+	}
 	queueCfg := redisadapter.DefaultWorkQueueConfig()
 	queueCfg.StreamKey = cfg.RedisStreamKey
-	queue := redisadapter.NewWorkQueue(cfg.RedisAddr, cfg.RedisPassword, queueCfg)
+	queue := redisadapter.NewWorkQueueFromClient(redisadapter.NewClient(redisClientCfg), queueCfg)
 	if err := queue.Ping(startupCtx); err != nil {
 		slog.Error("no se pudo conectar a Redis", "error", err.Error())
 		_ = mongoClient.Close(context.Background())
 		os.Exit(1)
 	}
-	lease := redisadapter.NewLease(cfg.RedisAddr, cfg.RedisPassword)
+	lease := redisadapter.NewLeaseFromClient(redisadapter.NewClient(redisClientCfg))
 
 	// Cliente EXCLUSIVO del watcher sin timeout de cliente (Timeout=0).
 	// El driver v2 (csot) aplica ClientOptions.Timeout como deadline de toda
