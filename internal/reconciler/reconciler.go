@@ -21,19 +21,30 @@ import (
 
 	"github.com/Alejo-Basile/doc-service/internal/domain"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
+	httpserver "github.com/Alejo-Basile/doc-service/internal/transport/http"
 	"github.com/gin-gonic/gin"
 )
 
 // Reconciler ejecuta el sweep periódico de documentos inconsistentes.
 type Reconciler struct {
-	repo         ports.DocumentRepository
-	storage      ports.ObjectStorage
-	queue        ports.WorkQueue
-	lease        ports.DistributedLease
-	clock        ports.Clock
-	interval     time.Duration
-	stuckAfter   time.Duration // umbral para UPLOADED estancados / reencolado
-	minSafetyAge time.Duration // edad mínima: documentos más jóvenes nunca se tocan (S6-P2-02)
+	repo          ports.DocumentRepository
+	storage       ports.ObjectStorage
+	queue         ports.WorkQueue
+	lease         ports.DistributedLease
+	clock         ports.Clock
+	interval      time.Duration
+	stuckAfter    time.Duration // umbral para UPLOADED estancados / reencolado
+	minSafetyAge  time.Duration // edad mínima: documentos más jóvenes nunca se tocan (S6-P2-02)
+	internalToken string        // token compartido para proteger el endpoint manual (SPEC §9)
+}
+
+// Option configura un Reconciler en construcción (functional options).
+type Option func(*Reconciler)
+
+// WithInternalToken protege el endpoint manual POST /internal/reconcile
+// con el token compartido de los endpoints internos (SPEC §9).
+func WithInternalToken(token string) Option {
+	return func(r *Reconciler) { r.internalToken = token }
 }
 
 // New crea un Reconciler con dependencias inyectadas.
@@ -47,6 +58,7 @@ func New(
 	interval time.Duration,
 	stuckAfter time.Duration,
 	minSafetyAge time.Duration,
+	opts ...Option,
 ) *Reconciler {
 	if stuckAfter <= 0 {
 		stuckAfter = 30 * time.Minute
@@ -54,7 +66,7 @@ func New(
 	if minSafetyAge <= 0 {
 		minSafetyAge = interval // default: al menos 1x intervalo
 	}
-	return &Reconciler{
+	r := &Reconciler{
 		repo:         repo,
 		storage:      storage,
 		queue:        queue,
@@ -64,11 +76,18 @@ func New(
 		stuckAfter:   stuckAfter,
 		minSafetyAge: minSafetyAge,
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // RegisterRoutes expone el endpoint manual de reconciliación (para testing/ops).
+// Protegido con el token interno: no debe quedar accesible sin autenticación.
 func (r *Reconciler) RegisterRoutes(engine *gin.Engine) {
-	engine.POST("/internal/reconcile", func(c *gin.Context) {
+	internal := engine.Group("/internal")
+	internal.Use(httpserver.InternalTokenMiddleware(r.internalToken))
+	internal.POST("/reconcile", func(c *gin.Context) {
 		result, err := r.RunOnce(c.Request.Context())
 		if err != nil {
 			c.JSON(500, gin.H{"error": err.Error()})
@@ -113,9 +132,11 @@ type CrossCheckReport struct {
 // Start ejecuta el sweep en loop con el intervalo configurado.
 // Bloquea hasta que el contexto se cancele (graceful shutdown).
 func (r *Reconciler) Start(ctx context.Context) {
+	// Ojo: el handler JSON de slog serializa time.Duration como nanosegundos
+	// crudos, por eso se loguea explícitamente con String() (formato legible).
 	slog.Info("reconciler iniciado",
-		"interval", r.interval,
-		"stuck_after", r.stuckAfter,
+		"interval", r.interval.String(),
+		"stuck_after", r.stuckAfter.String(),
 	)
 
 	ticker := time.NewTicker(r.interval)

@@ -63,7 +63,7 @@ func (r *DocumentRepository) Insert(ctx context.Context, doc *domain.Document) e
 	_, err := r.coll.InsertOne(ctx, doc)
 	if err != nil {
 		if mongo.IsDuplicateKeyError(err) {
-			return fmt.Errorf("documento %s ya existe: %w", doc.ID, err)
+			return fmt.Errorf("documento %s: %w", doc.ID, ports.ErrDuplicate)
 		}
 		return fmt.Errorf("insert documento %s: %w", doc.ID, err)
 	}
@@ -183,7 +183,7 @@ func (r *DocumentRepository) ListByCursor(ctx context.Context, filter ports.Curs
 	if filter.Cursor != "" {
 		created, id, err := DecodeCursor(filter.Cursor)
 		if err != nil {
-			return nil, "", fmt.Errorf("cursor inválido: %w", err)
+			return nil, "", fmt.Errorf("%w: %v", ports.ErrInvalidCursor, err)
 		}
 		q["$or"] = []bson.M{
 			{"created_at": bson.M{"$lt": created}},

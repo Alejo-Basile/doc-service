@@ -3,7 +3,6 @@
 package api
 
 import (
-	"crypto/subtle"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/Alejo-Basile/doc-service/internal/domain"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
+	httpserver "github.com/Alejo-Basile/doc-service/internal/transport/http"
 	"github.com/gin-gonic/gin"
 )
 
@@ -40,31 +40,11 @@ func NewInternalHandler(
 // RegisterRoutes registra las rutas operativas internas.
 func (h *InternalHandler) RegisterRoutes(engine *gin.Engine) {
 	internal := engine.Group("/internal")
-	internal.Use(h.authMiddleware())
+	internal.Use(httpserver.InternalTokenMiddleware(h.internalToken))
 	{
 		internal.GET("/documents/:id/history", h.GetHistory)
 		internal.POST("/documents/:id/retry", h.RetryDocument)
 		internal.POST("/documents/:id/cancel", h.CancelDocument)
-	}
-}
-
-// authMiddleware verifica el token interno en tiempo constante (S4-P2-06).
-func (h *InternalHandler) authMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		token := c.GetHeader("X-Internal-Token")
-		if token == "" {
-			auth := c.GetHeader("Authorization")
-			if len(auth) > 7 && auth[:7] == "Bearer " {
-				token = auth[7:]
-			}
-		}
-
-		if h.internalToken == "" || subtle.ConstantTimeCompare([]byte(token), []byte(h.internalToken)) != 1 {
-			slog.Warn("internal: token inválido o ausente", "path", c.Request.URL.Path)
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
-			return
-		}
-		c.Next()
 	}
 }
 

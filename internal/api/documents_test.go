@@ -28,7 +28,7 @@ func newMockRepo() *mockRepo {
 
 func (m *mockRepo) Insert(ctx context.Context, doc *domain.Document) error {
 	if _, exists := m.docs[doc.ID]; exists {
-		return fmt.Errorf("duplicate key: documento %s ya existe", doc.ID)
+		return fmt.Errorf("documento %s: %w", doc.ID, ports.ErrDuplicate)
 	}
 	m.docs[doc.ID] = doc
 	return nil
@@ -152,7 +152,7 @@ func setupTestServer(t *testing.T) (*gin.Engine, *mockRepo) {
 	storage := &mockStorage{}
 	validator := pdfsvc.NewValidator(storage)
 
-	handler := NewDocumentHandler(repo, storage, validator, 25*1024*1024, 30*time.Minute)
+	handler := NewDocumentHandler(repo, storage, validator, 25*1024*1024, 30*time.Minute, "raw-pdfs")
 
 	engine := gin.New()
 	engine.Use(func(c *gin.Context) {

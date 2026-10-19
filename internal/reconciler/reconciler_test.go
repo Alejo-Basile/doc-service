@@ -2,11 +2,14 @@ package reconciler
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/Alejo-Basile/doc-service/internal/domain"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
+	"github.com/gin-gonic/gin"
 )
 
 // mockClock implementa ports.Clock para tests.
@@ -500,5 +503,42 @@ func TestIsValidFailureReason(t *testing.T) {
 		if domain.IsValidFailureReason(r) {
 			t.Errorf("IsValidFailureReason(%q) = true, want false", r)
 		}
+	}
+}
+
+// TestRegisterRoutes_ReconcileRequiereToken verifica que el endpoint manual
+// POST /internal/reconcile quede protegido por el token interno (SPEC §9):
+// sin token responde 401 y no ejecuta el sweep; con token responde 200.
+func TestRegisterRoutes_ReconcileRequiereToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const token = "internal-test-token"
+
+	repo := newMockRepo()
+	storage := newMockStorage()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	r := New(repo, storage, nil, nil, &mockClock{now},
+		10*time.Minute, 30*time.Minute, 15*time.Minute, WithInternalToken(token))
+
+	engine := gin.New()
+	r.RegisterRoutes(engine)
+
+	do := func(tok string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/internal/reconcile", nil)
+		if tok != "" {
+			req.Header.Set("X-Internal-Token", tok)
+		}
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, req)
+		return w
+	}
+
+	if w := do(""); w.Code != http.StatusUnauthorized {
+		t.Fatalf("sin token: status = %d, want 401", w.Code)
+	}
+	if w := do("token-incorrecto"); w.Code != http.StatusUnauthorized {
+		t.Fatalf("token inválido: status = %d, want 401", w.Code)
+	}
+	if w := do(token); w.Code != http.StatusOK {
+		t.Fatalf("token válido: status = %d, want 200 (body=%s)", w.Code, w.Body.String())
 	}
 }

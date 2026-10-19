@@ -38,10 +38,6 @@ const startupTimeout = 30 * time.Second
 // (SPEC §11.3: payload JSON liviano con schema_version).
 const workSchemaVersion = 1
 
-// objectKeyPrefix es el prefijo contractual de las claves de objeto
-// (SPEC §11.3: object_key = raw-pdfs/<id>.pdf).
-const objectKeyPrefix = "raw-pdfs"
-
 func main() {
 	// Logger JSON estructurado.
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -135,12 +131,16 @@ func main() {
 	validator := pdfsvc.NewValidator(storage)
 
 	// --- Handlers ---
-	docsHandler := api.NewDocumentHandler(repo, storage, validator, cfg.MaxPDFBytes, cfg.DocUploadGrace)
+	// El prefijo de clave del contrato es "<bucket_raw>/" (SPEC §11.3:
+	// object_key = raw-pdfs/<id>.pdf), derivado de la config para no duplicarlo.
+	objectKeyPrefix := cfg.MinIOBucketRaw + "/"
+	docsHandler := api.NewDocumentHandler(repo, storage, validator, cfg.MaxPDFBytes, cfg.DocUploadGrace, cfg.MinIOBucketRaw)
 	internalHandler := api.NewInternalHandler(repo, storage, queue, cfg.InternalToken)
-	webhookHandler := webhook.NewHandler(repo, storage, cfg.MinIOWebhookSecret, cfg.MinIOBucketRaw, objectKeyPrefix+"/")
+	webhookHandler := webhook.NewHandler(repo, storage, cfg.MinIOWebhookSecret, cfg.MinIOBucketRaw, objectKeyPrefix)
 	rel := reconciler.New(
 		repo, storage, queue, lease, ports.SystemClock{},
 		cfg.ReconcileInterval, 30*time.Minute, cfg.MinSafetyAge,
+		reconciler.WithInternalToken(cfg.InternalToken),
 	)
 
 	// --- Servidor HTTP ---

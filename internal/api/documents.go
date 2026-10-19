@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/Alejo-Basile/doc-service/internal/domain"
@@ -24,6 +23,7 @@ type DocumentHandler struct {
 	validator   *pdfsvc.Validator
 	maxPDFBytes int64
 	uploadGrace time.Duration
+	bucketRaw   string // bucket de subida (configurable, default raw-pdfs)
 }
 
 // NewDocumentHandler crea el handler con las dependencias inyectadas.
@@ -33,6 +33,7 @@ func NewDocumentHandler(
 	validator *pdfsvc.Validator,
 	maxPDFBytes int64,
 	uploadGrace time.Duration,
+	bucketRaw string,
 ) *DocumentHandler {
 	return &DocumentHandler{
 		repo:        repo,
@@ -40,6 +41,7 @@ func NewDocumentHandler(
 		validator:   validator,
 		maxPDFBytes: maxPDFBytes,
 		uploadGrace: uploadGrace,
+		bucketRaw:   bucketRaw,
 	}
 }
 
@@ -88,7 +90,7 @@ func (h *DocumentHandler) CreateDocument(c *gin.Context) {
 	if req.SizeBytes > 0 && h.maxPDFBytes > 0 && req.SizeBytes > h.maxPDFBytes {
 		respondProblem(c, http.StatusBadRequest, "validation",
 			"Error de validación",
-			"size_bytes excede el máximo permitido: "+itoa(h.maxPDFBytes)+" bytes")
+			"size_bytes excede el máximo permitido: "+strconv.FormatInt(h.maxPDFBytes, 10)+" bytes")
 		return
 	}
 
@@ -137,8 +139,8 @@ func (h *DocumentHandler) CreateDocument(c *gin.Context) {
 		doc = domain.NewDocument(corrID, expiresAt)
 	}
 
-	// Fijar object_key derivado del document_id.
-	doc.SetObjectKey("raw-pdfs")
+	// Fijar object_key derivado del document_id y del bucket configurado.
+	doc.SetObjectKey(h.bucketRaw)
 
 	// Insertar (idempotente por _id).
 	if err := h.repo.Insert(c.Request.Context(), doc); err != nil {
@@ -157,7 +159,7 @@ func (h *DocumentHandler) CreateDocument(c *gin.Context) {
 
 	// Generar URL prefirmada POST.
 	presignOpts := ports.PresignPostOptions{
-		Bucket:       "raw-pdfs",
+		Bucket:       h.bucketRaw,
 		MaxSizeBytes: h.maxPDFBytes,
 		ContentType:  "application/pdf",
 		Expiration:   15 * time.Minute,
@@ -312,7 +314,7 @@ func (h *DocumentHandler) ListDocuments(c *gin.Context) {
 		Limit:  limit,
 	})
 	if err != nil {
-		if strings.Contains(err.Error(), "cursor inválido") {
+		if errors.Is(err, ports.ErrInvalidCursor) {
 			respondProblem(c, http.StatusBadRequest, "validation", "Cursor inválido", "")
 			return
 		}
@@ -349,7 +351,7 @@ func (h *DocumentHandler) respondExisting(c *gin.Context, doc *domain.Document) 
 
 	// Regenerar URL prefirmada para el documento existente.
 	presignOpts := ports.PresignPostOptions{
-		Bucket:       "raw-pdfs",
+		Bucket:       h.bucketRaw,
 		MaxSizeBytes: h.maxPDFBytes,
 		ContentType:  "application/pdf",
 		Expiration:   15 * time.Minute,
@@ -411,44 +413,8 @@ func respondProblem(c *gin.Context, status int, kind, title, detail string) {
 	})
 }
 
-// isDuplicate verifica si el error es de duplicado de MongoDB.
+// isDuplicate verifica si el error es de duplicado, usando el sentinel
+// que expone el repositorio (ports.ErrDuplicate) en vez de comparar texto.
 func isDuplicate(err error) bool {
-	// El repositorio envuelve el error; verificamos por string ya que
-	// no importamos mongo en esta capa.
-	return err != nil && (contains(err.Error(), "duplicate key") || contains(err.Error(), "ya existe"))
-}
-
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && indexOf(s, sub) >= 0
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
-}
-
-func itoa(n int64) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [20]byte
-	pos := len(buf)
-	for n > 0 {
-		pos--
-		buf[pos] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		pos--
-		buf[pos] = '-'
-	}
-	return string(buf[pos:])
+	return errors.Is(err, ports.ErrDuplicate)
 }
