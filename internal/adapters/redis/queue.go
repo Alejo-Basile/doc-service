@@ -45,7 +45,12 @@ func DefaultWorkQueueConfig() WorkQueueConfig {
 // NewWorkQueue crea un WorkQueue sobre la dirección Redis indicada.
 // password autentica contra el servidor (vacío en instancias sin ACL).
 func NewWorkQueue(addr, password string, cfg WorkQueueConfig) *WorkQueue {
-	client := redis.NewClient(&redis.Options{Addr: addr, Password: password})
+	return NewWorkQueueFromClient(NewClient(ClientConfig{Addr: addr, Password: password}), cfg)
+}
+
+// NewWorkQueueFromClient crea un WorkQueue sobre un cliente Redis existente.
+// Permite reutilizar un cliente Sentinel-aware construido con NewClient.
+func NewWorkQueueFromClient(client *redis.Client, cfg WorkQueueConfig) *WorkQueue {
 	return &WorkQueue{
 		client:      client,
 		streamKey:   cfg.StreamKey,
