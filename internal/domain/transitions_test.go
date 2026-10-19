@@ -13,7 +13,7 @@ func TestTransitions_Exhaustivo(t *testing.T) {
 	// Para cada par (from, to), CanTransitionFrom debe retornar true solo si
 	// el par está declarado en la matriz.
 	matrizEsperada := map[Status][]Status{
-		StatusPendingUpload:    {StatusUploaded, StatusUploadExpired},
+		StatusPendingUpload:    {StatusUploaded, StatusUploadExpired, StatusRejected},
 		StatusUploaded:         {StatusQueued},
 		StatusQueued:           {StatusProcessing},
 		StatusProcessing:       {StatusCompleted, StatusRejected, StatusRetrying, StatusExtractionFailed},
@@ -174,7 +174,7 @@ func TestTransitionsFor_ReturnsDestinos(t *testing.T) {
 		from     Status
 		esperado []Status
 	}{
-		{StatusPendingUpload, []Status{StatusUploaded, StatusUploadExpired}},
+		{StatusPendingUpload, []Status{StatusUploaded, StatusUploadExpired, StatusRejected}},
 		{StatusUploaded, []Status{StatusQueued}},
 		{StatusProcessing, []Status{StatusCompleted, StatusRejected, StatusRetrying, StatusExtractionFailed}},
 		{StatusCompleted, nil},

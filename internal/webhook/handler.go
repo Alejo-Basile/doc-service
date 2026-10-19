@@ -3,11 +3,8 @@
 package webhook
 
 import (
-	"context"
 	"crypto/subtle"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -190,8 +187,49 @@ func (h *Handler) HandleEvent(c *gin.Context) {
 		"event", eventName,
 	)
 
-	// 5. Transición condicional PENDING_UPLOAD → UPLOADED (S3-P2-07).
+	// 5. Validar %PDF- ANTES de promocionar el documento (S2-P2-02).
+	//
+	// IMPORTANTE: la validación va primero a propósito. Si se promocionara a
+	// UPLOADED y recién después se validara, el Change Stream emitiría un evento
+	// UPLOADED transitorio y el relay encolaría un trabajo de un objeto que nunca
+	// fue un PDF (justo antes de pasar a REJECTED). Validando antes, el watcher
+	// jamás ve UPLOADED para un objeto inválido.
 	ctx := c.Request.Context()
+	data, err := h.storage.GetRange(ctx, objectKey, 0, 5)
+	if err != nil {
+		slog.Error("webhook: no se pudo leer el objeto para validar",
+			"document_id", docID, "object_key", objectKey, "error", err)
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+
+	// 5a. No es PDF → PENDING_UPLOAD → REJECTED (terminal, sin reintentos).
+	if !isPDF(data) {
+		ok, err := h.repo.UpdateStatus(ctx, docID,
+			domain.StatusPendingUpload, domain.StatusRejected,
+			map[string]any{
+				"object_key":     objectKey,
+				"failure_reason": domain.FailureReasonNotAPDF,
+			},
+		)
+		if err != nil {
+			slog.Error("webhook: error marcando REJECTED",
+				"document_id", docID, "error", err)
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+			return
+		}
+		slog.Warn("webhook: PDF inválido, marcando REJECTED",
+			"document_id", docID, "object_key", objectKey)
+		if !ok {
+			c.JSON(http.StatusOK, gin.H{"status": "no_transition", "document_id": docID})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "rejected", "document_id": docID})
+		return
+	}
+
+	// 6. Promocionar PENDING_UPLOAD → UPLOADED (S3-P2-07).
+	// Esta transición dispara el Change Stream y el relay encola el trabajo.
 	ok, err := h.repo.UpdateStatus(ctx, docID,
 		domain.StatusPendingUpload, domain.StatusUploaded,
 		map[string]any{"object_key": objectKey},
@@ -213,40 +251,7 @@ func (h *Handler) HandleEvent(c *gin.Context) {
 	}
 
 	metrics.WebhookEvents.Inc()
-
-	// 6. Validar %PDF- post-subida (S2-P2-02, defensa en profundidad).
-	// Si no es PDF → REJECTED (terminal, sin reintentos).
-	if err := h.validatePDF(ctx, docID, objectKey); err != nil {
-		slog.Warn("webhook: PDF inválido, marcando REJECTED",
-			"document_id", docID, "error", err)
-		c.JSON(http.StatusOK, gin.H{"status": "rejected", "document_id": docID})
-		return
-	}
-
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "document_id": docID})
-}
-
-// validatePDF verifica la cabecera %PDF- del objeto recién subido.
-// Si no es PDF, transiciona a REJECTED con causa NOT_A_PDF.
-func (h *Handler) validatePDF(ctx context.Context, docID, objectKey string) error {
-	data, err := h.storage.GetRange(ctx, objectKey, 0, 5)
-	if err != nil {
-		return fmt.Errorf("get range: %w", err)
-	}
-
-	if !isPDF(data) {
-		// Transición UPLOADED → REJECTED (terminal, sin reintentos).
-		_, err := h.repo.UpdateStatus(ctx, docID,
-			domain.StatusUploaded, domain.StatusRejected,
-			map[string]any{"failure_reason": domain.FailureReasonNotAPDF},
-		)
-		if err != nil {
-			return fmt.Errorf("marcar REJECTED: %w", err)
-		}
-		return ErrNotPDF
-	}
-
-	return nil
 }
 
 // verifyToken compara el token con el secreto en tiempo constante (S3-P2-06).
@@ -271,9 +276,6 @@ func (h *Handler) extractDocumentID(objectKey string) string {
 	}
 	return rest
 }
-
-// ErrNotPDF se devuelve cuando el objeto no es un PDF válido.
-var ErrNotPDF = errors.New("el objeto no es un PDF válido")
 
 // isPDF verifica si los bytes empiezan por %PDF-.
 func isPDF(data []byte) bool {

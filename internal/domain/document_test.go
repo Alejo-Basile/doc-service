@@ -248,7 +248,7 @@ func TestTransitionsFor(t *testing.T) {
 		from     Status
 		esperado []Status
 	}{
-		{StatusPendingUpload, []Status{StatusUploaded, StatusUploadExpired}},
+		{StatusPendingUpload, []Status{StatusUploaded, StatusUploadExpired, StatusRejected}},
 		{StatusUploaded, []Status{StatusQueued}},
 		{StatusQueued, []Status{StatusProcessing}},
 		{StatusProcessing, []Status{StatusCompleted, StatusRejected, StatusRetrying, StatusExtractionFailed}},

@@ -95,7 +95,10 @@ func (s Status) IsValid() bool {
 // allowedTransitions define la matriz estricta de transiciones permitidas (SPEC §4, §11.1).
 // Cualquier par (origen, destino) no declarado aquí se rechaza.
 var allowedTransitions = map[Status][]Status{
-	StatusPendingUpload:    {StatusUploaded, StatusUploadExpired},
+	// PENDING_UPLOAD → REJECTED: la validación %PDF- post-subida falla antes de
+	// promocionar (S2-P2-02). Se evita el paso intermedio por UPLOADED para que el
+	// Change Stream nunca encole un objeto que no es un PDF.
+	StatusPendingUpload:    {StatusUploaded, StatusUploadExpired, StatusRejected},
 	StatusUploaded:         {StatusQueued},
 	StatusQueued:           {StatusProcessing},
 	StatusProcessing:       {StatusCompleted, StatusRejected, StatusRetrying, StatusExtractionFailed},
