@@ -25,4 +25,4 @@ USER 10001
 EXPOSE 8080
 HEALTHCHECK --interval=10s --timeout=3s --retries=6 --start-period=20s \
   CMD wget -qO- http://localhost:8080/healthz || exit 1
-ENTRYPOINT ["/usr/local/bin/api"]
+CMD ["/usr/local/bin/api"]
