@@ -87,14 +87,47 @@ func (m *mockRepo) UpdateStatusWithHistory(ctx context.Context, id string, from,
 	return true, nil
 }
 
-// mockStorage implementa ports.ObjectStorage.
+// mockStorage implementa ports.ObjectStorage (y el listado opcional).
 type mockStorage struct {
 	objects map[string]bool // key → exists
 	pdfData []byte
+	// listObjects soporta la aserción `lister` de purgeOrphanObjects (S4-P2-02).
+	listObjects []ports.ObjectInfo
+	deleted     []string
 }
 
 func newMockStorage() *mockStorage {
 	return &mockStorage{objects: make(map[string]bool)}
+}
+
+// mockQueue implementa ports.WorkQueue para tests.
+type mockQueue struct {
+	enqueued []ports.WorkMessage
+}
+
+func (m *mockQueue) Enqueue(_ context.Context, msg ports.WorkMessage) error {
+	m.enqueued = append(m.enqueued, msg)
+	return nil
+}
+
+func (m *mockQueue) Ping(_ context.Context) error { return nil }
+
+// mockLease implementa ports.DistributedLease para tests (S4-P2-03).
+type mockLease struct {
+	acquired   bool
+	acquireErr error
+	acquires   int
+	releases   int
+}
+
+func (m *mockLease) Acquire(_ context.Context, _ string, _ time.Duration) (bool, error) {
+	m.acquires++
+	return m.acquired, m.acquireErr
+}
+
+func (m *mockLease) Release(_ context.Context, _ string) error {
+	m.releases++
+	return nil
 }
 
 func (m *mockStorage) PresignPost(ctx context.Context, objectKey string, opts ports.PresignPostOptions) (*ports.PresignPostResult, error) {
@@ -115,7 +148,11 @@ func (m *mockStorage) GetRange(ctx context.Context, objectKey string, start, end
 	return []byte("%PDF-"), nil
 }
 
-func (m *mockStorage) Delete(ctx context.Context, objectKey string) error { return nil }
+func (m *mockStorage) Delete(ctx context.Context, objectKey string) error {
+	m.deleted = append(m.deleted, objectKey)
+	delete(m.objects, objectKey)
+	return nil
+}
 
 func (m *mockStorage) PresignGet(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
 	return "", nil
@@ -126,7 +163,7 @@ func (m *mockStorage) PresignGetTXT(ctx context.Context, objectKey string, expir
 }
 
 func (m *mockStorage) ListObjects(ctx context.Context) ([]ports.ObjectInfo, error) {
-	return nil, nil
+	return m.listObjects, nil
 }
 
 // errNotFound simula "not found" del SDK MinIO.
@@ -540,5 +577,274 @@ func TestRegisterRoutes_ReconcileRequiereToken(t *testing.T) {
 	}
 	if w := do(token); w.Code != http.StatusOK {
 		t.Fatalf("token válido: status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+}
+
+// --- Reencolado de UPLOADED estancados (S4-P2-01) ---
+
+func TestSweepStuckUploaded_ReencolaSiObjetoExiste(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+
+	// UPLOADED estancado (updated_at hace 2h) y creado hace 2h (pasa safety age).
+	doc := &domain.Document{
+		ID:            "doc-stuck",
+		Status:        domain.StatusUploaded,
+		ObjectKey:     "raw-pdfs/doc-stuck.pdf",
+		CorrelationID: "corr-1",
+		SchemaVersion: 2,
+		CreatedAt:     now.Add(-2 * time.Hour),
+		UpdatedAt:     now.Add(-2 * time.Hour),
+	}
+	repo.docs["doc-stuck"] = doc
+	storage.objects[doc.ObjectKey] = true
+
+	r := New(repo, storage, queue, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if result.Reenqueued != 1 {
+		t.Fatalf("Reenqueued = %d, want 1", result.Reenqueued)
+	}
+	if len(queue.enqueued) != 1 {
+		t.Fatalf("enqueued = %d, want 1", len(queue.enqueued))
+	}
+	if got := queue.enqueued[0].DocumentID; got != "doc-stuck" {
+		t.Errorf("DocumentID encolado = %q, want doc-stuck", got)
+	}
+	if got := queue.enqueued[0].CorrelationID; got != "corr-1" {
+		t.Errorf("CorrelationID encolado = %q, want corr-1", got)
+	}
+	if doc.Status != domain.StatusQueued {
+		t.Errorf("estado final = %s, want QUEUED (no se reencola dos veces)", doc.Status)
+	}
+}
+
+func TestSweepStuckUploaded_MarcaFailedSiObjetoAusente(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage() // objeto NO existe
+	queue := &mockQueue{}
+
+	doc := &domain.Document{
+		ID:        "doc-lost",
+		Status:    domain.StatusUploaded,
+		ObjectKey: "raw-pdfs/doc-lost.pdf",
+		CreatedAt: now.Add(-2 * time.Hour),
+		UpdatedAt: now.Add(-2 * time.Hour),
+	}
+	repo.docs["doc-lost"] = doc
+
+	r := New(repo, storage, queue, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if result.Reenqueued != 0 {
+		t.Errorf("Reenqueued = %d, want 0 (objeto ausente)", result.Reenqueued)
+	}
+	if len(queue.enqueued) != 0 {
+		t.Errorf("enqueued = %d, want 0 (objeto ausente)", len(queue.enqueued))
+	}
+	if doc.Status != domain.StatusFailed {
+		t.Errorf("estado final = %s, want FAILED (object_missing)", doc.Status)
+	}
+}
+
+func TestSweepStuckUploaded_NoReencolaReciente(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+
+	// Updated hace 5 min (menor a stuckAfter de 30 min): no está estancado.
+	doc := &domain.Document{
+		ID:        "doc-fresh",
+		Status:    domain.StatusUploaded,
+		ObjectKey: "raw-pdfs/doc-fresh.pdf",
+		CreatedAt: now.Add(-time.Hour),
+		UpdatedAt: now.Add(-5 * time.Minute),
+	}
+	repo.docs["doc-fresh"] = doc
+	storage.objects[doc.ObjectKey] = true
+
+	r := New(repo, storage, queue, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if result.Reenqueued != 0 || len(queue.enqueued) != 0 {
+		t.Errorf("reencoló un documento no estancado: Reenqueued=%d, enqueued=%d",
+			result.Reenqueued, len(queue.enqueued))
+	}
+}
+
+func TestSweepStuckUploaded_RespetaSafetyAge(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+
+	// Estancado (updated hace 2h) pero creado hace 5 min (< safety age 15 min).
+	doc := &domain.Document{
+		ID:        "doc-young",
+		Status:    domain.StatusUploaded,
+		ObjectKey: "raw-pdfs/doc-young.pdf",
+		CreatedAt: now.Add(-5 * time.Minute),
+		UpdatedAt: now.Add(-2 * time.Hour),
+	}
+	repo.docs["doc-young"] = doc
+	storage.objects[doc.ObjectKey] = true
+
+	r := New(repo, storage, queue, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if result.Reenqueued != 0 || len(queue.enqueued) != 0 {
+		t.Errorf("no respetó safety age: Reenqueued=%d, enqueued=%d",
+			result.Reenqueued, len(queue.enqueued))
+	}
+}
+
+// --- Purga de huérfanos (S4-P2-02) ---
+
+func TestSweepOrphans_PurgaSoloHuerfanosAntiguos(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+
+	// Documento válido que referencia su objeto.
+	doc := &domain.Document{
+		ID:        "doc-1",
+		Status:    domain.StatusCompleted,
+		ObjectKey: "raw-pdfs/doc-1.pdf",
+		CreatedAt: now.Add(-time.Hour),
+	}
+	repo.docs["doc-1"] = doc
+
+	storage.listObjects = []ports.ObjectInfo{
+		// Válido: tiene documento → NO se borra aunque sea antiguo.
+		{Key: "raw-pdfs/doc-1.pdf", LastModified: now.Add(-30 * 24 * time.Hour)},
+		// Huérfano antiguo (> 7 días) → SÍ se borra.
+		{Key: "raw-pdfs/huerfano-viejo.pdf", LastModified: now.Add(-30 * 24 * time.Hour)},
+		// Huérfano reciente (< 7 días) → NO se borra todavía.
+		{Key: "raw-pdfs/huerfano-nuevo.pdf", LastModified: now.Add(-time.Hour)},
+	}
+
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if result.OrphansPurged != 1 {
+		t.Fatalf("OrphansPurged = %d, want 1", result.OrphansPurged)
+	}
+	if len(storage.deleted) != 1 || storage.deleted[0] != "raw-pdfs/huerfano-viejo.pdf" {
+		t.Fatalf("deleted = %v, want [raw-pdfs/huerfano-viejo.pdf]", storage.deleted)
+	}
+	// Nunca borra objetos con documento asociado.
+	for _, k := range storage.deleted {
+		if k == "raw-pdfs/doc-1.pdf" {
+			t.Error("borró un objeto con documento asociado")
+		}
+	}
+}
+
+func TestSweepOrphans_SinObjetos_NoPurga(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage() // sin listObjects
+
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+	if result.OrphansPurged != 0 {
+		t.Errorf("OrphansPurged = %d, want 0", result.OrphansPurged)
+	}
+}
+
+// --- Bloqueo distribuido multi-réplica (S4-P2-03) ---
+
+func TestRunOnce_SinLease_NoBloquea(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+	if result.LockAcquired {
+		t.Error("LockAcquired = true sin lease configurado")
+	}
+}
+
+func TestRunOnce_LeaseNoAdquirido_OtraReplicaActiva(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+	lease := &mockLease{acquired: false} // otra réplica tiene el lease
+
+	// Documento que, de correr, se reencolaría: no debe tocarse.
+	doc := &domain.Document{
+		ID:        "doc-1",
+		Status:    domain.StatusUploaded,
+		ObjectKey: "raw-pdfs/doc-1.pdf",
+		CreatedAt: now.Add(-2 * time.Hour),
+		UpdatedAt: now.Add(-2 * time.Hour),
+	}
+	repo.docs["doc-1"] = doc
+	storage.objects[doc.ObjectKey] = true
+
+	r := New(repo, storage, queue, lease, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if result.LockAcquired {
+		t.Error("LockAcquired = true con lease no adquirido")
+	}
+	if len(queue.enqueued) != 0 || len(repo.updateCalls) != 0 {
+		t.Error("otra réplica activa: no debía reencolar ni transicionar")
+	}
+	if lease.releases != 0 {
+		t.Error("no debe liberar un lease que no adquirió")
+	}
+}
+
+func TestRunOnce_LeaseAdquirido_EjecutaYLibera(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	lease := &mockLease{acquired: true}
+
+	r := New(repo, storage, nil, lease, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if !result.LockAcquired {
+		t.Error("LockAcquired = false con lease adquirido")
+	}
+	if lease.acquires != 1 {
+		t.Errorf("acquires = %d, want 1", lease.acquires)
+	}
+	if lease.releases != 1 {
+		t.Errorf("releases = %d, want 1 (debe liberar al terminar)", lease.releases)
 	}
 }
