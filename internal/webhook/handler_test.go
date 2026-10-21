@@ -435,6 +435,127 @@ type objectMissingError struct{}
 
 func (*objectMissingError) Error() string { return "The specified key does not exist" }
 
+// --- Ventana anti-replay (S3-P2-06) ---
+
+// eventTimePayload arma un evento ObjectCreated con Records[].eventTime.
+func eventTimePayload(eventTime string) map[string]any {
+	return map[string]any{
+		"EventName": "s3:ObjectCreated:Put",
+		"Records": []map[string]any{
+			{
+				"eventName": "s3:ObjectCreated:Put",
+				"eventTime": eventTime,
+				"s3": map[string]any{
+					"bucket": map[string]any{"name": "raw-pdfs"},
+					"object": map[string]any{"key": "raw-pdfs/doc-1.pdf"},
+				},
+			},
+		},
+	}
+}
+
+func TestHandleEvent_EventoReciente_Aceptado(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	repo.docs["doc-1"] = &domain.Document{ID: "doc-1", Status: domain.StatusPendingUpload}
+
+	h := NewHandler(repo, &mockStorage{}, "secret123", "raw-pdfs", "raw-pdfs/",
+		WithClock(func() time.Time { return now }),
+		WithReplayWindow(10*time.Minute),
+	)
+	engine := newTestEngine(h)
+
+	w := postEvent(engine, "secret123", eventTimePayload(now.Add(-1*time.Minute).Format(time.RFC3339Nano)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (evento dentro de la ventana); body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleEvent_EventoViejo_Rechazado(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	repo.docs["doc-1"] = &domain.Document{ID: "doc-1", Status: domain.StatusPendingUpload}
+
+	h := NewHandler(repo, &mockStorage{}, "secret123", "raw-pdfs", "raw-pdfs/",
+		WithClock(func() time.Time { return now }),
+		WithReplayWindow(10*time.Minute),
+	)
+	engine := newTestEngine(h)
+
+	// Evento de hace 1h: por fuera de la ventana (posible replay).
+	w := postEvent(engine, "secret123", eventTimePayload(now.Add(-time.Hour).Format(time.RFC3339Nano)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (evento viejo); body=%s", w.Code, w.Body.String())
+	}
+	if len(repo.updateCalls) != 0 {
+		t.Errorf("updateCalls = %d, want 0 (no debe transicionar)", len(repo.updateCalls))
+	}
+}
+
+func TestHandleEvent_EventoFuturo_Rechazado(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	repo.docs["doc-1"] = &domain.Document{ID: "doc-1", Status: domain.StatusPendingUpload}
+
+	h := NewHandler(repo, &mockStorage{}, "secret123", "raw-pdfs", "raw-pdfs/",
+		WithClock(func() time.Time { return now }),
+		WithReplayWindow(10*time.Minute),
+	)
+	engine := newTestEngine(h)
+
+	// Evento 1h en el futuro: fuera de la ventana (reloj adelantado o forjado).
+	w := postEvent(engine, "secret123", eventTimePayload(now.Add(time.Hour).Format(time.RFC3339Nano)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (evento futuro); body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleEvent_SinEventTime_Aceptado(t *testing.T) {
+	repo := newMockRepo()
+	repo.docs["doc-1"] = &domain.Document{ID: "doc-1", Status: domain.StatusPendingUpload}
+
+	h := NewHandler(repo, &mockStorage{}, "secret123", "raw-pdfs", "raw-pdfs/")
+	engine := newTestEngine(h)
+
+	// Payload sin eventTime (emisor no estándar): se acepta para no romper.
+	w := postEvent(engine, "secret123", map[string]any{
+		"EventName": "s3:ObjectCreated:Put",
+		"s3": map[string]any{
+			"bucket": map[string]any{"name": "raw-pdfs"},
+			"object": map[string]any{"key": "raw-pdfs/doc-1.pdf"},
+		},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (sin eventTime se acepta); body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestWithinReplayWindow(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	h := NewHandler(newMockRepo(), &mockStorage{}, "s", "raw-pdfs", "raw-pdfs/",
+		WithClock(func() time.Time { return now }),
+		WithReplayWindow(5*time.Minute),
+	)
+
+	cases := []struct {
+		name      string
+		eventTime string
+		want      bool
+	}{
+		{"vacío se acepta", "", true},
+		{"no parseable se acepta", "no-es-fecha", true},
+		{"justo en ventana", now.Add(-5 * time.Minute).Format(time.RFC3339Nano), true},
+		{"justo fuera", now.Add(-5*time.Minute - time.Second).Format(time.RFC3339Nano), false},
+		{"futuro dentro de skew", now.Add(2 * time.Minute).Format(time.RFC3339Nano), true},
+		{"futuro excesivo", now.Add(6 * time.Minute).Format(time.RFC3339Nano), false},
+	}
+	for _, tc := range cases {
+		if got := h.withinReplayWindow(tc.eventTime); got != tc.want {
+			t.Errorf("%s: withinReplayWindow(%q) = %v, want %v", tc.name, tc.eventTime, got, tc.want)
+		}
+	}
+}
+
 func TestExtractDocumentID(t *testing.T) {
 	h := &Handler{keyPrefix: "raw-pdfs/"}
 
