@@ -518,6 +518,79 @@ func TestCrossCheck_GeneraReporte(t *testing.T) {
 	}
 }
 
+// TestCrossCheck_DatosSanos_ReporteVacio verifica el caso "todo consistente":
+// MongoDB, MinIO y Redis cuadran, así que ninguna lista de discrepancias debe
+// tener elementos (S6-P2-01). Es la señal de alerta: si este reporte deja de
+// estar vacío en el entorno real, hay una inconsistencia que investigar.
+func TestCrossCheck_DatosSanos_ReporteVacio(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+
+	// Documento COMPLETED sano: tiene object_key y txt_ref, ambos existen.
+	completedKey := "raw-pdfs/doc-completed.pdf"
+	completedTxt := "extracted-txt/doc-completed.txt"
+	repo.docs["doc-completed"] = &domain.Document{
+		ID:        "doc-completed",
+		Status:    domain.StatusCompleted,
+		ObjectKey: completedKey,
+		TxtRef:    completedTxt,
+		CreatedAt: now.Add(-time.Hour),
+	}
+
+	// Documento activo (PROCESSING) con su objeto presente.
+	activeKey := "raw-pdfs/doc-active.pdf"
+	repo.docs["doc-active"] = &domain.Document{
+		ID:        "doc-active",
+		Status:    domain.StatusProcessing,
+		ObjectKey: activeKey,
+		CreatedAt: now.Add(-time.Hour),
+	}
+
+	// MinIO tiene exactamente los mismos objetos que referencian los documentos.
+	storage.objects[completedKey] = true
+	storage.objects[completedTxt] = true
+	storage.objects[activeKey] = true
+	storage.listObjects = []ports.ObjectInfo{
+		{Key: completedKey},
+		{Key: activeKey},
+	}
+
+	r := New(repo, storage, queue, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	report, err := r.crossCheck(context.Background(), now)
+	if err != nil {
+		t.Fatalf("crossCheck error: %v", err)
+	}
+
+	if report.TotalDocuments != 2 {
+		t.Errorf("TotalDocuments = %d, want 2", report.TotalDocuments)
+	}
+	if report.RawBucketObjects != 2 {
+		t.Errorf("RawBucketObjects = %d, want 2", report.RawBucketObjects)
+	}
+	if report.ByStatus[string(domain.StatusCompleted)] != 1 ||
+		report.ByStatus[string(domain.StatusProcessing)] != 1 {
+		t.Errorf("ByStatus = %v, want COMPLETED=1 PROCESSING=1", report.ByStatus)
+	}
+
+	if len(report.OrphanRawObjects) != 0 {
+		t.Errorf("OrphanRawObjects = %v, want 0", report.OrphanRawObjects)
+	}
+	if len(report.MissingRawObjects) != 0 {
+		t.Errorf("MissingRawObjects = %v, want 0", report.MissingRawObjects)
+	}
+	if len(report.CompletedNoTxt) != 0 {
+		t.Errorf("CompletedNoTxt = %v, want 0", report.CompletedNoTxt)
+	}
+	if len(report.FailedNoReason) != 0 {
+		t.Errorf("FailedNoReason = %v, want 0", report.FailedNoReason)
+	}
+	if report.YoungUntouched != 0 {
+		t.Errorf("YoungUntouched = %d, want 0 (ambos pasan el umbral de seguridad)", report.YoungUntouched)
+	}
+}
+
 // --- Failure reasons normalizados (S5-P2-02) ---
 
 func TestIsValidFailureReason(t *testing.T) {
