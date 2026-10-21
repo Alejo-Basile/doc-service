@@ -203,14 +203,19 @@ func (h *Handler) HandleEvent(c *gin.Context) {
 		return
 	}
 
+	corrID := correlationID(c)
+
 	// 5a. No es PDF → PENDING_UPLOAD → REJECTED (terminal, sin reintentos).
 	if !isPDF(data) {
-		ok, err := h.repo.UpdateStatus(ctx, docID,
+		ok, err := h.repo.UpdateStatusWithHistory(ctx, docID,
 			domain.StatusPendingUpload, domain.StatusRejected,
-			map[string]any{
-				"object_key":     objectKey,
-				"failure_reason": domain.FailureReasonNotAPDF,
+			domain.StatusEntry{
+				Status:        domain.StatusRejected,
+				Actor:         domain.ActorMinIOWebhook,
+				CorrelationID: corrID,
+				Reason:        domain.FailureReasonNotAPDF,
 			},
+			map[string]any{"object_key": objectKey},
 		)
 		if err != nil {
 			slog.Error("webhook: error marcando REJECTED",
@@ -230,8 +235,13 @@ func (h *Handler) HandleEvent(c *gin.Context) {
 
 	// 6. Promocionar PENDING_UPLOAD → UPLOADED (S3-P2-07).
 	// Esta transición dispara el Change Stream y el relay encola el trabajo.
-	ok, err := h.repo.UpdateStatus(ctx, docID,
+	ok, err := h.repo.UpdateStatusWithHistory(ctx, docID,
 		domain.StatusPendingUpload, domain.StatusUploaded,
+		domain.StatusEntry{
+			Status:        domain.StatusUploaded,
+			Actor:         domain.ActorMinIOWebhook,
+			CorrelationID: corrID,
+		},
 		map[string]any{"object_key": objectKey},
 	)
 	if err != nil {
@@ -283,4 +293,15 @@ func isPDF(data []byte) bool {
 		return false
 	}
 	return string(data[:5]) == "%PDF-"
+}
+
+// correlationID extrae el correlation_id del contexto de Gin (lo setea el
+// middleware de logging) para registrarlo en el historial del documento.
+func correlationID(c *gin.Context) string {
+	if v, ok := c.Get("correlation_id"); ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
 }

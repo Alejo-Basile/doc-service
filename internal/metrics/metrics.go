@@ -26,4 +26,23 @@ var (
 		Name:      "events_total",
 		Help:      "Total de eventos de webhook de MinIO procesados.",
 	})
+
+	// RelayEnqueueErrors totaliza los fallos de encolado del relay tras agotar
+	// los reintentos (S4-P2-05). Un valor creciente señala documentos UPLOADED
+	// que quedaron sin encolar y que el reconciliador deberá recuperar: es la
+	// señal para alertar "UPLOADED sin encolar".
+	RelayEnqueueErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "docservice",
+		Subsystem: "relay",
+		Name:      "enqueue_errors_total",
+		Help:      "Total de eventos UPLOADED que el relay no pudo encolar tras agotar reintentos.",
+	})
+
+	// RelayEnqueued totaliza los eventos encolados con éxito por el relay.
+	RelayEnqueued = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "docservice",
+		Subsystem: "relay",
+		Name:      "enqueued_total",
+		Help:      "Total de eventos UPLOADED encolados exitosamente por el relay.",
+	})
 )

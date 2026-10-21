@@ -161,8 +161,14 @@ func main() {
 	// --- Goroutines de fondo: Change Stream relay + reconciliador ---
 	// Se detienen con cancelBackground() después de drenar el HTTP.
 	backgroundCtx, cancelBackground := context.WithCancel(context.Background())
+	relayCfg := relay.DefaultConfig()
+	slog.Info("relay configurado",
+		"max_retries", relayCfg.MaxRetries,
+		"base_backoff", relayCfg.BaseBackoff.String(),
+	)
 	watcher := changestream.NewWatcher(
-		watcherClient, tokenStore, relay.New(queue, workSchemaVersion).Handler(), changestream.DefaultWatcherConfig(),
+		watcherClient, tokenStore, relay.NewWithConfig(queue, workSchemaVersion, relayCfg).Handler(),
+		changestream.DefaultWatcherConfig(),
 	)
 	go func() {
 		// Run reintenta internamente con backoff; solo retorna con el
