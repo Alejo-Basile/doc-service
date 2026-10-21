@@ -87,6 +87,7 @@ func (m *mockRepo) UpdateStatusWithHistory(ctx context.Context, id string, from,
 type mockStorage struct {
 	pdfHeader []byte
 	statErr   error
+	rangeErr  error // simula GetRange fallando (p.ej. objeto ya borrado)
 }
 
 func (m *mockStorage) PresignPost(ctx context.Context, objectKey string, opts ports.PresignPostOptions) (*ports.PresignPostResult, error) {
@@ -101,6 +102,9 @@ func (m *mockStorage) Stat(ctx context.Context, objectKey string) (ports.ObjectI
 }
 
 func (m *mockStorage) GetRange(ctx context.Context, objectKey string, start, end int64) ([]byte, error) {
+	if m.rangeErr != nil {
+		return nil, m.rangeErr
+	}
 	if m.pdfHeader != nil {
 		return m.pdfHeader, nil
 	}
@@ -308,6 +312,46 @@ func TestHandleEvent_NotPDF_Rejected(t *testing.T) {
 			repo.updateCalls[0].from, repo.updateCalls[0].to)
 	}
 }
+
+// TestHandleEvent_ObjectAlreadyDeleted_NoPromociona verifica S3-P2-08: si el
+// objeto ya no existe cuando llega el evento, el handler no debe promocionar el
+// documento a UPLOADED (dejaría un documento fantasma). Devuelve 5xx para que
+// MinIO reintente y, persistente el fallo, el reconciliador lo lleve a estado
+// terminal (UPLOAD_EXPIRED) sin que quede colgado en UPLOADED.
+func TestHandleEvent_ObjectAlreadyDeleted_NoPromociona(t *testing.T) {
+	repo := newMockRepo()
+	doc := &domain.Document{ID: "doc-gone", Status: domain.StatusPendingUpload}
+	repo.docs["doc-gone"] = doc
+
+	storage := &mockStorage{rangeErr: errObjectMissing}
+	h := NewHandler(repo, storage, "secret123", "raw-pdfs", "raw-pdfs/")
+	engine := newTestEngine(h)
+
+	w := postEvent(engine, "secret123", map[string]any{
+		"EventName": "s3:ObjectCreated:Put",
+		"s3": map[string]any{
+			"bucket": map[string]any{"name": "raw-pdfs"},
+			"object": map[string]any{"key": "raw-pdfs/doc-gone.pdf"},
+		},
+	})
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500 (objeto ilegible)", w.Code)
+	}
+	if len(repo.updateCalls) != 0 {
+		t.Errorf("updateCalls = %d, want 0 (no debe transicionar)", len(repo.updateCalls))
+	}
+	if doc.Status != domain.StatusPendingUpload {
+		t.Errorf("estado = %s, want PENDING_UPLOAD (el reconciliador lo expira)", doc.Status)
+	}
+}
+
+// errObjectMissing simula el error del SDK al leer un objeto inexistente.
+var errObjectMissing = &objectMissingError{}
+
+type objectMissingError struct{}
+
+func (*objectMissingError) Error() string { return "The specified key does not exist" }
 
 func TestExtractDocumentID(t *testing.T) {
 	h := &Handler{keyPrefix: "raw-pdfs/"}
