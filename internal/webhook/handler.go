@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/Alejo-Basile/doc-service/internal/domain"
 	"github.com/Alejo-Basile/doc-service/internal/metrics"
@@ -17,11 +18,18 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// defaultReplayWindow es la ventana por defecto para aceptar el eventTime de un
+// evento de MinIO. MinIO emite Records[].eventTime en RFC3339 (confirmado en la
+// version desplegada 2025-07-23); los eventos fuera de la ventana se rechazan
+// para reducir replay (S3-P2-06).
+const defaultReplayWindow = 10 * time.Minute
+
 // Evento minimo de MinIO Bucket Notifications que nos interesa.
 // Soporta el formato con s3 anidado en Records (payload real de MinIO, CI-D)
 // y el formato legado con s3 en la raiz (compatibilidad con tests existentes).
 type minioEvent struct {
 	EventName string `json:"EventName"`
+	EventTime string `json:"eventTime"`
 	Key       string `json:"Key"`
 	S3        struct {
 		Bucket struct {
@@ -33,6 +41,7 @@ type minioEvent struct {
 	} `json:"s3"`
 	Records []struct {
 		EventName string `json:"eventName"`
+		EventTime string `json:"eventTime"`
 		S3        struct {
 			Bucket struct {
 				Name string `json:"name"`
@@ -50,7 +59,23 @@ type Handler struct {
 	storage       ports.ObjectStorage
 	webhookSecret string
 	bucketRaw     string
-	keyPrefix     string // prefijo esperado en la clave (ej: raw-pdfs/)
+	keyPrefix     string        // prefijo esperado en la clave (ej: raw-pdfs/)
+	replayWindow  time.Duration // ventana anti-replay; 0 = defaultReplayWindow
+	clock         func() time.Time
+}
+
+// Option configura el Handler.
+type Option func(*Handler)
+
+// WithReplayWindow fija la ventana temporal para el eventTime del evento
+// (S3-P2-06). Un valor <= 0 usa defaultReplayWindow.
+func WithReplayWindow(d time.Duration) Option {
+	return func(h *Handler) { h.replayWindow = d }
+}
+
+// WithClock inyecta un reloj para tests.
+func WithClock(now func() time.Time) Option {
+	return func(h *Handler) { h.clock = now }
 }
 
 // NewHandler crea el handler del webhook.
@@ -60,14 +85,27 @@ func NewHandler(
 	webhookSecret string,
 	bucketRaw string,
 	keyPrefix string,
+	opts ...Option,
 ) *Handler {
-	return &Handler{
+	h := &Handler{
 		repo:          repo,
 		storage:       storage,
 		webhookSecret: webhookSecret,
 		bucketRaw:     bucketRaw,
 		keyPrefix:     keyPrefix,
+		replayWindow:  defaultReplayWindow,
+		clock:         time.Now,
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	if h.replayWindow <= 0 {
+		h.replayWindow = defaultReplayWindow
+	}
+	if h.clock == nil {
+		h.clock = time.Now
+	}
+	return h
 }
 
 // RegisterRoutes registra la ruta del webhook en el engine.
@@ -127,6 +165,23 @@ func (h *Handler) HandleEvent(c *gin.Context) {
 	if !strings.Contains(eventName, "ObjectCreated") {
 		slog.Debug("webhook: evento ignorado (no ObjectCreated)", "event", eventName)
 		c.JSON(http.StatusOK, gin.H{"status": "ignored", "reason": "not ObjectCreated"})
+		return
+	}
+
+	// 2b. Ventana anti-replay (S3-P2-06): rechazar eventos fuera de la ventana
+	// usando Records[].eventTime (RFC3339). Si el evento no trae timestamp
+	// parseable se acepta con warning (compatibilidad con emisores no estándar);
+	// la deduplicación sigue protegiendo los reenvíos dentro de la ventana.
+	eventTime := event.EventTime
+	if eventTime == "" && len(event.Records) > 0 {
+		eventTime = event.Records[0].EventTime
+	}
+	if !h.withinReplayWindow(eventTime) {
+		slog.Warn("webhook: evento fuera de la ventana anti-replay",
+			"event_time", eventTime, "window", h.replayWindow.String())
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "event out of replay window",
+		})
 		return
 	}
 
@@ -262,6 +317,33 @@ func (h *Handler) HandleEvent(c *gin.Context) {
 
 	metrics.WebhookEvents.Inc()
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "document_id": docID})
+}
+
+// withinReplayWindow valida que el eventTime del evento esté dentro de la
+// ventana tolerada respecto al reloj del servidor (S3-P2-06). Acepta un margen
+// hacia el futuro por desincronización de relojes (clock skew).
+//
+// Si eventTime viene vacío o no parsea, retorna true (no se puede validar; se
+// loguea el caso en el caller). Un timestamp viejo es la señal de replay.
+func (h *Handler) withinReplayWindow(eventTime string) bool {
+	if eventTime == "" {
+		return true
+	}
+	t, err := time.Parse(time.RFC3339Nano, eventTime)
+	if err != nil {
+		return true
+	}
+	now := h.clock()
+	age := now.Sub(t)
+	// Demasiado viejo → replay.
+	if age > h.replayWindow {
+		return false
+	}
+	// Demasiado en el futuro → reloj adelantado o evento malicioso.
+	if -age > h.replayWindow {
+		return false
+	}
+	return true
 }
 
 // verifyToken compara el token con el secreto en tiempo constante (S3-P2-06).
