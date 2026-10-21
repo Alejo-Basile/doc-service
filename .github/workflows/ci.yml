@@ -67,18 +67,23 @@ jobs:
           exit 1
       - name: iniciar minio
         run: |
+          # bitnamilegacy/minio: su entrypoint ya arranca el server (setup ->
+          # stop -> start). NO pasar "minio server ..." como command porque
+          # sobreescribe el entrypoint y el server no queda escuchando (health
+          # check en timeout).
           docker run -d --name minio -p 9000:9000 \
+            -v minio-data:/bitnami/minio/data \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin123 \
-            bitnamilegacy/minio:2025.7.23-debian-12-r5 \
-            minio server /data --console-address ":9001"
-          for i in $(seq 1 30); do
+            bitnamilegacy/minio:2025.7.23-debian-12-r5
+          for i in $(seq 1 60); do
             if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
               exit 0
             fi
             sleep 1
           done
-          echo "minio no arranco"
+          echo "minio no arranco; logs del contenedor:"
+          docker logs minio
           exit 1
       - name: tests de integracion
         env:
