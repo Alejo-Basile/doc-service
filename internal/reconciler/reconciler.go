@@ -289,9 +289,15 @@ func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time) (*s
 			}
 		} else {
 			// Objeto no existe → UPLOAD_EXPIRED.
-			ok, err := r.repo.UpdateStatus(ctx, doc.ID,
+			ok, err := r.repo.UpdateStatusWithHistory(ctx, doc.ID,
 				domain.StatusPendingUpload, domain.StatusUploadExpired,
-				map[string]any{"failure_reason": domain.FailureReasonUploadExpired},
+				domain.StatusEntry{
+					Status:        domain.StatusUploadExpired,
+					Actor:         domain.ActorReconciler,
+					CorrelationID: doc.CorrelationID,
+					Reason:        domain.FailureReasonUploadExpired,
+				},
+				nil,
 			)
 			if err != nil {
 				slog.Error("reconciler: error marcando UPLOAD_EXPIRED",
@@ -346,9 +352,15 @@ func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time) (int
 		}
 		if !exists {
 			// Objeto no existe: marcar FAILED con causa normalizada.
-			_, _ = r.repo.UpdateStatus(ctx, doc.ID,
+			_, _ = r.repo.UpdateStatusWithHistory(ctx, doc.ID,
 				domain.StatusUploaded, domain.StatusFailed,
-				map[string]any{"failure_reason": domain.FailureReasonObjectMissing},
+				domain.StatusEntry{
+					Status:        domain.StatusFailed,
+					Actor:         domain.ActorReconciler,
+					CorrelationID: doc.CorrelationID,
+					Reason:        domain.FailureReasonObjectMissing,
+				},
+				nil,
 			)
 			continue
 		}
@@ -368,9 +380,14 @@ func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time) (int
 		}
 
 		// Transicionar UPLOADED → QUEUED (para que no se reencole en el próximo ciclo).
-		ok, err := r.repo.UpdateStatus(ctx, doc.ID,
+		ok, err := r.repo.UpdateStatusWithHistory(ctx, doc.ID,
 			domain.StatusUploaded, domain.StatusQueued,
-			map[string]any{},
+			domain.StatusEntry{
+				Status:        domain.StatusQueued,
+				Actor:         domain.ActorReconciler,
+				CorrelationID: doc.CorrelationID,
+			},
+			nil,
 		)
 		if err != nil {
 			slog.Error("reconciler: error transicionando a QUEUED",
@@ -474,15 +491,26 @@ func (r *Reconciler) validateAndRecover(ctx context.Context, doc *domain.Documen
 	}
 
 	if len(data) < 5 || string(data[:5]) != "%PDF-" {
-		_, err := r.repo.UpdateStatus(ctx, doc.ID,
+		_, err := r.repo.UpdateStatusWithHistory(ctx, doc.ID,
 			domain.StatusPendingUpload, domain.StatusRejected,
-			map[string]any{"failure_reason": domain.FailureReasonNotAPDF},
+			domain.StatusEntry{
+				Status:        domain.StatusRejected,
+				Actor:         domain.ActorReconciler,
+				CorrelationID: doc.CorrelationID,
+				Reason:        domain.FailureReasonNotAPDF,
+			},
+			nil,
 		)
 		return false, err
 	}
 
-	_, err = r.repo.UpdateStatus(ctx, doc.ID,
+	_, err = r.repo.UpdateStatusWithHistory(ctx, doc.ID,
 		domain.StatusPendingUpload, domain.StatusUploaded,
+		domain.StatusEntry{
+			Status:        domain.StatusUploaded,
+			Actor:         domain.ActorReconciler,
+			CorrelationID: doc.CorrelationID,
+		},
 		map[string]any{"object_key": doc.ObjectKey},
 	)
 	return err == nil, err
