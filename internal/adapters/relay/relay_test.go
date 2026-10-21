@@ -11,6 +11,7 @@ import (
 	mongoadapter "github.com/Alejo-Basile/doc-service/internal/adapters/mongo"
 	redidadapter "github.com/Alejo-Basile/doc-service/internal/adapters/redis"
 	"github.com/Alejo-Basile/doc-service/internal/domain"
+	"github.com/Alejo-Basile/doc-service/internal/ports"
 )
 
 func testAddrs(t *testing.T) (string, string, string) {
@@ -204,4 +205,89 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+// --- Tests unitarios de reintento/backoff (S4-P2-05) ---
+
+// flakyQueue falla las primeras `failN` llamadas a Enqueue y luego tiene éxito.
+type flakyQueue struct {
+	failN   int
+	calls   int
+	enqueue int
+}
+
+func (q *flakyQueue) Enqueue(_ context.Context, _ ports.WorkMessage) error {
+	q.calls++
+	if q.calls <= q.failN {
+		return fmt.Errorf("cola caída (intento %d)", q.calls)
+	}
+	q.enqueue++
+	return nil
+}
+
+func (q *flakyQueue) Ping(_ context.Context) error { return nil }
+
+func TestRelay_ReintentaHastaEncolar(t *testing.T) {
+	// La cola falla 2 veces y al 3.er intento encola.
+	q := &flakyQueue{failN: 2}
+	r := NewWithConfig(q, 1, Config{MaxRetries: 5, BaseBackoff: time.Millisecond})
+
+	err := r.Handler()(context.Background(), changestream.Event{
+		DocumentID: "doc-1",
+		Status:     "UPLOADED",
+		ObjectKey:  "raw-pdfs/doc-1.pdf",
+	})
+	if err != nil {
+		t.Fatalf("Handler error = %v, want nil (debía reintentar y encolar)", err)
+	}
+	if q.enqueue != 1 {
+		t.Errorf("encolados = %d, want 1", q.enqueue)
+	}
+	if q.calls != 3 {
+		t.Errorf("llamadas = %d, want 3 (2 fallos + 1 éxito)", q.calls)
+	}
+}
+
+func TestRelay_AgotaReintentosYDevuelveError(t *testing.T) {
+	// La cola siempre falla.
+	q := &flakyQueue{failN: 100}
+	r := NewWithConfig(q, 1, Config{MaxRetries: 3, BaseBackoff: time.Millisecond})
+
+	err := r.Handler()(context.Background(), changestream.Event{
+		DocumentID: "doc-2",
+		Status:     "UPLOADED",
+	})
+	if err == nil {
+		t.Fatal("Handler error = nil, want error tras agotar reintentos")
+	}
+	// 1 intento inicial + 3 reintentos = 4 llamadas.
+	if q.calls != 4 {
+		t.Errorf("llamadas = %d, want 4 (1 + 3 reintentos)", q.calls)
+	}
+}
+
+func TestRelay_CancelacionDeContexto_Aborta(t *testing.T) {
+	q := &flakyQueue{failN: 100}
+	r := NewWithConfig(q, 1, Config{MaxRetries: 100, BaseBackoff: 50 * time.Millisecond})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // ya cancelado
+
+	err := r.Handler()(ctx, changestream.Event{DocumentID: "doc-3", Status: "UPLOADED"})
+	if err == nil {
+		t.Fatal("Handler error = nil, want error por contexto cancelado")
+	}
+}
+
+func TestRelay_EventoNoUploaded_NoEncola(t *testing.T) {
+	q := &flakyQueue{}
+	r := NewWithConfig(q, 1, Config{MaxRetries: 3, BaseBackoff: time.Millisecond})
+
+	err := r.Handler()(context.Background(), changestream.Event{DocumentID: "doc-4", Status: "QUEUED"})
+	if err != nil {
+		t.Fatalf("Handler error = %v, want nil", err)
+	}
+	if q.calls != 0 {
+		t.Errorf("llamadas = %d, want 0 (no es UPLOADED)", q.calls)
+	}
 }

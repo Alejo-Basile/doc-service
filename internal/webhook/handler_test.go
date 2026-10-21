@@ -16,14 +16,21 @@ import (
 
 // mockRepo implementa ports.DocumentRepository para tests.
 type mockRepo struct {
-	docs        map[string]*domain.Document
-	updateCalls []updateCall
+	docs         map[string]*domain.Document
+	updateCalls  []updateCall
+	historyCalls []historyCall
 }
 
 type updateCall struct {
 	id   string
 	from domain.Status
 	to   domain.Status
+}
+
+type historyCall struct {
+	id    string
+	to    domain.Status
+	entry domain.StatusEntry
 }
 
 func newMockRepo() *mockRepo {
@@ -75,11 +82,13 @@ func (m *mockRepo) ListByCursor(ctx context.Context, filter ports.CursorFilter) 
 
 func (m *mockRepo) UpdateStatusWithHistory(ctx context.Context, id string, from, to domain.Status, entry domain.StatusEntry, extraSet map[string]any) (bool, error) {
 	m.updateCalls = append(m.updateCalls, updateCall{id: id, from: from, to: to})
+	m.historyCalls = append(m.historyCalls, historyCall{id: id, to: to, entry: entry})
 	doc, ok := m.docs[id]
 	if !ok || doc.Status != from {
 		return false, nil
 	}
 	doc.Status = to
+	doc.History = append(doc.History, entry)
 	return true, nil
 }
 
@@ -172,6 +181,79 @@ func TestHandleEvent_ValidToken_TransitionsPendingToUploaded(t *testing.T) {
 	}
 	if repo.updateCalls[0].to != domain.StatusUploaded {
 		t.Errorf("transition to = %s, want UPLOADED", repo.updateCalls[0].to)
+	}
+}
+
+// TestHandleEvent_RegistraHistorial verifica que la transición del webhook
+// escribe una entrada de historial con actor minio-webhook (S4-P2-04).
+func TestHandleEvent_RegistraHistorial(t *testing.T) {
+	repo := newMockRepo()
+	doc := &domain.Document{ID: "doc-hist", Status: domain.StatusPendingUpload}
+	repo.docs["doc-hist"] = doc
+
+	h := NewHandler(repo, &mockStorage{}, "secret123", "raw-pdfs", "raw-pdfs/")
+	engine := newTestEngine(h)
+
+	w := postEvent(engine, "secret123", map[string]any{
+		"EventName": "s3:ObjectCreated:Put",
+		"s3": map[string]any{
+			"bucket": map[string]any{"name": "raw-pdfs"},
+			"object": map[string]any{"key": "raw-pdfs/doc-hist.pdf"},
+		},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	if len(repo.historyCalls) != 1 {
+		t.Fatalf("historyCalls = %d, want 1", len(repo.historyCalls))
+	}
+	entry := repo.historyCalls[0].entry
+	if entry.Actor != domain.ActorMinIOWebhook {
+		t.Errorf("actor = %s, want minio-webhook", entry.Actor)
+	}
+	if entry.Status != domain.StatusUploaded {
+		t.Errorf("status en historial = %s, want UPLOADED", entry.Status)
+	}
+	if len(doc.History) != 1 || doc.History[0].Actor != domain.ActorMinIOWebhook {
+		t.Errorf("historial del documento = %+v, want 1 entrada minio-webhook", doc.History)
+	}
+}
+
+// TestHandleEvent_NotPDF_RejectedRegistraHistorial verifica que el rechazo
+// por no-PDF también deja entrada de historial con la razón (S4-P2-04, S2-P2-02).
+func TestHandleEvent_NotPDF_RejectedRegistraHistorial(t *testing.T) {
+	repo := newMockRepo()
+	doc := &domain.Document{ID: "doc-bad", Status: domain.StatusPendingUpload}
+	repo.docs["doc-bad"] = doc
+
+	storage := &mockStorage{pdfHeader: []byte("no soy pdf")}
+	h := NewHandler(repo, storage, "secret123", "raw-pdfs", "raw-pdfs/")
+	engine := newTestEngine(h)
+
+	w := postEvent(engine, "secret123", map[string]any{
+		"EventName": "s3:ObjectCreated:Put",
+		"s3": map[string]any{
+			"bucket": map[string]any{"name": "raw-pdfs"},
+			"object": map[string]any{"key": "raw-pdfs/doc-bad.pdf"},
+		},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	if len(repo.historyCalls) != 1 {
+		t.Fatalf("historyCalls = %d, want 1", len(repo.historyCalls))
+	}
+	entry := repo.historyCalls[0].entry
+	if entry.Actor != domain.ActorMinIOWebhook {
+		t.Errorf("actor = %s, want minio-webhook", entry.Actor)
+	}
+	if entry.Status != domain.StatusRejected {
+		t.Errorf("status en historial = %s, want REJECTED", entry.Status)
+	}
+	if entry.Reason != domain.FailureReasonNotAPDF {
+		t.Errorf("reason en historial = %s, want NOT_A_PDF", entry.Reason)
 	}
 }
 
