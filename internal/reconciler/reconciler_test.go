@@ -77,6 +77,7 @@ func (m *mockRepo) ListByCursor(ctx context.Context, filter ports.CursorFilter) 
 }
 
 func (m *mockRepo) UpdateStatusWithHistory(ctx context.Context, id string, from, to domain.Status, entry domain.StatusEntry, extraSet map[string]any) (bool, error) {
+	m.updateCalls = append(m.updateCalls, updateCall{id: id, from: from, to: to})
 	doc, ok := m.docs[id]
 	if !ok || doc.Status != from {
 		return false, nil
@@ -846,5 +847,76 @@ func TestRunOnce_LeaseAdquirido_EjecutaYLibera(t *testing.T) {
 	}
 	if lease.releases != 1 {
 		t.Errorf("releases = %d, want 1 (debe liberar al terminar)", lease.releases)
+	}
+}
+
+// --- Historial en las transiciones del reconciliador (S4-P2-04) ---
+
+func TestReconciler_Transiciones_RegistranHistorial(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage() // sin objetos: PENDING_UPLOAD vencido → UPLOAD_EXPIRED
+
+	doc := &domain.Document{
+		ID:            "doc-hist",
+		Status:        domain.StatusPendingUpload,
+		ObjectKey:     "raw-pdfs/doc-hist.pdf",
+		CorrelationID: "corr-hist",
+		ExpiresAt:     now.Add(-time.Hour),
+		CreatedAt:     now.Add(-2 * time.Hour),
+	}
+	repo.docs["doc-hist"] = doc
+
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	if _, err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if len(doc.History) != 1 {
+		t.Fatalf("historial = %d entradas, want 1", len(doc.History))
+	}
+	entry := doc.History[0]
+	if entry.Actor != domain.ActorReconciler {
+		t.Errorf("actor = %s, want reconciler", entry.Actor)
+	}
+	if entry.Status != domain.StatusUploadExpired {
+		t.Errorf("status = %s, want UPLOAD_EXPIRED", entry.Status)
+	}
+	if entry.CorrelationID != "corr-hist" {
+		t.Errorf("correlation_id = %q, want corr-hist", entry.CorrelationID)
+	}
+	if entry.Reason != domain.FailureReasonUploadExpired {
+		t.Errorf("reason = %s, want UPLOAD_WINDOW_EXPIRED", entry.Reason)
+	}
+}
+
+func TestSweepStuckUploaded_ReencolaRegistraHistorial(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+
+	doc := &domain.Document{
+		ID:            "doc-stuck",
+		Status:        domain.StatusUploaded,
+		ObjectKey:     "raw-pdfs/doc-stuck.pdf",
+		CorrelationID: "corr-stuck",
+		CreatedAt:     now.Add(-2 * time.Hour),
+		UpdatedAt:     now.Add(-2 * time.Hour),
+	}
+	repo.docs["doc-stuck"] = doc
+	storage.objects[doc.ObjectKey] = true
+
+	r := New(repo, storage, queue, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	if _, err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	// UPLOADED→QUEUED debe dejar una entrada de historial del reconciler.
+	if len(doc.History) != 1 {
+		t.Fatalf("historial = %d entradas, want 1", len(doc.History))
+	}
+	if doc.History[0].Actor != domain.ActorReconciler || doc.History[0].Status != domain.StatusQueued {
+		t.Errorf("entrada = %+v, want reconciler/QUEUED", doc.History[0])
 	}
 }
