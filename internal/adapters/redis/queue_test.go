@@ -123,6 +123,57 @@ func TestWorkQueue_Deduplicacion(t *testing.T) {
 	}
 }
 
+// TestWorkQueue_FalloXADDLiberaDedup verifica que si XADD falla (p. ej. por un
+// tipo de clave incorrecto), la marca de deduplicación se libera para que el
+// replay del watcher pueda reencolar el documento cuando Redis vuelva (#55).
+func TestWorkQueue_FalloXADDLiberaDedup(t *testing.T) {
+	q, ctx, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	docID := fmt.Sprintf("doc-xadd-fail-%d", time.Now().UnixNano())
+	msg := ports.WorkMessage{
+		DocumentID:    docID,
+		ObjectKey:     "raw-pdfs/" + docID + ".pdf",
+		CorrelationID: "corr-xadd-fail",
+		EnqueuedAt:    time.Now().UTC().Format(time.RFC3339),
+		SchemaVersion: 1,
+	}
+
+	// Forzar que XADD falle: la clave del stream existe con otro tipo (string).
+	streamKey := q.StreamKey()
+	if err := q.Client().Set(ctx, streamKey, "no-es-un-stream", 0).Err(); err != nil {
+		t.Fatalf("Set streamKey: %v", err)
+	}
+
+	if err := q.Enqueue(ctx, msg); err == nil {
+		t.Fatal("Enqueue debía fallar con WRONGTYPE en XADD")
+	}
+
+	dedupKey := "dedup:" + docID
+	exists, err := q.Client().Exists(ctx, dedupKey).Result()
+	if err != nil {
+		t.Fatalf("Exists: %v", err)
+	}
+	if exists != 0 {
+		t.Errorf("la marca %s no se liberó tras el fallo de XADD", dedupKey)
+	}
+
+	// Al corregir la clave, el replay puede reencolar exactamente una vez.
+	if err := q.Client().Del(ctx, streamKey).Err(); err != nil {
+		t.Fatalf("Del streamKey: %v", err)
+	}
+	if err := q.Enqueue(ctx, msg); err != nil {
+		t.Fatalf("Enqueue tras liberar dedup falló: %v", err)
+	}
+	n, err := q.XLen(ctx)
+	if err != nil {
+		t.Fatalf("XLen: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("XLen = %d, want 1", n)
+	}
+}
+
 func TestWorkQueue_DocumentIDsDistintos(t *testing.T) {
 	q, ctx, cleanup := setupTestQueue(t)
 	defer cleanup()

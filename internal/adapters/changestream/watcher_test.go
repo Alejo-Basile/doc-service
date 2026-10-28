@@ -254,6 +254,146 @@ func TestWatcher_PersisteResumeToken(t *testing.T) {
 	}
 }
 
+// TestWatcher_HandlerFalla_ReintentaEvento simula una caída de Redis: el
+// handler falla en el primer intento y el watcher debe reintentar el MISMO
+// evento in-process (sin avanzar el token) hasta procesarlo (#55,
+// at-least-once).
+func TestWatcher_HandlerFalla_ReintentaEvento(t *testing.T) {
+	h, ctx, cleanup := setupHarness(t)
+	defer cleanup()
+
+	var mu sync.Mutex
+	calls := 0
+	exitos := 0
+
+	handler := func(ctx context.Context, event Event) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		if calls == 1 {
+			return fmt.Errorf("redis caído (simulado)")
+		}
+		exitos++
+		return nil
+	}
+
+	cfg := DefaultWatcherConfig()
+	cfg.RetryBackoff = 100 * time.Millisecond
+	w := NewWatcher(h.client, h.tokenStore, handler, cfg)
+
+	go func() { _ = w.Run(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+
+	doc := domain.NewDocument("corr-cs-replay", time.Now().UTC().Add(24*time.Hour))
+	doc.SetObjectKey("raw-pdfs")
+	if err := h.repo.Insert(ctx, doc); err != nil {
+		t.Fatalf("Insert falló: %v", err)
+	}
+	if _, err := h.repo.UpdateStatus(ctx, doc.ID,
+		domain.StatusPendingUpload, domain.StatusUploaded,
+		map[string]any{"object_key": doc.ObjectKey},
+	); err != nil {
+		t.Fatalf("UpdateStatus falló: %v", err)
+	}
+
+	// El primer intento falla; el watcher debe reprocesar el evento.
+	deadline := time.After(5 * time.Second)
+	for {
+		mu.Lock()
+		n := exitos
+		c := calls
+		mu.Unlock()
+		if n >= 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("el evento no se reintentó tras el fallo (calls=%d, éxitos=%d)", c, n)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	// El token se persiste recién después del handler exitoso.
+	token, err := h.tokenStore.Get(ctx)
+	if err != nil {
+		t.Fatalf("tokenStore.Get falló: %v", err)
+	}
+	if token == "" {
+		t.Error("el resume token debía persistirse tras el handler exitoso")
+	}
+
+	mu.Lock()
+	finalCalls := calls
+	mu.Unlock()
+	if finalCalls < 2 {
+		t.Errorf("handler llamado %d veces, want >=2 (fallo + reintento)", finalCalls)
+	}
+}
+
+// TestWatcher_HandlerFallaPersistente_AvanzaToken verifica el tope de eventos
+// "veneno": si el handler falla más de HandlerFailureTimeout para el mismo
+// evento, se avanza el token para no bloquear el stream (el reconciliador
+// cubre el documento).
+func TestWatcher_HandlerFallaPersistente_AvanzaToken(t *testing.T) {
+	h, ctx, cleanup := setupHarness(t)
+	defer cleanup()
+
+	var mu sync.Mutex
+	calls := 0
+
+	handler := func(ctx context.Context, event Event) error {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return fmt.Errorf("fallo persistente (simulado)")
+	}
+
+	cfg := DefaultWatcherConfig()
+	cfg.RetryBackoff = 50 * time.Millisecond
+	cfg.HandlerFailureTimeout = 150 * time.Millisecond
+	w := NewWatcher(h.client, h.tokenStore, handler, cfg)
+
+	go func() { _ = w.Run(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+
+	doc := domain.NewDocument("corr-cs-poison", time.Now().UTC().Add(24*time.Hour))
+	doc.SetObjectKey("raw-pdfs")
+	if err := h.repo.Insert(ctx, doc); err != nil {
+		t.Fatalf("Insert falló: %v", err)
+	}
+	if _, err := h.repo.UpdateStatus(ctx, doc.ID,
+		domain.StatusPendingUpload, domain.StatusUploaded,
+		map[string]any{"object_key": doc.ObjectKey},
+	); err != nil {
+		t.Fatalf("UpdateStatus falló: %v", err)
+	}
+
+	deadline := time.After(5 * time.Second)
+	for {
+		token, err := h.tokenStore.Get(ctx)
+		if err != nil {
+			t.Fatalf("tokenStore.Get falló: %v", err)
+		}
+		if token != "" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("el token no avanzó: el evento veneno bloqueó el stream")
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	mu.Lock()
+	n := calls
+	mu.Unlock()
+	if n < 2 {
+		t.Errorf("handler llamado %d veces, want >=2 antes de avanzar el token", n)
+	}
+}
+
 func TestWatcher_SimulacionDosWatchers(t *testing.T) {
 	// Simular dos watchers activos: ambos reciben el mismo evento,
 	// pero la deduplicación en el WorkQueue garantiza 1 solo XADD.

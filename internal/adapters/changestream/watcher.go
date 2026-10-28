@@ -23,6 +23,10 @@ import (
 // token en loop (S1-P2-07/08).
 var errResumeTokenInvalid = errors.New("resume token invalido, descartando y reiniciando stream")
 
+// errHandlerTimeout señala que el handler falló de forma persistente para un
+// evento y el watcher decidió avanzar el token para no bloquear el stream.
+var errHandlerTimeout = errors.New("handler falla de forma persistente")
+
 // maxConsecutiveResets limita los reinicios frescos consecutivos disparados
 // por un token invalidado, para no entrar en un tight-loop si el fallo persiste
 // (p.ej. Mongo inaccesible al mismo tiempo).
@@ -68,12 +72,13 @@ type Handler func(ctx context.Context, event Event) error
 
 // Watcher escucha el Change Stream de la colección `documents`.
 type Watcher struct {
-	client       *mongoadapter.Client
-	coll         *mongo.Collection
-	tokenStore   *mongoadapter.ResumeTokenStore
-	handler      Handler
-	pollInterval time.Duration
-	retryBackoff time.Duration
+	client                *mongoadapter.Client
+	coll                  *mongo.Collection
+	tokenStore            *mongoadapter.ResumeTokenStore
+	handler               Handler
+	pollInterval          time.Duration
+	retryBackoff          time.Duration
+	handlerFailureTimeout time.Duration
 }
 
 // WatcherConfig configura el Watcher.
@@ -84,14 +89,21 @@ type WatcherConfig struct {
 	PollInterval time.Duration
 	// RetryBackoff es el backoff base para reintentos tras error.
 	RetryBackoff time.Duration
+	// HandlerFailureTimeout es el tiempo máximo que se reintenta el mismo
+	// evento si el handler falla de forma persistente (evento "veneno"). Al
+	// superarlo se avanza el resume token para no bloquear el stream; el
+	// reconciliador cubre el documento. 0 desactiva el tope.
+	// Default: 10 min.
+	HandlerFailureTimeout time.Duration
 }
 
 // DefaultWatcherConfig retorna la configuración por defecto.
 func DefaultWatcherConfig() WatcherConfig {
 	return WatcherConfig{
-		Collection:   "documents",
-		PollInterval: 30 * time.Second,
-		RetryBackoff: 1 * time.Second,
+		Collection:            "documents",
+		PollInterval:          30 * time.Second,
+		RetryBackoff:          1 * time.Second,
+		HandlerFailureTimeout: 10 * time.Minute,
 	}
 }
 
@@ -103,12 +115,13 @@ func NewWatcher(
 	cfg WatcherConfig,
 ) *Watcher {
 	return &Watcher{
-		client:       client,
-		coll:         client.Collection(cfg.Collection),
-		tokenStore:   tokenStore,
-		handler:      handler,
-		pollInterval: cfg.PollInterval,
-		retryBackoff: cfg.RetryBackoff,
+		client:                client,
+		coll:                  client.Collection(cfg.Collection),
+		tokenStore:            tokenStore,
+		handler:               handler,
+		pollInterval:          cfg.PollInterval,
+		retryBackoff:          cfg.RetryBackoff,
+		handlerFailureTimeout: cfg.HandlerFailureTimeout,
 	}
 }
 
@@ -232,16 +245,26 @@ func (w *Watcher) watchOnce(ctx context.Context) error {
 			continue
 		}
 
-		// Persistir resume token ANTES de procesar (S1-P2-07).
-		if err := w.tokenStore.Save(ctx, tokenToString(stream.ResumeToken())); err != nil {
-			slog.Error("save resume token", "error", err)
-		}
-
-		if err := w.handler(ctx, event); err != nil {
-			slog.Error("handler error",
+		// Reintentar el mismo evento en proceso mientras el stream sigue abierto
+		// (#55): ante una caída de Redis el handler falla y el token NO avanza.
+		// Sólo un fallo persistente (evento "veneno") se salta, pasado
+		// HandlerFailureTimeout, para no bloquear el stream; el reconciliador
+		// cubre el documento.
+		if err := w.handleWithRetry(ctx, event); err != nil {
+			if !errors.Is(err, errHandlerTimeout) {
+				return err
+			}
+			slog.Error("watcher: handler falla de forma persistente, avanzando resume token",
 				"document_id", event.DocumentID,
+				"timeout", w.handlerFailureTimeout.String(),
 				"error", err,
 			)
+		}
+
+		// El resume token se persiste SÓLO tras procesar el evento (o tras
+		// decidir saltarlo por veneno). Guardarlo antes perdía el evento.
+		if err := w.tokenStore.Save(ctx, tokenToString(stream.ResumeToken())); err != nil {
+			return fmt.Errorf("save resume token: %w", err)
 		}
 	}
 
@@ -253,6 +276,47 @@ func (w *Watcher) watchOnce(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// handleWithRetry reintenta el handler para un mismo evento con backoff
+// exponencial sin cerrar el Change Stream (at-least-once, #55). Ante una caída
+// de Redis el evento se reintenta hasta que el handler lo procese; sólo un
+// fallo persistente supera HandlerFailureTimeout y devuelve errHandlerTimeout
+// para que el caller avance el token y el reconciliador cubra el documento.
+func (w *Watcher) handleWithRetry(ctx context.Context, event Event) error {
+	backoff := w.retryBackoff
+	if backoff <= 0 {
+		backoff = time.Second
+	}
+	var failedAt time.Time
+
+	for {
+		err := w.handler(ctx, event)
+		if err == nil {
+			return nil
+		}
+		if failedAt.IsZero() {
+			failedAt = time.Now()
+		}
+		if w.handlerFailureTimeout > 0 &&
+			time.Since(failedAt) >= w.handlerFailureTimeout {
+			return fmt.Errorf("%w: %v", errHandlerTimeout, err)
+		}
+		slog.Warn("watcher: handler falló, reintentando el mismo evento",
+			"document_id", event.DocumentID,
+			"backoff", backoff.String(),
+			"error", err,
+		)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
+	}
 }
 
 // discardToken elimina el resume token persistido cuando Mongo rechaza
