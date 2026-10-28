@@ -45,6 +45,15 @@ Hay dos opciones:
    lo detecta y alerta (no lo transiciona automáticamente: eso es trabajo
    del operador).
 
+5. **Timeline completa (S5-P2-04)**: el worker también hace `$push` a
+   `status_history` con `actor: "worker"`, `correlation_id` y `at` en la misma
+   `updateOne` que cambia el estado (ver `extraction-worker/crates/worker/src/
+   document_store.rs`). Así la timeline queda completa para un ticket de soporte:
+   `client` (creación), `minio-webhook` (promoción), `reconciler` (reencolado) y
+   `worker` (PROCESSING/COMPLETED). Las escrituras del worker son condicionales
+   y el `$push` va en la misma operación, de modo que no puede haber un cambio
+   de estado sin su entrada de historial.
+
 ## Consecuencias
 
 ### Positivas

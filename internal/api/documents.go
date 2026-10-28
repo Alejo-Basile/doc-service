@@ -119,24 +119,13 @@ func (h *DocumentHandler) CreateDocument(c *gin.Context) {
 		docID = ""
 	}
 
-	// Crear documento.
+	// Crear documento. La entrada inicial de la timeline (PENDING_UPLOAD) la
+	// registra siempre NewDocument con actor "client" (S5-P2-04), tanto con
+	// idempotency key como sin ella.
 	expiresAt := time.Now().UTC().Add(h.uploadGrace)
-	var doc *domain.Document
+	doc := domain.NewDocument(corrID, expiresAt)
 	if docID != "" {
-		doc = &domain.Document{
-			ID:            docID,
-			Status:        domain.StatusPendingUpload,
-			CorrelationID: corrID,
-			SchemaVersion: 1,
-			ExpiresAt:     expiresAt,
-			CreatedAt:     time.Now().UTC(),
-			UpdatedAt:     time.Now().UTC(),
-			History: []domain.StatusEntry{
-				{Status: domain.StatusPendingUpload, Actor: domain.ActorClient, CorrelationID: corrID, At: time.Now().UTC()},
-			},
-		}
-	} else {
-		doc = domain.NewDocument(corrID, expiresAt)
+		doc.ID = docID
 	}
 
 	// Fijar object_key derivado del document_id y del bucket configurado.

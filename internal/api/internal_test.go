@@ -99,6 +99,83 @@ func TestInternal_History_OK(t *testing.T) {
 	}
 }
 
+// TestInternal_History_TimelineCompleta valida el DoD de S5-P2-04: un ticket
+// de soporte se resuelve leyendo la timeline. Recorre el flujo del lado
+// doc-service (cliente → webhook de MinIO → reconciliador) y verifica que el
+// endpoint devuelve cada actor con su correlation_id y su fecha. El actor
+// `worker` lo agrega el extraction-worker (Rust) por ADR-0006, en su repo.
+func TestInternal_History_TimelineCompleta(t *testing.T) {
+	engine, repo := setupInternalTestServer(t)
+	ctx := context.Background()
+	const corr = "corr-timeline"
+
+	doc := domain.NewDocument(corr, time.Now().UTC().Add(30*time.Minute))
+	if err := repo.Insert(ctx, doc); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	// Webhook: PENDING_UPLOAD → UPLOADED.
+	if ok, err := repo.UpdateStatusWithHistory(ctx, doc.ID,
+		domain.StatusPendingUpload, domain.StatusUploaded,
+		domain.StatusEntry{
+			Status: domain.StatusUploaded, Actor: domain.ActorMinIOWebhook,
+			CorrelationID: corr,
+		}, nil); err != nil || !ok {
+		t.Fatalf("transición webhook: ok=%v err=%v", ok, err)
+	}
+
+	// Reconciliador: UPLOADED → QUEUED (reencolado).
+	if ok, err := repo.UpdateStatusWithHistory(ctx, doc.ID,
+		domain.StatusUploaded, domain.StatusQueued,
+		domain.StatusEntry{
+			Status: domain.StatusQueued, Actor: domain.ActorReconciler,
+			CorrelationID: corr,
+		}, nil); err != nil || !ok {
+		t.Fatalf("transición reconciliador: ok=%v err=%v", ok, err)
+	}
+
+	w := internalRequest(engine, http.MethodGet, "/internal/documents/"+doc.ID+"/history", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		DocumentID string `json:"document_id"`
+		Status     string `json:"status"`
+		Count      int    `json:"count"`
+		History    []struct {
+			Status        string    `json:"status"`
+			Actor         string    `json:"actor"`
+			CorrelationID string    `json:"correlation_id"`
+			At            time.Time `json:"at"`
+		} `json:"history"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("JSON inválido: %v", err)
+	}
+
+	want := []struct{ status, actor string }{
+		{string(domain.StatusPendingUpload), string(domain.ActorClient)},
+		{string(domain.StatusUploaded), string(domain.ActorMinIOWebhook)},
+		{string(domain.StatusQueued), string(domain.ActorReconciler)},
+	}
+	if resp.Count != len(want) || len(resp.History) != len(want) {
+		t.Fatalf("count = %d, history = %d, want %d", resp.Count, len(resp.History), len(want))
+	}
+	for i, e := range want {
+		got := resp.History[i]
+		if got.Status != e.status || got.Actor != e.actor {
+			t.Errorf("history[%d] = {%s, %s}, want {%s, %s}", i, got.Status, got.Actor, e.status, e.actor)
+		}
+		if got.CorrelationID != corr {
+			t.Errorf("history[%d].correlation_id = %q, want %q", i, got.CorrelationID, corr)
+		}
+		if got.At.IsZero() {
+			t.Errorf("history[%d].at vacío", i)
+		}
+	}
+}
+
 func TestInternal_History_NoExiste_NotFound(t *testing.T) {
 	engine, _ := setupInternalTestServer(t)
 

@@ -167,7 +167,7 @@ func setupTestServer(t *testing.T) (*gin.Engine, *mockRepo) {
 // --- tests ---
 
 func TestCreateDocument_Nuevo(t *testing.T) {
-	engine, _ := setupTestServer(t)
+	engine, repo := setupTestServer(t)
 
 	body := `{"size_bytes": 1024}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v2/documents", bytes.NewBufferString(body))
@@ -198,6 +198,19 @@ func TestCreateDocument_Nuevo(t *testing.T) {
 	}
 	if resp.ExpiresIn <= 0 {
 		t.Errorf("ExpiresIn debe ser positivo, got %d", resp.ExpiresIn)
+	}
+
+	// S5-P2-04: la creación abre la timeline con actor "client" tanto con
+	// idempotency key como sin ella (antes variaba a "doc-service").
+	doc, err := repo.GetByID(context.Background(), resp.DocumentID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if len(doc.History) != 1 {
+		t.Fatalf("History = %d entradas, want 1", len(doc.History))
+	}
+	if doc.History[0].Actor != domain.ActorClient {
+		t.Errorf("History[0].Actor = %s, want client", doc.History[0].Actor)
 	}
 }
 

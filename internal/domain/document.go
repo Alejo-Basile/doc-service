@@ -180,7 +180,7 @@ func NewDocument(correlationID string, expiresAt time.Time) *Document {
 		CreatedAt:     now,
 		UpdatedAt:     now,
 		History: []StatusEntry{
-			{Status: StatusPendingUpload, Actor: ActorDocService, CorrelationID: correlationID, At: now},
+			{Status: StatusPendingUpload, Actor: ActorClient, CorrelationID: correlationID, At: now},
 		},
 	}
 }
