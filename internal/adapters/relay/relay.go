@@ -67,8 +67,8 @@ func NewWithConfig(queue ports.WorkQueue, schemaVersion int, cfg Config) *Relay 
 //
 // Ante un fallo de encolado reintenta con backoff exponencial hasta agotar
 // maxRetries (S4-P2-05). Si persiste, incrementa la métrica de error y
-// devuelve el error; el documento queda UPLOADED y el reconciliador lo
-// recupera, de modo que el evento no se pierde en silencio.
+// devuelve el error; el watcher reintenta el mismo evento in-process (#55) y,
+// si el fallo es persistente, avanza el token y el reconciliador lo recupera.
 func (r *Relay) Handler() changestream.Handler {
 	return func(ctx context.Context, event changestream.Event) error {
 		// Solo procesar eventos UPLOADED (el pipeline ya filtra, pero defensa en profundidad).
@@ -92,10 +92,10 @@ func (r *Relay) Handler() changestream.Handler {
 
 		err := r.enqueueWithRetry(ctx, msg)
 		if err != nil {
-			// El evento no se perdió: el documento sigue UPLOADED y el
-			// reconciliador lo reencolará. La métrica es la señal de alerta.
+			// El token no avanzó: el watcher reintenta este mismo evento (#55).
+			// Si el fallo es persistente, el reconciliador cubre el documento.
 			metrics.RelayEnqueueErrors.Inc()
-			slog.Error("relay: no se pudo encolar tras reintentos; el reconciliador lo recuperará",
+			slog.Error("relay: no se pudo encolar tras reintentos; el watcher lo reintentará",
 				"document_id", event.DocumentID,
 				"object_key", msg.ObjectKey,
 				"retries", r.maxRetries,
