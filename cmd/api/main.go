@@ -19,6 +19,7 @@ import (
 	"github.com/Alejo-Basile/doc-service/internal/adapters/relay"
 	"github.com/Alejo-Basile/doc-service/internal/api"
 	"github.com/Alejo-Basile/doc-service/internal/config"
+	"github.com/Alejo-Basile/doc-service/internal/metrics"
 	"github.com/Alejo-Basile/doc-service/internal/pdfsvc"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
 	"github.com/Alejo-Basile/doc-service/internal/reconciler"
@@ -158,7 +159,7 @@ func main() {
 	server.RegisterAPI(docsHandler, webhookHandler, internalHandler, rel)
 	httpSrv := server.NewHTTPServer(cfg.Addr())
 
-	// --- Goroutines de fondo: Change Stream relay + reconciliador ---
+	// --- Goroutines de fondo: Change Stream relay + reconciliador + metrics collector ---
 	// Se detienen con cancelBackground() después de drenar el HTTP.
 	backgroundCtx, cancelBackground := context.WithCancel(context.Background())
 	relayCfg := relay.DefaultConfig()
@@ -191,6 +192,11 @@ func main() {
 		}
 	}()
 	go rel.Start(backgroundCtx)
+
+	// Collector de métricas de negocio (S4-P1-02): consulta Mongo cada 15s
+	// y actualiza gauges: documents_by_status, documents_non_terminal,
+	// documents_oldest_intermediate_age_seconds.
+	go metrics.StartCollectorWithConfig(backgroundCtx, mongoClient)
 
 	// Canal para capturar señales del SO (SIGINT y SIGTERM).
 	quit := make(chan os.Signal, 1)
