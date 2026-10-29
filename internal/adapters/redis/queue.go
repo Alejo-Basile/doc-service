@@ -92,6 +92,14 @@ func (w *WorkQueue) Enqueue(ctx context.Context, msg ports.WorkMessage) error {
 		},
 	}).Result()
 	if err != nil {
+		// El mensaje NO llegó al stream: liberar la marca de deduplicación para
+		// que el replay del watcher pueda reencolarlo cuando Redis vuelva (#55).
+		if delErr := w.client.Del(ctx, dedupKey).Err(); delErr != nil {
+			slog.Warn("no se pudo liberar la marca de deduplicación tras fallo de XADD",
+				"document_id", msg.DocumentID,
+				"error", delErr,
+			)
+		}
 		return fmt.Errorf("XADD %s: %w", w.streamKey, err)
 	}
 
