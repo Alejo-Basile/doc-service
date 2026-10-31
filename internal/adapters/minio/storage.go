@@ -270,7 +270,7 @@ func (o *ObjectStorage) MakeBucket(ctx context.Context, bucket string) error {
 func (o *ObjectStorage) ListObjects(ctx context.Context) ([]ports.ObjectInfo, error) {
 	var objects []ports.ObjectInfo
 
-	for obj := range o.client.ListObjects(ctx, o.bucketRaw, miniogo.ListObjectsOptions{}) {
+	for obj := range o.client.ListObjects(ctx, o.bucketRaw, miniogo.ListObjectsOptions{Recursive: true}) {
 		if obj.Err != nil {
 			return nil, fmt.Errorf("list objects %s: %w", o.bucketRaw, obj.Err)
 		}
