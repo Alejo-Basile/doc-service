@@ -2,6 +2,8 @@ package reconciler
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,6 +12,7 @@ import (
 	"github.com/Alejo-Basile/doc-service/internal/domain"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
 	"github.com/gin-gonic/gin"
+	minio "github.com/minio/minio-go/v7"
 )
 
 // mockClock implementa ports.Clock para tests.
@@ -369,14 +372,20 @@ func TestRunOnce_StuckIntermediate_Recent_NotDetected(t *testing.T) {
 
 func TestIsNotFound(t *testing.T) {
 	tests := []struct {
+		name string
 		err  error
 		want bool
 	}{
-		{nil, false},
-		{notFoundError{}, true},
-		{errString("Object not found"), true},
-		{errString("NoSuchKey"), true},
-		{errString("connection refused"), false},
+		{name: "nil", err: nil, want: false},
+		{name: "error de red genérico", err: errors.New("connection refused"), want: false},
+		{name: "SDK NoSuchKey (type-assert del error del SDK)", err: minio.ErrorResponse{Code: "NoSuchKey", Message: "The specified key does not exist.", StatusCode: 404}, want: true},
+		{name: "SDK status 404 con código distinto", err: minio.ErrorResponse{Code: "AccessDenied", StatusCode: http.StatusNotFound}, want: true},
+		{name: "SDK error distinto", err: minio.ErrorResponse{Code: "InternalError", StatusCode: http.StatusInternalServerError}, want: false},
+		{name: "SDK NoSuchKey envuelto", err: fmt.Errorf("stat bucket/key: %w", minio.ErrorResponse{Code: "NoSuchKey", StatusCode: 404}), want: true},
+		{name: "mensaje not found", err: notFoundError{}, want: true},
+		{name: "mensaje Object not found", err: errString("Object not found"), want: true},
+		{name: "mensaje NoSuchKey", err: errString("NoSuchKey"), want: true},
+		{name: "mensaje connection refused", err: errString("connection refused"), want: false},
 	}
 
 	for _, tt := range tests {
@@ -991,5 +1000,46 @@ func TestSweepStuckUploaded_ReencolaRegistraHistorial(t *testing.T) {
 	}
 	if doc.History[0].Actor != domain.ActorReconciler || doc.History[0].Status != domain.StatusQueued {
 		t.Errorf("entrada = %+v, want reconciler/QUEUED", doc.History[0])
+	}
+}
+
+// TestCrossCheck_IgnoraEntradasDePrefijo verifica que el listado de MinIO no
+// confunda un prefijo de carpeta ("raw-pdfs/") con un objeto huérfano ni lo
+// cuente como objeto del bucket (S6-P2-01, cross-check del reconciliador).
+func TestCrossCheck_IgnoraEntradasDePrefijo(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	doc := &domain.Document{
+		ID:        "doc-a",
+		Status:    domain.StatusCompleted,
+		CreatedAt: now, // joven: salta la rama de Stat de completed_no_txt
+		UpdatedAt: now,
+		ObjectKey: "raw-pdfs/doc-a.pdf",
+		TxtRef:    "extracted-txt/doc-a.txt",
+	}
+	repo.docs["doc-a"] = doc
+
+	storage := newMockStorage()
+	storage.objects["raw-pdfs/doc-a.pdf"] = true
+	storage.listObjects = []ports.ObjectInfo{
+		{Key: "raw-pdfs/doc-a.pdf"},
+		{Key: "raw-pdfs/"}, // entrada de prefijo: no es un objeto real
+	}
+	queue := &mockQueue{}
+
+	r := New(repo, storage, queue, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	report, err := r.crossCheck(context.Background(), now)
+	if err != nil {
+		t.Fatalf("crossCheck error: %v", err)
+	}
+
+	if report.RawBucketObjects != 1 {
+		t.Errorf("RawBucketObjects = %d, want 1 (prefijo no cuenta como objeto)", report.RawBucketObjects)
+	}
+	if len(report.OrphanRawObjects) != 0 {
+		t.Errorf("OrphanRawObjects = %v, want vacíos (no hay huérfanos reales)", report.OrphanRawObjects)
+	}
+	if len(storage.deleted) != 0 {
+		t.Errorf("storage.deleted = %v, want vacío (no se purga nada)", storage.deleted)
 	}
 }
