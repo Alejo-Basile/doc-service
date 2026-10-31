@@ -15,14 +15,18 @@ package reconciler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Alejo-Basile/doc-service/internal/domain"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
 	httpserver "github.com/Alejo-Basile/doc-service/internal/transport/http"
 	"github.com/gin-gonic/gin"
+	minio "github.com/minio/minio-go/v7"
 )
 
 // Reconciler ejecuta el sweep periódico de documentos inconsistentes.
@@ -458,6 +462,10 @@ func (r *Reconciler) purgeOrphanObjects(ctx context.Context, validKeys map[strin
 
 	purged := 0
 	for _, obj := range objects {
+		// Ignorar entradas de prefijo (common prefixes) del listado.
+		if strings.HasSuffix(obj.Key, "/") {
+			continue
+		}
 		// No purgar si el objeto tiene documento asociado.
 		if validKeys[obj.Key] {
 			continue
@@ -682,12 +690,18 @@ func (r *Reconciler) crossCheck(ctx context.Context, now time.Time) (*CrossCheck
 		if err != nil {
 			return nil, fmt.Errorf("list raw objects: %w", err)
 		}
-		report.RawBucketObjects = int64(len(objects))
+		rawObjects := 0
 		for _, obj := range objects {
+			// Ignorar entradas de prefijo (common prefixes) del listado.
+			if strings.HasSuffix(obj.Key, "/") {
+				continue
+			}
+			rawObjects++
 			if !validRawKeys[obj.Key] {
 				report.OrphanRawObjects = append(report.OrphanRawObjects, obj.Key)
 			}
 		}
+		report.RawBucketObjects = int64(rawObjects)
 	}
 
 	// 4. Redis stream length.
@@ -732,6 +746,10 @@ func isDocActive(s domain.Status) bool {
 func isNotFound(err error) bool {
 	if err == nil {
 		return false
+	}
+	var sdkErr minio.ErrorResponse
+	if errors.As(err, &sdkErr) {
+		return sdkErr.Code == "NoSuchKey" || sdkErr.StatusCode == http.StatusNotFound
 	}
 	msg := err.Error()
 	return contains(msg, "not found") ||
