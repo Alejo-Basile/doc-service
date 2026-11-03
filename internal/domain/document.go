@@ -80,16 +80,40 @@ func (s Status) IsTerminal() bool {
 	}
 }
 
+// allStatuses lista todos los estados válidos del ciclo de vida.
+// Es la fuente única para IsValid y para quien necesite enumerarlos
+// (por ejemplo, el collector de métricas de negocio).
+var allStatuses = []Status{
+	StatusPendingUpload,
+	StatusUploaded,
+	StatusQueued,
+	StatusProcessing,
+	StatusRetrying,
+	StatusExtractionFailed,
+	StatusCompensating,
+	StatusCompleted,
+	StatusFailed,
+	StatusRejected,
+	StatusUploadExpired,
+}
+
+// AllStatuses devuelve una copia de todos los estados válidos del dominio.
+func AllStatuses() []Status {
+	return append([]Status(nil), allStatuses...)
+}
+
+var validStatuses = func() map[Status]struct{} {
+	m := make(map[Status]struct{}, len(allStatuses))
+	for _, s := range allStatuses {
+		m[s] = struct{}{}
+	}
+	return m
+}()
+
 // IsValid valida que el estado pertenezca al dominio.
 func (s Status) IsValid() bool {
-	switch s {
-	case StatusPendingUpload, StatusUploaded, StatusQueued, StatusProcessing,
-		StatusRetrying, StatusExtractionFailed, StatusCompensating,
-		StatusCompleted, StatusFailed, StatusRejected, StatusUploadExpired:
-		return true
-	default:
-		return false
-	}
+	_, ok := validStatuses[s]
+	return ok
 }
 
 // allowedTransitions define la matriz estricta de transiciones permitidas (SPEC §4, §11.1).
