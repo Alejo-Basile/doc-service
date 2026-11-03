@@ -47,10 +47,14 @@ func setupHarness(t *testing.T) (*testHarness, context.Context, func()) {
 	repo := mongo.NewDocumentRepository(client, "documents")
 	tokenStore := mongo.NewResumeTokenStore(client)
 
+	// El orden importa: cancelar primero para que los watchers dejen de usar la
+	// base, y recién después dropear. Con el orden inverso un Save en vuelo
+	// aterrizaba sobre una base en proceso de drop y ensuciaba el log con
+	// "Cannot create collection ... database is in the process of being dropped".
 	cleanup := func() {
+		cancel()
 		_ = client.DB().Drop(context.Background())
 		_ = client.Close(context.Background())
-		cancel()
 	}
 
 	return &testHarness{client, repo, tokenStore, dbName}, ctx, cleanup
@@ -314,13 +318,25 @@ func TestWatcher_HandlerFalla_ReintentaEvento(t *testing.T) {
 		}
 	}
 
-	// El token se persiste recién después del handler exitoso.
-	token, err := h.tokenStore.Get(ctx)
-	if err != nil {
-		t.Fatalf("tokenStore.Get falló: %v", err)
-	}
-	if token == "" {
-		t.Error("el resume token debía persistirse tras el handler exitoso")
+	// El token se persiste recién después del handler exitoso, en la goroutine
+	// del watcher: que el contador del handler llegue a 1 NO garantiza que
+	// Save ya ocurrió. Se consulta con deadline en vez de una única lectura;
+	// la lectura única fallaba en CI bajo carga (se leía antes del Save).
+	tokenDeadline := time.After(3 * time.Second)
+	for {
+		token, getErr := h.tokenStore.Get(ctx)
+		if getErr != nil {
+			t.Fatalf("tokenStore.Get falló: %v", getErr)
+		}
+		if token != "" {
+			break
+		}
+		select {
+		case <-tokenDeadline:
+			t.Error("el resume token debía persistirse tras el handler exitoso")
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 
 	mu.Lock()
