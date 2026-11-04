@@ -18,7 +18,7 @@ func TestTransitions_Exhaustivo(t *testing.T) {
 		StatusQueued:           {StatusProcessing},
 		StatusProcessing:       {StatusCompleted, StatusRejected, StatusRetrying, StatusExtractionFailed},
 		StatusRetrying:         {StatusProcessing, StatusExtractionFailed},
-		StatusExtractionFailed: {StatusCompensating},
+		StatusExtractionFailed: {StatusCompensating, StatusRetrying}, // RETRYING: retry del operador
 		StatusCompensating:     {StatusFailed},
 		// Estados terminales: sin transiciones de salida.
 		StatusCompleted:     nil,

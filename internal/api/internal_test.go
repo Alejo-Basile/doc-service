@@ -4,25 +4,47 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/Alejo-Basile/doc-service/internal/domain"
+	"github.com/Alejo-Basile/doc-service/internal/ports"
 	"github.com/gin-gonic/gin"
 )
 
 const testInternalToken = "internal-test-auth"
 
+type mockQueue struct {
+	messages []ports.WorkMessage
+	err      error
+}
+
+func (m *mockQueue) Enqueue(ctx context.Context, msg ports.WorkMessage) error {
+	if m.err != nil {
+		return m.err
+	}
+	m.messages = append(m.messages, msg)
+	return nil
+}
+
+func (m *mockQueue) Ping(ctx context.Context) error { return m.err }
+
 func setupInternalTestServer(t *testing.T) (*gin.Engine, *mockRepo) {
+	t.Helper()
+	return setupInternalTestServerWithQueue(t, nil)
+}
+
+func setupInternalTestServerWithQueue(t *testing.T, queue ports.WorkQueue) (*gin.Engine, *mockRepo) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 
 	repo := newMockRepo()
 	storage := &mockStorage{}
 
-	handler := NewInternalHandler(repo, storage, nil, testInternalToken)
+	handler := NewInternalHandler(repo, storage, queue, testInternalToken)
 
 	engine := gin.New()
 	handler.RegisterRoutes(engine)
@@ -185,10 +207,11 @@ func TestInternal_History_NoExiste_NotFound(t *testing.T) {
 	}
 }
 
-// --- Retry (S4-P2-05) ---
+// --- Retry (S4-P2-06) ---
 
 func TestInternal_Retry_ExtractionFailed_OK(t *testing.T) {
-	engine, repo := setupInternalTestServer(t)
+	queue := &mockQueue{}
+	engine, repo := setupInternalTestServerWithQueue(t, queue)
 
 	doc := domain.NewDocument("corr-r1", time.Now().UTC().Add(30*time.Minute))
 	doc.Status = domain.StatusExtractionFailed
@@ -205,8 +228,11 @@ func TestInternal_Retry_ExtractionFailed_OK(t *testing.T) {
 	if resp["status"] != string(domain.StatusRetrying) {
 		t.Errorf("status = %v, want RETRYING", resp["status"])
 	}
+	if resp["reenqueued"] != true {
+		t.Errorf("reenqueued = %v, want true", resp["reenqueued"])
+	}
 
-	// Verificar que el historial se actualizó.
+	// Verificar que el historial se actualizó con el actor de la API.
 	updated, _ := repo.GetByID(context.Background(), doc.ID)
 	if updated.Status != domain.StatusRetrying {
 		t.Errorf("doc.Status = %s, want RETRYING", updated.Status)
@@ -214,13 +240,24 @@ func TestInternal_Retry_ExtractionFailed_OK(t *testing.T) {
 	if len(updated.History) < 2 {
 		t.Errorf("history = %d entradas, want >= 2", len(updated.History))
 	}
+	if got := updated.History[len(updated.History)-1].Actor; got != domain.ActorDocService {
+		t.Errorf("actor = %s, want %s", got, domain.ActorDocService)
+	}
+	if len(queue.messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(queue.messages))
+	}
+	if queue.messages[0].DocumentID != doc.ID {
+		t.Errorf("message.DocumentID = %s, want %s", queue.messages[0].DocumentID, doc.ID)
+	}
 }
 
-func TestInternal_Retry_Retrying_Processing(t *testing.T) {
-	engine, repo := setupInternalTestServer(t)
+func TestInternal_Retry_Retrying_ReencolaSinCambiarEstado(t *testing.T) {
+	queue := &mockQueue{}
+	engine, repo := setupInternalTestServerWithQueue(t, queue)
 
 	doc := domain.NewDocument("corr-r2", time.Now().UTC().Add(30*time.Minute))
 	doc.Status = domain.StatusRetrying
+	doc.ObjectKey = "raw-pdfs/corr-r2.pdf"
 	_ = repo.Insert(context.Background(), doc)
 
 	w := internalRequest(engine, http.MethodPost, "/internal/documents/"+doc.ID+"/retry", nil)
@@ -230,8 +267,50 @@ func TestInternal_Retry_Retrying_Processing(t *testing.T) {
 
 	var resp map[string]any
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["status"] != string(domain.StatusProcessing) {
-		t.Errorf("status = %v, want PROCESSING", resp["status"])
+	if resp["status"] != string(domain.StatusRetrying) {
+		t.Errorf("status = %v, want RETRYING (RETRYING → PROCESSING es del worker)", resp["status"])
+	}
+	if resp["reenqueued"] != true {
+		t.Errorf("reenqueued = %v, want true", resp["reenqueued"])
+	}
+
+	updated, _ := repo.GetByID(context.Background(), doc.ID)
+	if updated.Status != domain.StatusRetrying {
+		t.Errorf("doc.Status = %s, want RETRYING", updated.Status)
+	}
+	if len(queue.messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(queue.messages))
+	}
+}
+
+func TestInternal_Retry_EnqueueFalla_503(t *testing.T) {
+	for _, estado := range []domain.Status{domain.StatusExtractionFailed, domain.StatusRetrying} {
+		t.Run(string(estado), func(t *testing.T) {
+			queue := &mockQueue{err: errors.New("redis caído")}
+			engine, repo := setupInternalTestServerWithQueue(t, queue)
+
+			doc := domain.NewDocument("corr-r4", time.Now().UTC().Add(30*time.Minute))
+			doc.Status = estado
+			doc.ObjectKey = "raw-pdfs/corr-r4.pdf"
+			_ = repo.Insert(context.Background(), doc)
+
+			w := internalRequest(engine, http.MethodPost, "/internal/documents/"+doc.ID+"/retry", nil)
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+			}
+
+			var resp map[string]any
+			_ = json.Unmarshal(w.Body.Bytes(), &resp)
+			if resp["reenqueued"] != false {
+				t.Errorf("reenqueued = %v, want false", resp["reenqueued"])
+			}
+
+			// El documento queda en RETRYING desde donde se puede reintentar.
+			updated, _ := repo.GetByID(context.Background(), doc.ID)
+			if updated.Status != domain.StatusRetrying {
+				t.Errorf("doc.Status = %s, want RETRYING (reintentable)", updated.Status)
+			}
+		})
 	}
 }
 

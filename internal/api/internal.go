@@ -91,9 +91,10 @@ func (h *InternalHandler) GetHistory(c *gin.Context) {
 	})
 }
 
-// RetryDocument maneja POST /internal/documents/:id/retry (S4-P2-05).
-// Reintenta un documento en estado EXTRACTION_FAILED → COMPENSATING → (worker decide).
-// Solo aplica a documentos en EXTRACTION_FAILED.
+// RetryDocument maneja POST /internal/documents/:id/retry (S4-P2-06).
+// Reintenta un documento en EXTRACTION_FAILED (→ RETRYING) o en RETRYING
+// (reencola sin cambiar de estado: la transición a PROCESSING la hace el worker
+// al reclamar el mensaje).
 func (h *InternalHandler) RetryDocument(c *gin.Context) {
 	id := c.Param("id")
 	if id == "" {
@@ -112,8 +113,6 @@ func (h *InternalHandler) RetryDocument(c *gin.Context) {
 		return
 	}
 
-	// Solo EXTRACTION_FAILED puede ser reintentado directamente.
-	// RETRYING es transición desde EXTRACTION_FAILED según la matriz.
 	if doc.Status != domain.StatusExtractionFailed && doc.Status != domain.StatusRetrying {
 		c.JSON(http.StatusConflict, gin.H{
 			"error":          "estado no permite reintento",
@@ -123,32 +122,40 @@ func (h *InternalHandler) RetryDocument(c *gin.Context) {
 		return
 	}
 
-	// Transicionar a RETRYING (o PROCESSING si ya está en RETRYING).
 	to := domain.StatusRetrying
-	if doc.Status == domain.StatusRetrying {
-		to = domain.StatusProcessing
-	}
+	if doc.Status == domain.StatusExtractionFailed {
+		// Defensa en profundidad: la arista del operador está en la matriz,
+		// pero la API no debe escribir transiciones que el dominio rechace.
+		if !domain.CanTransitionFrom(doc.Status, to) {
+			c.JSON(http.StatusConflict, gin.H{
+				"error":          "transición no permitida por la máquina de estados",
+				"current_status": string(doc.Status),
+				"target_status":  string(to),
+			})
+			return
+		}
 
-	entry := domain.StatusEntry{
-		Status:        to,
-		Actor:         domain.ActorDocService,
-		CorrelationID: doc.CorrelationID,
+		entry := domain.StatusEntry{
+			Status:        to,
+			Actor:         domain.ActorDocService,
+			CorrelationID: doc.CorrelationID,
+		}
+		ok, err := h.repo.UpdateStatusWithHistory(c.Request.Context(), id,
+			doc.Status, to, entry, map[string]any{},
+		)
+		if err != nil {
+			slog.Error("internal retry: update status", "error", err, "document_id", id)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "error actualizando estado"})
+			return
+		}
+		if !ok {
+			c.JSON(http.StatusConflict, gin.H{"error": "transición no aplicada (documento cambió de estado)"})
+			return
+		}
 	}
+	// Si ya estaba en RETRYING, no se transiciona: sólo se reencola.
 
-	ok, err := h.repo.UpdateStatusWithHistory(c.Request.Context(), id,
-		doc.Status, to, entry, map[string]any{},
-	)
-	if err != nil {
-		slog.Error("internal retry: update status", "error", err, "document_id", id)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "error actualizando estado"})
-		return
-	}
-	if !ok {
-		c.JSON(http.StatusConflict, gin.H{"error": "transición no aplicada (documento cambió de estado)"})
-		return
-	}
-
-	// Reencolar si hay queue disponible.
+	reenqueued := false
 	if h.queue != nil && doc.ObjectKey != "" {
 		msg := ports.WorkMessage{
 			DocumentID:    doc.ID,
@@ -159,18 +166,27 @@ func (h *InternalHandler) RetryDocument(c *gin.Context) {
 		}
 		if err := h.queue.Enqueue(c.Request.Context(), msg); err != nil {
 			slog.Error("internal retry: enqueue failed", "error", err, "document_id", id)
-			// No fallar el request: la transición ya se aplicó.
+			// La transición ya se aplicó, pero el reintento no está en curso.
+			// El documento queda en RETRYING, desde donde se puede reintentar.
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"document_id": id,
+				"status":      string(to),
+				"reenqueued":  false,
+				"error":       "no se pudo encolar el reintento; reintentar la operación",
+			})
+			return
 		}
+		reenqueued = true
 	}
 
 	slog.Info("internal retry: documento reintentado",
-		"document_id", id, "from", doc.Status, "to", to,
+		"document_id", id, "from", doc.Status, "to", to, "reenqueued", reenqueued,
 	)
 
 	c.JSON(http.StatusOK, gin.H{
 		"document_id": id,
 		"status":      string(to),
-		"reenqueued":  h.queue != nil,
+		"reenqueued":  reenqueued,
 	})
 }
 
