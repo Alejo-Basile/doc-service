@@ -94,23 +94,12 @@ func collectByStatus(ctx context.Context, coll *mongodriver.Collection) error {
 	}
 	defer cursor.Close(ctx)
 
-	// Resetear todos los gauges conocidos a 0 antes de setear los valores reales
-	// para que estados sin documentos muestren 0 y no valor anterior.
-	knownStatuses := []string{
-		string(domain.StatusPendingUpload),
-		string(domain.StatusUploaded),
-		string(domain.StatusQueued),
-		string(domain.StatusProcessing),
-		string(domain.StatusRetrying),
-		string(domain.StatusExtractionFailed),
-		string(domain.StatusCompensating),
-		string(domain.StatusCompleted),
-		string(domain.StatusFailed),
-		string(domain.StatusRejected),
-		string(domain.StatusUploadExpired),
-	}
-	for _, s := range knownStatuses {
-		DocumentsByStatus.WithLabelValues(s).Set(0)
+	// Resetear todos los estados del dominio a 0 antes de setear los valores
+	// reales para que estados sin documentos muestren 0 y no el valor anterior.
+	// domain.AllStatuses es la fuente única: un estado nuevo entra al collector
+	// sin tener que duplicar la lista acá.
+	for _, s := range domain.AllStatuses() {
+		DocumentsByStatus.WithLabelValues(string(s)).Set(0)
 	}
 
 	for cursor.Next(ctx) {
