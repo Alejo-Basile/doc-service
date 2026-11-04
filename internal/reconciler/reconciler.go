@@ -749,12 +749,20 @@ func isNotFound(err error) bool {
 	}
 	var sdkErr minio.ErrorResponse
 	if errors.As(err, &sdkErr) {
-		return sdkErr.Code == "NoSuchKey" || sdkErr.StatusCode == http.StatusNotFound
+		// Sólo la ausencia del objeto. Un 404 con otro código (p. ej.
+		// NoSuchBucket) es un error de infraestructura: tratarlo como
+		// "objeto ausente" marcaría documentos válidos como UPLOAD_EXPIRED
+		// o FAILED(object_missing) durante una mala configuración.
+		if sdkErr.Code == "NoSuchKey" || sdkErr.Code == "NoSuchObject" {
+			return true
+		}
+		// Fallback: algunos errores del SDK llegan con 404 y sin código.
+		return sdkErr.Code == "" && sdkErr.StatusCode == http.StatusNotFound
 	}
 	msg := err.Error()
 	return contains(msg, "not found") ||
 		contains(msg, "NoSuchKey") ||
-		contains(msg, "404") ||
+		contains(msg, "NoSuchObject") ||
 		contains(msg, "NotFound")
 }
 

@@ -95,6 +95,8 @@ func (m *mockRepo) UpdateStatusWithHistory(ctx context.Context, id string, from,
 type mockStorage struct {
 	objects map[string]bool // key → exists
 	pdfData []byte
+	// statErr permite simular errores de infraestructura (p. ej. NoSuchBucket).
+	statErr error
 	// listObjects soporta la aserción `lister` de purgeOrphanObjects (S4-P2-02).
 	listObjects []ports.ObjectInfo
 	deleted     []string
@@ -139,6 +141,9 @@ func (m *mockStorage) PresignPost(ctx context.Context, objectKey string, opts po
 }
 
 func (m *mockStorage) Stat(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
+	if m.statErr != nil {
+		return ports.ObjectInfo{}, m.statErr
+	}
 	if m.objects[objectKey] {
 		return ports.ObjectInfo{Key: objectKey}, nil
 	}
@@ -212,6 +217,43 @@ func TestRunOnce_ExpiredPending_ObjectAbsent(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("no se transicionó a UPLOAD_EXPIRED; calls=%+v", repo.updateCalls)
+	}
+}
+
+// TestRunOnce_ExpiredPending_BucketAusente_NoExpira fija que un 404 de
+// infraestructura (NoSuchBucket) no se confunda con "objeto ausente": el
+// documento debe quedar intacto para que el próximo sweep lo reintente.
+func TestRunOnce_ExpiredPending_BucketAusente_NoExpira(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	storage.statErr = minio.ErrorResponse{
+		Code:       "NoSuchBucket",
+		Message:    "The specified bucket does not exist.",
+		StatusCode: http.StatusNotFound,
+	}
+
+	doc := &domain.Document{
+		ID:        "doc-bucket",
+		Status:    domain.StatusPendingUpload,
+		ObjectKey: "raw-pdfs/doc-bucket.pdf",
+		ExpiresAt: now.Add(-time.Hour),
+	}
+	repo.docs["doc-bucket"] = doc
+
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if result.ExpiredPending != 0 {
+		t.Errorf("ExpiredPending = %d, want 0 (NoSuchBucket no es objeto ausente)", result.ExpiredPending)
+	}
+	for _, call := range repo.updateCalls {
+		if call.id == "doc-bucket" && call.to == domain.StatusUploadExpired {
+			t.Errorf("el documento no debía expirar por un 404 de bucket; calls=%+v", repo.updateCalls)
+		}
 	}
 }
 
@@ -379,12 +421,15 @@ func TestIsNotFound(t *testing.T) {
 		{name: "nil", err: nil, want: false},
 		{name: "error de red genérico", err: errors.New("connection refused"), want: false},
 		{name: "SDK NoSuchKey (type-assert del error del SDK)", err: minio.ErrorResponse{Code: "NoSuchKey", Message: "The specified key does not exist.", StatusCode: 404}, want: true},
-		{name: "SDK status 404 con código distinto", err: minio.ErrorResponse{Code: "AccessDenied", StatusCode: http.StatusNotFound}, want: true},
+		{name: "SDK NoSuchBucket no es objeto ausente", err: minio.ErrorResponse{Code: "NoSuchBucket", StatusCode: http.StatusNotFound}, want: false},
+		{name: "SDK AccessDenied 404 no es objeto ausente", err: minio.ErrorResponse{Code: "AccessDenied", StatusCode: http.StatusNotFound}, want: false},
+		{name: "SDK 404 sin código (fallback) es objeto ausente", err: minio.ErrorResponse{StatusCode: http.StatusNotFound}, want: true},
 		{name: "SDK error distinto", err: minio.ErrorResponse{Code: "InternalError", StatusCode: http.StatusInternalServerError}, want: false},
 		{name: "SDK NoSuchKey envuelto", err: fmt.Errorf("stat bucket/key: %w", minio.ErrorResponse{Code: "NoSuchKey", StatusCode: 404}), want: true},
 		{name: "mensaje not found", err: notFoundError{}, want: true},
 		{name: "mensaje Object not found", err: errString("Object not found"), want: true},
 		{name: "mensaje NoSuchKey", err: errString("NoSuchKey"), want: true},
+		{name: "mensaje 404 sin NoSuchKey", err: errString("unexpected 404"), want: false},
 		{name: "mensaje connection refused", err: errString("connection refused"), want: false},
 	}
 
