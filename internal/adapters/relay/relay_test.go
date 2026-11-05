@@ -103,18 +103,17 @@ func TestRelay_EncolaEventoUPLOADED(t *testing.T) {
 		t.Fatalf("XLen esperado 1, got %d", len(msgs))
 	}
 
-	payload, ok := msgs[0].Values["payload"].(string)
-	if !ok {
-		t.Fatalf("payload no es string: %v", msgs[0].Values["payload"])
+	values := msgs[0].Values
+	if _, wrapped := values["payload"]; wrapped {
+		t.Fatalf("el mensaje no debe envolver el contrato en `payload`: %v", values)
 	}
-
-	for _, campo := range []string{"document_id", "object_key", "correlation_id", "schema_version"} {
-		if !contains(payload, campo) {
-			t.Errorf("payload falta campo %q: %s", campo, payload)
+	if got, ok := values["document_id"].(string); !ok || got != doc.ID {
+		t.Errorf("document_id = %v, want %q", values["document_id"], doc.ID)
+	}
+	for _, campo := range []string{"object_key", "correlation_id", "enqueued_at", "schema_version"} {
+		if _, ok := values[campo].(string); !ok {
+			t.Errorf("falta el campo plano %q: %v", campo, values)
 		}
-	}
-	if !contains(payload, doc.ID) {
-		t.Errorf("payload falta document_id %q: %s", doc.ID, payload)
 	}
 }
 
@@ -192,19 +191,6 @@ func TestRelay_ObjectKeyDerivado(t *testing.T) {
 	if fmt.Sprintf("raw-pdfs/%s.pdf", "doc-derived") != expected {
 		t.Errorf("derivación de object_key incorrecta")
 	}
-}
-
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && indexOf(s, sub) >= 0
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }
 
 // --- Tests unitarios de reintento/backoff (S4-P2-05) ---
