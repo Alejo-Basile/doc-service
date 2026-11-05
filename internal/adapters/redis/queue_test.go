@@ -202,14 +202,14 @@ func TestWorkQueue_DocumentIDsDistintos(t *testing.T) {
 	}
 }
 
-func TestWorkQueue_PayloadDelContrato(t *testing.T) {
+func TestWorkQueue_ContratoCamposPlanos(t *testing.T) {
 	q, ctx, cleanup := setupTestQueue(t)
 	defer cleanup()
 
 	msg := ports.WorkMessage{
-		DocumentID:    "doc-payload",
-		ObjectKey:     "raw-pdfs/doc-payload.pdf",
-		CorrelationID: "corr-payload",
+		DocumentID:    "doc-contrato",
+		ObjectKey:     "raw-pdfs/doc-contrato.pdf",
+		CorrelationID: "corr-contrato",
 		EnqueuedAt:    "2026-10-04T10:00:00Z",
 		SchemaVersion: 1,
 	}
@@ -226,21 +226,31 @@ func TestWorkQueue_PayloadDelContrato(t *testing.T) {
 		t.Fatalf("XRange longitud esperada 1, got %d", len(msgs))
 	}
 
-	// Verificar que el payload tiene los campos del contrato.
-	payload, ok := msgs[0].Values["payload"].(string)
-	if !ok {
-		t.Fatalf("payload no es string: %v", msgs[0].Values["payload"])
+	values := msgs[0].Values
+	if _, wrapped := values["payload"]; wrapped {
+		t.Fatalf("el mensaje no debe envolver el contrato en `payload`: %v", values)
+	}
+	if len(values) != 5 {
+		t.Errorf("campos del mensaje = %d, want 5: %v", len(values), values)
 	}
 
-	// No debe tener campo attempts.
-	if contains(payload, "attempts") {
-		t.Error("el payload no debe contener campo 'attempts'")
+	// Mismos nombres y tipos que `WorkItem::from_stream_fields` del worker:
+	// cinco campos planos, con schema_version como texto (Redis no tiene enteros).
+	esperado := map[string]string{
+		"document_id":    msg.DocumentID,
+		"object_key":     msg.ObjectKey,
+		"correlation_id": msg.CorrelationID,
+		"enqueued_at":    msg.EnqueuedAt,
+		"schema_version": "1",
 	}
-
-	// Debe tener los campos del contrato.
-	for _, campo := range []string{"document_id", "object_key", "correlation_id", "enqueued_at", "schema_version"} {
-		if !contains(payload, campo) {
-			t.Errorf("payload falta campo %q: %s", campo, payload)
+	for campo, valor := range esperado {
+		got, ok := values[campo].(string)
+		if !ok {
+			t.Errorf("campo %q no es string: %v", campo, values[campo])
+			continue
+		}
+		if got != valor {
+			t.Errorf("campo %q = %q, want %q", campo, got, valor)
 		}
 	}
 }
@@ -280,21 +290,6 @@ func TestWorkQueue_WaitNoBloqueaEnStandalone(t *testing.T) {
 	if n != 1 {
 		t.Errorf("XLen esperado 1, got %d", n)
 	}
-}
-
-// contains verifica si un string contiene un substring.
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(sub) == 0 ||
-		indexOf(s, sub) >= 0)
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }
 
 // TestWorkQueue_IntegracionConRedisReal es un test de humo que verifica

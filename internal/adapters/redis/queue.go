@@ -4,9 +4,9 @@ package redis
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/Alejo-Basile/doc-service/internal/ports"
@@ -65,7 +65,10 @@ func NewWorkQueueFromClient(client *redis.Client, cfg WorkQueueConfig) *WorkQueu
 // Pasos:
 //  1. Deduplicación: SET dedup:<document_id> 1 NX EX <ttl>. Si ya existe,
 //     el mensaje fue encolado previamente (puede haber >1 watcher).
-//  2. XADD al stream con el payload del contrato (sin attempts).
+//  2. XADD al stream con los campos planos del contrato (sin attempts).
+//     El envelope es un campo por atributo, no un JSON dentro de `payload`:
+//     así el worker y las herramientas de inspección leen `document_id` y
+//     `correlation_id` directo de XPENDING/XRANGE (ADR-0007).
 //  3. WAIT 1 <timeout> para que el mensaje esté replicado.
 func (w *WorkQueue) Enqueue(ctx context.Context, msg ports.WorkMessage) error {
 	// 1. Deduplicación.
@@ -79,16 +82,15 @@ func (w *WorkQueue) Enqueue(ctx context.Context, msg ports.WorkMessage) error {
 		return nil
 	}
 
-	// 2. XADD al stream.
-	payload, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("marshal work message: %w", err)
-	}
-
+	// 2. XADD al stream con campos planos (SPEC §5.4, ADR-0007).
 	streamID, err := w.client.XAdd(ctx, &redis.XAddArgs{
 		Stream: w.streamKey,
 		Values: map[string]interface{}{
-			"payload": string(payload),
+			"document_id":    msg.DocumentID,
+			"object_key":     msg.ObjectKey,
+			"correlation_id": msg.CorrelationID,
+			"enqueued_at":    msg.EnqueuedAt,
+			"schema_version": strconv.Itoa(msg.SchemaVersion),
 		},
 	}).Result()
 	if err != nil {

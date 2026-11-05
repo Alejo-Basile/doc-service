@@ -56,6 +56,8 @@ Usamos **JSON** como formato del mensaje en Redis Streams.
 
 ### Reglas del contrato
 
+- El mensaje se publica con **campos planos** (un campo del stream por atributo),
+  no como un JSON dentro de un campo `payload` (ADR-0007).
 - El binario del PDF **nunca** viaja por la cola (SPEC §5.4). Solo metadatos.
 - `object_key` es derivable de `document_id` (`raw-pdfs/<id>.pdf`): la operación
   es idempotente por diseño.

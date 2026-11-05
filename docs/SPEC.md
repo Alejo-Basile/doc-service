@@ -270,12 +270,15 @@ Consumer Group:  extraction-workers
 DLQ:             stream:pdf-processing-dlq
 ```
 
-- Alta: `XADD stream:pdf-processing * document_id <id> object_key raw-pdfs/<id>.pdf correlation_id <id> schema_version 1` — **sin `attempts`** (ver abajo).
+- Alta: `XADD stream:pdf-processing * document_id <id> object_key raw-pdfs/<id>.pdf correlation_id <id> enqueued_at <RFC3339> schema_version 1` — **sin `attempts`** (ver abajo).
+- Envelope: **un campo plano por atributo**, sin wrapper JSON.
 - Cada worker: `XREADGROUP GROUP extraction-workers consumer-<pod> COUNT 1 BLOCK 5000 STREAMS stream:pdf-processing >`
 - Éxito: `XACK`
 - Fallo: **no** se hace `XACK` → el mensaje queda en el *Pending Entries List* (PEL).
 - Recuperación de mensajes huérfanos (worker caído a mitad de proceso): `XAUTOCLAIM` periódico para reasignar el mensaje a otro consumidor.
 - Al superar el máximo de intentos (ej. 5), el mensaje se mueve a `stream:pdf-processing-dlq` y el documento pasa a `EXTRACTION_FAILED` (dispara la compensación, sección 6).
+
+🔧 **Envelope de campos planos, no un JSON dentro de `payload`.** `document_id`, `object_key`, `correlation_id`, `enqueued_at` y `schema_version` viajan como campos del stream. El worker y las herramientas de inspección (`XRANGE`, `XPENDING`, replay de la DLQ) leen `document_id` y `correlation_id` directamente; con un wrapper quedan invisibles para el diagnóstico de la PEL. El parser de `extraction-worker` acepta `payload` sólo como compatibilidad transitoria (ver ADR-0007 de `doc-service`).
 
 🔧 **El contador de intentos es el *delivery count* de `XPENDING`, no un campo del mensaje.** Redis ya lleva la cuenta de cuántas veces entregó un mensaje pendiente y la incrementa solo en cada `XREADGROUP` y en cada `XAUTOCLAIM`. Llevar `attempts` en el payload obliga a **reescribir el mensaje dentro del stream** en cada intento para mantener un contador que ya existe: más escrituras sobre el path crítico, más superficie de fallo y un mensaje que cambia bajo los pies del consumidor. Se lee con `XPENDING stream:pdf-processing extraction-workers IDLE 0 - + 100` y se compara contra `WORKER_MAX_ATTEMPTS`.
 
@@ -290,7 +293,7 @@ Se resuelve con una transacción (`MULTI`/`EXEC`) o, mejor, con un **script Lua*
 
 ### 5.5 Formato de los mensajes: JSON en vez de Protocol Buffers
 
-🔧 **Recomendación de eficiencia/simplicidad:** el binario del PDF **nunca** viaja por Redis Streams (viaja por MinIO). El mensaje en la cola es solo metadata pequeña (`document_id`, `object_key`, `attempts`, `correlation_id`). Para este tamaño de payload:
+🔧 **Recomendación de eficiencia/simplicidad:** el binario del PDF **nunca** viaja por Redis Streams (viaja por MinIO). El mensaje en la cola es solo metadata pequeña (`document_id`, `object_key`, `correlation_id`, `enqueued_at`, `schema_version`). Para este tamaño de payload:
 
 - **JSON** es suficiente, más simple de depurar (`XRANGE` muestra el contenido legible sin decodificar), y evita mantener `.proto` sincronizados entre Go y Rust más un compilador protobuf en ambos toolchains.
 - Protobuf solo se justificaría si el volumen de mensajes fuera masivo (miles/segundo) y el ahorro de bytes importara — no es el caso aquí.
