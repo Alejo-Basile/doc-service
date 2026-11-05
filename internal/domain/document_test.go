@@ -66,6 +66,7 @@ func TestCanTransitionFrom_MatrizCompleta(t *testing.T) {
 		// Reintento
 		{StatusProcessing, StatusRetrying, true},
 		{StatusRetrying, StatusProcessing, true},
+		{StatusExtractionFailed, StatusRetrying, true}, // retry del operador (S4-P2-06)
 		// Fallo definitivo + compensación
 		{StatusProcessing, StatusExtractionFailed, true},
 		{StatusRetrying, StatusExtractionFailed, true},
@@ -253,7 +254,7 @@ func TestTransitionsFor(t *testing.T) {
 		{StatusQueued, []Status{StatusProcessing}},
 		{StatusProcessing, []Status{StatusCompleted, StatusRejected, StatusRetrying, StatusExtractionFailed}},
 		{StatusRetrying, []Status{StatusProcessing, StatusExtractionFailed}},
-		{StatusExtractionFailed, []Status{StatusCompensating}},
+		{StatusExtractionFailed, []Status{StatusCompensating, StatusRetrying}},
 		{StatusCompensating, []Status{StatusFailed}},
 		{StatusCompleted, nil},
 		{StatusFailed, nil},

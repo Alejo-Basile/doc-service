@@ -122,12 +122,15 @@ var allowedTransitions = map[Status][]Status{
 	// PENDING_UPLOAD → REJECTED: la validación %PDF- post-subida falla antes de
 	// promocionar (S2-P2-02). Se evita el paso intermedio por UPLOADED para que el
 	// Change Stream nunca encole un objeto que no es un PDF.
-	StatusPendingUpload:    {StatusUploaded, StatusUploadExpired, StatusRejected},
-	StatusUploaded:         {StatusQueued},
-	StatusQueued:           {StatusProcessing},
-	StatusProcessing:       {StatusCompleted, StatusRejected, StatusRetrying, StatusExtractionFailed},
-	StatusRetrying:         {StatusProcessing, StatusExtractionFailed},
-	StatusExtractionFailed: {StatusCompensating},
+	StatusPendingUpload: {StatusUploaded, StatusUploadExpired, StatusRejected},
+	StatusUploaded:      {StatusQueued},
+	StatusQueued:        {StatusProcessing},
+	StatusProcessing:    {StatusCompleted, StatusRejected, StatusRetrying, StatusExtractionFailed},
+	StatusRetrying:      {StatusProcessing, StatusExtractionFailed},
+	// EXTRACTION_FAILED → RETRYING es el reintento explícito del operador por el
+	// endpoint administrativo protegido (S4-P2-06). La SAGA automática sigue
+	// yendo a COMPENSATING (ver SPEC §4).
+	StatusExtractionFailed: {StatusCompensating, StatusRetrying},
 	StatusCompensating:     {StatusFailed},
 }
 

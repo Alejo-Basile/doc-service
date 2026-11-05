@@ -168,6 +168,7 @@ stateDiagram-v2
     PROCESSING --> RETRYING: Fallo transitorio
     RETRYING --> PROCESSING: Reintento (Retry pattern)
     RETRYING --> EXTRACTION_FAILED: Reintentos agotados / circuit breaker abierto
+    EXTRACTION_FAILED --> RETRYING: Reintento explícito del operador (admin API)
     EXTRACTION_FAILED --> COMPENSATING: Saga dispara compensación
     COMPENSATING --> FAILED: Estado terminal, recursos limpiados
     COMPLETED --> [*]
@@ -177,6 +178,8 @@ stateDiagram-v2
 ```
 
 Estados terminales: `COMPLETED`, `FAILED`, `REJECTED` y `UPLOAD_EXPIRED`. Nada sale de ellos.
+
+🔧 **`EXTRACTION_FAILED → RETRYING` es una excepción de operador, no de la SAGA.** La arista sólo la escribe el endpoint administrativo protegido (§S4-P2-06) ante un reintento explícito; queda auditada en `status_history` con actor `doc-service`. La SAGA automática sigue usando `EXTRACTION_FAILED → COMPENSATING`.
 
 🔧 **`REJECTED`: estado terminal que evita un ciclo de reintentos inútil.** Si el objeto subido no es un PDF (§9), el resultado no va a cambiar por reintentarlo: cada intento es exactamente la misma extracción fallando sobre el mismo objeto. Se registra `REJECTED` con causa (`NOT_A_PDF`) y **no** pasa por `RETRYING` ni por la DLQ. La distinción con `EXTRACTION_FAILED` es semántica y útil en soporte: `REJECTED` = la entrada nunca fue un documento procesable (el problema es del cliente), `EXTRACTION_FAILED` = la entrada era válida pero no se pudo procesar y se agotaron los reintentos (con compensación y limpieza de recursos).
 
