@@ -30,7 +30,12 @@ type Config struct {
 	BucketRaw string
 	// BucketTXT es el bucket de textos extraídos.
 	BucketTXT string
+	// Region es la región SigV4 usada para firmar; vacía usa defaultRegion.
+	Region string
 }
+
+// defaultRegion es la región SigV4 por defecto para firmar URLs.
+const defaultRegion = "us-east-1"
 
 // ObjectStorage implementa ports.ObjectStorage sobre MinIO.
 // Los buckets se configuran al crear el adaptador (no se pasan por llamada).
@@ -45,9 +50,14 @@ type ObjectStorage struct {
 
 // New crea un ObjectStorage conectado a MinIO.
 func New(cfg Config) (*ObjectStorage, error) {
+	region := strings.TrimSpace(cfg.Region)
+	if region == "" {
+		region = defaultRegion
+	}
 	client, err := miniogo.New(cfg.Endpoint, &miniogo.Options{
 		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
 		Secure: cfg.UseSSL,
+		Region: region,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("minio client: %w", err)
@@ -67,6 +77,7 @@ func New(cfg Config) (*ObjectStorage, error) {
 		presignClient, err = miniogo.New(u.Host, &miniogo.Options{
 			Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
 			Secure: secure,
+			Region: region,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("minio presign client: %w", err)
@@ -113,9 +124,10 @@ func (o *ObjectStorage) PresignPost(
 	}
 
 	// POST policy: la firma SigV4 de la politica NO depende del Host header
-	// (se firma el documento de la politica, no el request). Se usa el cliente
-	// interno para el round-trip de region/signatura y luego se reescribe el
-	// host al publico para el navegador. Si no hay host publico, queda el interno.
+	// (se firma el documento de la politica, no el request). Con Region fijada
+	// no hay round-trip de GetBucketLocation: se firma localmente. Luego se
+	// reescribe el host al publico para el navegador. Si no hay host publico,
+	// queda el interno.
 	u, formData, err := o.client.PresignedPostPolicy(ctx, policy)
 	if err != nil {
 		return nil, fmt.Errorf("presign POST %s/%s: %w", bucket, objectKey, err)

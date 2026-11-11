@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,8 +15,8 @@ import (
 )
 
 // testMinIOConfig lee el endpoint de MinIO del entorno y salta el test si no
-// hay servidor: PresignPost/PresignGet hacen un round-trip real de
-// GetBucketLocation, así que requieren un MinIO vivo (como redis/mongo).
+// hay servidor: las pruebas de integración siguen necesitando un MinIO vivo
+// para el setup de buckets (BucketExists/MakeBucket), no para firmar.
 func testMinIOConfig(t *testing.T) (endpoint, accessKey, secretKey, publicEP string) {
 	t.Helper()
 	endpoint = os.Getenv("MINIO_TEST_ENDPOINT")
@@ -327,5 +329,118 @@ func TestNew_PublicEndpointInvalido(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("New error = nil, want error con public endpoint inválido")
+	}
+}
+
+// credentialRegion parsea un valor de credencial (URL o form field) y devuelve
+// el segmento de región (índice 2 al separar por "/").
+func credentialRegion(t *testing.T, raw string) string {
+	t.Helper()
+	// raw puede ser una URL completa o un valor tipo "access/date/region/s3/aws4_request".
+	v := raw
+	if strings.HasPrefix(raw, "http") {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatalf("parse url: %v", err)
+		}
+		v = u.Query().Get("X-Amz-Credential")
+	}
+	parts := strings.Split(v, "/")
+	if len(parts) < 3 {
+		t.Fatalf("credential con forma inesperada: %q", v)
+	}
+	return parts[2]
+}
+
+func newOfflineStorage(t *testing.T, region string) *ObjectStorage {
+	t.Helper()
+	s, err := New(Config{
+		Endpoint:       "127.0.0.1:1",
+		PublicEndpoint: "http://127.0.0.1:1",
+		AccessKey:      "minioadmin",
+		SecretKey:      "minioadmin123",
+		BucketRaw:      "raw-pdfs",
+		BucketTXT:      "extracted-txt",
+		Region:         region,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return s
+}
+
+func TestPresign_SinRed_RegionPorDefecto(t *testing.T) {
+	s := newOfflineStorage(t, "")
+	ctx := context.Background()
+	u, err := s.PresignGet(ctx, "raw-pdfs/doc.pdf", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("PresignGet: %v", err)
+	}
+	pu, _ := url.Parse(u)
+	if pu.Host != "127.0.0.1:1" {
+		t.Errorf("host = %q", pu.Host)
+	}
+	if got := credentialRegion(t, u); got != "us-east-1" {
+		t.Errorf("region = %q, want us-east-1", got)
+	}
+	u2, err := s.PresignGetTXT(ctx, "abc.txt", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("PresignGetTXT: %v", err)
+	}
+	if !strings.Contains(u2, "/extracted-txt/abc.txt") {
+		t.Errorf("path = %q", u2)
+	}
+	if got := credentialRegion(t, u2); got != "us-east-1" {
+		t.Errorf("region = %q, want us-east-1", got)
+	}
+	res, err := s.PresignPost(ctx, "raw-pdfs/doc.pdf", ports.PresignPostOptions{Expiration: 15 * time.Minute})
+	if err != nil {
+		t.Fatalf("PresignPost: %v", err)
+	}
+	if got := credentialRegion(t, res.Fields["x-amz-credential"]); got != "us-east-1" {
+		t.Errorf("region = %q, want us-east-1", got)
+	}
+}
+
+func TestPresign_RegionPersonalizada(t *testing.T) {
+	s := newOfflineStorage(t, "eu-west-1")
+	ctx := context.Background()
+	u, err := s.PresignGet(ctx, "raw-pdfs/doc.pdf", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("PresignGet: %v", err)
+	}
+	if got := credentialRegion(t, u); got != "eu-west-1" {
+		t.Errorf("region = %q, want eu-west-1", got)
+	}
+	res, err := s.PresignPost(ctx, "raw-pdfs/doc.pdf", ports.PresignPostOptions{Expiration: 15 * time.Minute})
+	if err != nil {
+		t.Fatalf("PresignPost: %v", err)
+	}
+	if got := credentialRegion(t, res.Fields["x-amz-credential"]); got != "eu-west-1" {
+		t.Errorf("region = %q, want eu-west-1", got)
+	}
+}
+
+func TestPresignGet_Concurrente_SinRed(t *testing.T) {
+	s := newOfflineStorage(t, "")
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	errs := make(chan error, 64)
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.PresignGet(ctx, "raw-pdfs/doc.pdf", 5*time.Minute); err != nil {
+				errs <- err
+			}
+			if _, err := s.PresignGetTXT(ctx, "abc.txt", 5*time.Minute); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Errorf("err: %v", e)
 	}
 }
