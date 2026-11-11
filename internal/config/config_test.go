@@ -15,7 +15,7 @@ func setEnv(t *testing.T, vars map[string]string) {
 		"HTTP_PORT", "DEBUG",
 		"MONGO_URI", "MONGO_DATABASE",
 		"MINIO_ENDPOINT", "MINIO_PUBLIC_ENDPOINT", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY",
-		"MINIO_BUCKET_RAW", "MINIO_BUCKET_TXT", "MINIO_WEBHOOK_SECRET",
+		"MINIO_BUCKET_RAW", "MINIO_BUCKET_TXT", "MINIO_WEBHOOK_SECRET", "MINIO_REGION",
 		"REDIS_ADDR", "REDIS_PASSWORD", "REDIS_STREAM_KEY",
 		"REDIS_SENTINEL_ADDRS", "REDIS_MASTER_NAME", "INTERNAL_TOKEN",
 		"MAX_PDF_BYTES", "RECONCILE_INTERVAL_MIN", "DOC_UPLOAD_GRACE_MIN",
@@ -66,6 +66,9 @@ func TestLoad_ConfigCompleta_Sucede(t *testing.T) {
 	}
 	if cfg.MinIOBucketTXT != "extracted-txt" {
 		t.Errorf("MinIOBucketTXT default esperado 'extracted-txt', got %q", cfg.MinIOBucketTXT)
+	}
+	if cfg.MinIORegion != "us-east-1" {
+		t.Errorf("MinIORegion default esperado 'us-east-1', got %q", cfg.MinIORegion)
 	}
 	if cfg.RedisStreamKey != "stream:pdf-processing" {
 		t.Errorf("RedisStreamKey default esperado 'stream:pdf-processing', got %q", cfg.RedisStreamKey)
@@ -295,5 +298,19 @@ func TestLoad_SentinelIgnoraRedisAddr(t *testing.T) {
 
 	if _, err := Load(); err != nil {
 		t.Fatalf("Load() no debía exigir REDIS_ADDR en modo Sentinel: %v", err)
+	}
+}
+
+func TestLoad_MinIORegionPersonalizada(t *testing.T) {
+	vars := completeVars()
+	vars["MINIO_REGION"] = "eu-west-1"
+	setEnv(t, vars)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MinIORegion != "eu-west-1" {
+		t.Errorf("MinIORegion = %q, want eu-west-1", cfg.MinIORegion)
 	}
 }

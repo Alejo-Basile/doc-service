@@ -93,6 +93,7 @@ func main() {
 		UseSSL:         false, // TLS termina en el edge (Traefik); el endpoint interno es plano.
 		BucketRaw:      cfg.MinIOBucketRaw,
 		BucketTXT:      cfg.MinIOBucketTXT,
+		Region:         cfg.MinIORegion,
 	})
 	if err != nil {
 		slog.Error("no se pudo inicializar el adaptador MinIO", "error", err.Error())
@@ -168,7 +169,7 @@ func main() {
 		"base_backoff", relayCfg.BaseBackoff.String(),
 	)
 	watcher := changestream.NewWatcher(
-		watcherClient, tokenStore, relay.NewWithConfig(queue, workSchemaVersion, relayCfg).Handler(),
+		watcherClient, tokenStore, relay.NewWithConfig(queue, repo, workSchemaVersion, relayCfg).Handler(),
 		changestream.DefaultWatcherConfig(),
 	)
 	go func() {
