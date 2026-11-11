@@ -17,8 +17,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
       -o /out/api ./cmd/api
 
 # --- Runtime -----------------------------------------------------------------
-FROM alpine:3.20
-RUN apk add --no-cache ca-certificates wget \
+FROM alpine:3.24
+RUN apk upgrade --no-cache \
+ && apk add --no-cache ca-certificates wget \
  && adduser -D -u 10001 appuser
 COPY --from=build /out/api /usr/local/bin/api
 USER 10001
