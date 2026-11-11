@@ -152,8 +152,9 @@ func (c *Config) Validate() error {
 	if c.MaxPDFBytes <= 0 {
 		return fmt.Errorf("configuración inválida: MAX_PDF_BYTES debe ser positivo, got %d", c.MaxPDFBytes)
 	}
-	// SPEC §4: la gracia debe ser >= 2x el intervalo del reconciliador,
-	// para que el TTL de Mongo nunca decida el expirado por su cuenta.
+	// SPEC §4: DocUploadGrace es la gracia posterior a la ventana de subida;
+	// expires_at = created_at + ventana + gracia. La gracia debe ser >= 2x
+	// el intervalo del reconciliador para que el TTL no decida el expirado solo.
 	minGrace := 2 * c.ReconcileInterval
 	if c.DocUploadGrace < minGrace {
 		return fmt.Errorf(

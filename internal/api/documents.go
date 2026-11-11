@@ -16,6 +16,9 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// uploadWindow es la vigencia de la URL prefirmada POST (S3-P2-04).
+const uploadWindow = 15 * time.Minute
+
 // DocumentHandler implementa los endpoints de la API v2.
 type DocumentHandler struct {
 	repo        ports.DocumentRepository
@@ -122,7 +125,7 @@ func (h *DocumentHandler) CreateDocument(c *gin.Context) {
 	// Crear documento. La entrada inicial de la timeline (PENDING_UPLOAD) la
 	// registra siempre NewDocument con actor "client" (S5-P2-04), tanto con
 	// idempotency key como sin ella.
-	expiresAt := time.Now().UTC().Add(h.uploadGrace)
+	expiresAt := time.Now().UTC().Add(uploadWindow).Add(h.uploadGrace)
 	doc := domain.NewDocument(corrID, expiresAt)
 	if docID != "" {
 		doc.ID = docID
@@ -151,7 +154,7 @@ func (h *DocumentHandler) CreateDocument(c *gin.Context) {
 		Bucket:       h.bucketRaw,
 		MaxSizeBytes: h.maxPDFBytes,
 		ContentType:  "application/pdf",
-		Expiration:   15 * time.Minute,
+		Expiration:   uploadWindow,
 	}
 
 	result, err := h.storage.PresignPost(c.Request.Context(), doc.ObjectKey, presignOpts)
@@ -337,13 +340,25 @@ func (h *DocumentHandler) respondExisting(c *gin.Context, doc *domain.Document) 
 		"document_id", doc.ID,
 		"status", doc.Status,
 	)
+	if doc.Status == domain.StatusPendingUpload {
+		newExpiresAt := time.Now().UTC().Add(uploadWindow).Add(h.uploadGrace)
+		updated, err := h.repo.UpdateStatus(c.Request.Context(), doc.ID, domain.StatusPendingUpload, domain.StatusPendingUpload, map[string]any{"expires_at": newExpiresAt})
+		if err != nil {
+			slog.Error("extend expires_at on re-presign", "error", err, "document_id", doc.ID)
+			respondProblem(c, http.StatusInternalServerError, "internal", "Error extendiendo la ventana de subida", "")
+			return
+		}
+		if updated {
+			doc.ExpiresAt = newExpiresAt
+		}
+	}
 
 	// Regenerar URL prefirmada para el documento existente.
 	presignOpts := ports.PresignPostOptions{
 		Bucket:       h.bucketRaw,
 		MaxSizeBytes: h.maxPDFBytes,
 		ContentType:  "application/pdf",
-		Expiration:   15 * time.Minute,
+		Expiration:   uploadWindow,
 	}
 
 	result, err := h.storage.PresignPost(c.Request.Context(), doc.ObjectKey, presignOpts)

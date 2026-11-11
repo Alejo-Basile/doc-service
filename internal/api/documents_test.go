@@ -48,6 +48,15 @@ func (m *mockRepo) UpdateStatus(ctx context.Context, id string, from, to domain.
 		return false, nil
 	}
 	doc.Status = to
+	for k, v := range fields {
+		switch k {
+		case "expires_at":
+			if t, ok := v.(time.Time); ok {
+				doc.ExpiresAt = t
+			}
+		}
+	}
+	doc.UpdatedAt = time.Now().UTC()
 	return true, nil
 }
 
@@ -211,6 +220,99 @@ func TestCreateDocument_Nuevo(t *testing.T) {
 	}
 	if doc.History[0].Actor != domain.ActorClient {
 		t.Errorf("History[0].Actor = %s, want client", doc.History[0].Actor)
+	}
+}
+
+func TestCreateDocument_ExpiresAtVentanaMasGracia(t *testing.T) {
+	engine, repo := setupTestServer(t)
+	before := time.Now().UTC()
+	request := httptest.NewRequest(http.MethodPost, "/api/v2/documents", bytes.NewBufferString(`{}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	after := time.Now().UTC()
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status esperado 201, got %d (body: %s)", response.Code, response.Body.String())
+	}
+	var resp CreateDocumentResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("JSON inválido: %v", err)
+	}
+	doc, err := repo.GetByID(context.Background(), resp.DocumentID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	grace := 30 * time.Minute
+	if doc.ExpiresAt.Before(before.Add(15*time.Minute+grace-time.Second)) || doc.ExpiresAt.After(after.Add(15*time.Minute+grace+time.Second)) {
+		t.Errorf("ExpiresAt = %s, want between request bounds plus upload window and grace", doc.ExpiresAt)
+	}
+	if resp.ExpiresIn != int((15 * time.Minute).Seconds()) {
+		t.Errorf("ExpiresIn = %d, want %d", resp.ExpiresIn, int((15 * time.Minute).Seconds()))
+	}
+}
+
+func TestCreateDocument_IdempotenteExtiendeExpiresAt(t *testing.T) {
+	engine, repo := setupTestServer(t)
+	body := `{"idempotency_key":"extend-expiry"}`
+	post := func() *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/api/v2/documents", bytes.NewBufferString(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		return response
+	}
+	first := post()
+	if first.Code != http.StatusCreated {
+		t.Fatalf("primer request: status esperado 201, got %d", first.Code)
+	}
+	doc := repo.docs["extend-expiry"]
+	doc.ExpiresAt = time.Now().UTC().Add(time.Minute)
+
+	before := time.Now().UTC()
+	second := post()
+	after := time.Now().UTC()
+	if second.Code != http.StatusOK {
+		t.Fatalf("segundo request: status esperado 200, got %d (body: %s)", second.Code, second.Body.String())
+	}
+	expectedLower := before.Add(15*time.Minute + 30*time.Minute - time.Second)
+	expectedUpper := after.Add(15*time.Minute + 30*time.Minute + time.Second)
+	if doc.ExpiresAt.Before(expectedLower) || doc.ExpiresAt.After(expectedUpper) {
+		t.Errorf("stored ExpiresAt = %s, want approximately now + upload window + grace", doc.ExpiresAt)
+	}
+	var resp CreateDocumentResponse
+	if err := json.Unmarshal(second.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("JSON inválido: %v", err)
+	}
+	if resp.ExpiresAt != doc.ExpiresAt.Format(time.RFC3339) {
+		t.Errorf("response expires_at = %s, stored value = %s", resp.ExpiresAt, doc.ExpiresAt.Format(time.RFC3339))
+	}
+}
+
+func TestCreateDocument_IdempotenteNoExtiendeTerminal(t *testing.T) {
+	engine, repo := setupTestServer(t)
+	body := `{"idempotency_key":"terminal-expiry"}`
+	request := httptest.NewRequest(http.MethodPost, "/api/v2/documents", bytes.NewBufferString(body))
+	request.Header.Set("Content-Type", "application/json")
+	first := httptest.NewRecorder()
+	engine.ServeHTTP(first, request)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("primer request: status esperado 201, got %d", first.Code)
+	}
+	doc := repo.docs["terminal-expiry"]
+	doc.Status = domain.StatusCompleted
+	fixedExpiry := time.Date(2020, time.January, 2, 3, 4, 5, 0, time.UTC)
+	doc.ExpiresAt = fixedExpiry
+
+	request = httptest.NewRequest(http.MethodPost, "/api/v2/documents", bytes.NewBufferString(body))
+	request.Header.Set("Content-Type", "application/json")
+	second := httptest.NewRecorder()
+	engine.ServeHTTP(second, request)
+	if second.Code != http.StatusOK {
+		t.Fatalf("segundo request: status esperado 200, got %d", second.Code)
+	}
+	if !doc.ExpiresAt.Equal(fixedExpiry) {
+		t.Errorf("terminal ExpiresAt changed to %s, want %s", doc.ExpiresAt, fixedExpiry)
 	}
 }
 
