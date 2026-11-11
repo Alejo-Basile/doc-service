@@ -31,7 +31,7 @@ type Config struct {
 	MinIOBucketTXT      string
 	MinIOWebhookSecret  string
 	// MinIORegion es la región SigV4 usada para firmar URLs prefirmadas.
-	MinIORegion         string
+	MinIORegion string
 
 	// Redis
 	RedisAddr      string
