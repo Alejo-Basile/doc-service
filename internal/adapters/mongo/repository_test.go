@@ -428,6 +428,114 @@ func TestDocumentRepository_UpdateStatusWithHistory(t *testing.T) {
 	}
 }
 
+// TestDocumentRepository_WorkerCompleted_Condicional verifica la escritura
+// condicional PROCESSING → COMPLETED que hace el extraction-worker (ADR-0006,
+// S5-P2-01): el update solo aplica si el documento está en PROCESSING y deja
+// su entrada en el historial. Con cualquier otro estado de origen no matchea
+// y no modifica nada.
+func TestDocumentRepository_WorkerCompleted_Condicional(t *testing.T) {
+	_, repo, ctx, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	entry := domain.StatusEntry{
+		Status:        domain.StatusCompleted,
+		Actor:         domain.ActorWorker,
+		CorrelationID: "corr-worker-1",
+	}
+
+	t.Run("aplica cuando el documento está en PROCESSING", func(t *testing.T) {
+		doc := domain.NewDocument("corr-worker-1", time.Now().UTC().Add(24*time.Hour))
+		doc.Status = domain.StatusProcessing
+		if err := repo.Insert(ctx, doc); err != nil {
+			t.Fatalf("Insert falló: %v", err)
+		}
+
+		ok, err := repo.UpdateStatusWithHistory(ctx, doc.ID,
+			domain.StatusProcessing, domain.StatusCompleted,
+			entry,
+			map[string]any{"txt_ref": fmt.Sprintf("extracted-txt/%s.txt", doc.ID)},
+		)
+		if err != nil {
+			t.Fatalf("UpdateStatusWithHistory falló: %v", err)
+		}
+		if !ok {
+			t.Fatal("el update PROCESSING→COMPLETED debía matchear")
+		}
+
+		got, err := repo.GetByID(ctx, doc.ID)
+		if err != nil {
+			t.Fatalf("GetByID falló: %v", err)
+		}
+		if got.Status != domain.StatusCompleted {
+			t.Errorf("Status esperado %q, got %q", domain.StatusCompleted, got.Status)
+		}
+		if got.TxtRef == "" {
+			t.Error("TxtRef no se actualizó")
+		}
+		if len(got.History) != 2 {
+			t.Fatalf("history longitud esperada 2, got %d", len(got.History))
+		}
+		ultima := got.History[len(got.History)-1]
+		if ultima.Status != domain.StatusCompleted || ultima.Actor != domain.ActorWorker {
+			t.Errorf("última entrada de history esperada %s/%s, got %s/%s",
+				domain.StatusCompleted, domain.ActorWorker, ultima.Status, ultima.Actor)
+		}
+	})
+
+	// Cualquier estado de origen distinto de PROCESSING no debe matchear.
+	casos := []struct {
+		nombre string
+		id     string
+		estado domain.Status
+	}{
+		{"QUEUED", "corr-worker-queued", domain.StatusQueued},
+		{"PENDING_UPLOAD", "corr-worker-pending", domain.StatusPendingUpload},
+		{"ya COMPLETED", "corr-worker-done", domain.StatusCompleted},
+	}
+
+	for _, c := range casos {
+		t.Run("no aplica cuando el documento está en "+c.nombre, func(t *testing.T) {
+			doc := domain.NewDocument(c.id, time.Now().UTC().Add(24*time.Hour))
+			doc.Status = c.estado
+			if err := repo.Insert(ctx, doc); err != nil {
+				t.Fatalf("Insert falló: %v", err)
+			}
+
+			antes, err := repo.GetByID(ctx, doc.ID)
+			if err != nil {
+				t.Fatalf("GetByID (antes) falló: %v", err)
+			}
+
+			ok, err := repo.UpdateStatusWithHistory(ctx, doc.ID,
+				domain.StatusProcessing, domain.StatusCompleted,
+				entry,
+				map[string]any{"txt_ref": fmt.Sprintf("extracted-txt/%s.txt", doc.ID)},
+			)
+			if err != nil {
+				t.Fatalf("UpdateStatusWithHistory no debía fallar con error: %v", err)
+			}
+			if ok {
+				t.Fatalf("el update PROCESSING→COMPLETED no debía matchear con el documento en %s", c.estado)
+			}
+
+			despues, err := repo.GetByID(ctx, doc.ID)
+			if err != nil {
+				t.Fatalf("GetByID (después) falló: %v", err)
+			}
+			if despues.Status != c.estado {
+				t.Errorf("Status esperado %q (sin cambios), got %q", c.estado, despues.Status)
+			}
+			if despues.TxtRef != "" {
+				t.Errorf("TxtRef debía quedar vacío, got %q", despues.TxtRef)
+			}
+			if len(despues.History) != len(antes.History) {
+				t.Errorf("history no debía cambiar: antes %d, después %d",
+					len(antes.History), len(despues.History))
+			}
+		})
+	}
+}
+
 // --- Cursor encode/decode (S3-P2-10) ---
 
 func TestEncodeDecodeCursor(t *testing.T) {
