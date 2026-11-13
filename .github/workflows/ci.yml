@@ -108,7 +108,7 @@ jobs:
           load: true
           tags: doc-service:ci
       - name: scan image for critical vulnerabilities
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: doc-service:ci
           format: table
