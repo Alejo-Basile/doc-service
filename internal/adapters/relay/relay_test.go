@@ -38,7 +38,7 @@ func TestRelay_EncolaEventoUPLOADED(t *testing.T) {
 	dbName := fmt.Sprintf("docservice_relay_%d", time.Now().UnixNano())
 	mclient, err := mongoadapter.NewClient(ctx, mongoURI, dbName, cfg)
 	if err != nil {
-		t.Fatalf("Mongo no disponible: %v", err)
+		t.Skipf("Mongo no disponible (%s): %v", mongoURI, err)
 	}
 	defer func() {
 		_ = mclient.DB().Drop(context.Background())
@@ -54,7 +54,7 @@ func TestRelay_EncolaEventoUPLOADED(t *testing.T) {
 	defer queue.Close()
 
 	if err := queue.Ping(ctx); err != nil {
-		t.Fatalf("Redis no disponible: %v", err)
+		t.Skipf("Redis no disponible (%s): %v", redisAddr, err)
 	}
 
 	r := New(queue, 1)
@@ -127,7 +127,7 @@ func TestRelay_DosWatchersUnSoloMensaje(t *testing.T) {
 	dbName := fmt.Sprintf("docservice_relay2_%d", time.Now().UnixNano())
 	mclient, err := mongoadapter.NewClient(ctx, mongoURI, dbName, cfg)
 	if err != nil {
-		t.Fatalf("Mongo no disponible: %v", err)
+		t.Skipf("Mongo no disponible (%s): %v", mongoURI, err)
 	}
 	defer func() {
 		_ = mclient.DB().Drop(context.Background())
