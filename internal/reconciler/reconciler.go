@@ -205,12 +205,19 @@ func (r *Reconciler) RunOnce(ctx context.Context) (*Result, error) {
 	result.ExpiredPending = expiredPending.expired
 	result.RecoveredUploaded = expiredPending.recovered
 
-	// 2. Documentos UPLOADED estancados → reencolar (S4-P2-01/07).
+	// 2. Documentos UPLOADED estancados → transición + reencolar (S4-P2-01/07).
 	reenqueued, err := r.sweepStuckUploaded(ctx, now)
 	if err != nil {
 		return nil, fmt.Errorf("sweep stuck uploaded: %w", err)
 	}
 	result.Reenqueued = reenqueued
+
+	// 2b. Documentos QUEUED estancados → reencolar sin cambiar estado (cierra ventana de crash).
+	reenqueued2, err := r.sweepStuckQueued(ctx, now)
+	if err != nil {
+		return nil, fmt.Errorf("sweep stuck queued: %w", err)
+	}
+	result.Reenqueued += reenqueued2
 
 	// 3. Documentos en estado intermedio con updated_at antiguo (solo detección).
 	stuck, err := r.sweepStuckIntermediate(ctx, now)
@@ -369,21 +376,7 @@ func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time) (int
 			continue
 		}
 
-		// Reencolar a Redis Streams.
-		msg := ports.WorkMessage{
-			DocumentID:    doc.ID,
-			ObjectKey:     doc.ObjectKey,
-			CorrelationID: doc.CorrelationID,
-			EnqueuedAt:    now.Format(time.RFC3339),
-			SchemaVersion: doc.SchemaVersion,
-		}
-		if err := r.queue.Enqueue(ctx, msg); err != nil {
-			slog.Error("reconciler: error reencolando documento",
-				"document_id", doc.ID, "error", err)
-			continue
-		}
-
-		// Transicionar UPLOADED → QUEUED (para que no se reencole en el próximo ciclo).
+		// Invariante de orden: transicionar UPLOADED → QUEUED PRIMERO, luego XADD.
 		ok, err := r.repo.UpdateStatusWithHistory(ctx, doc.ID,
 			domain.StatusUploaded, domain.StatusQueued,
 			domain.StatusEntry{
@@ -398,13 +391,73 @@ func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time) (int
 				"document_id", doc.ID, "error", err)
 			continue
 		}
-		if ok {
-			reenqueued++
-			slog.Info("reconciler: documento reencolado (UPLOADED estancado)",
-				"document_id", doc.ID, "object_key", doc.ObjectKey)
+		if !ok {
+			// Ya no estaba UPLOADED; omitir.
+			continue
 		}
+
+		// Reencolar a Redis Streams.
+		msg := ports.WorkMessage{
+			DocumentID:    doc.ID,
+			ObjectKey:     doc.ObjectKey,
+			CorrelationID: doc.CorrelationID,
+			EnqueuedAt:    now.Format(time.RFC3339),
+			SchemaVersion: doc.SchemaVersion,
+		}
+		if err := r.queue.Enqueue(ctx, msg); err != nil {
+			slog.Error("reconciler: error reencolando documento",
+				"document_id", doc.ID, "error", err)
+			continue
+		}
+		reenqueued++
+		slog.Info("reconciler: documento reencolado (UPLOADED estancado)",
+			"document_id", doc.ID, "object_key", doc.ObjectKey)
 	}
 
+	return reenqueued, nil
+}
+
+// sweepStuckQueued reencola documentos QUEUED cuyo mensaje pudo haberse perdido
+// (crash entre transición y XADD, o ACK espurio). No cambia el estado.
+func (r *Reconciler) sweepStuckQueued(ctx context.Context, now time.Time) (int, error) {
+	if r.queue == nil {
+		return 0, nil
+	}
+	reenqueued := 0
+	cutoff := now.Add(-r.stuckAfter)
+
+	docs, _, err := r.repo.List(ctx, ports.ListFilter{
+		Status: domain.StatusQueued,
+		Limit:  100,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("list queued: %w", err)
+	}
+
+	for _, doc := range docs {
+		if doc.ObjectKey == "" {
+			continue
+		}
+		if now.Sub(doc.CreatedAt) < r.minSafetyAge {
+			continue
+		}
+		if !doc.UpdatedAt.Before(cutoff) {
+			continue
+		}
+		msg := ports.WorkMessage{
+			DocumentID:    doc.ID,
+			ObjectKey:     doc.ObjectKey,
+			CorrelationID: doc.CorrelationID,
+			EnqueuedAt:    now.Format(time.RFC3339),
+			SchemaVersion: doc.SchemaVersion,
+		}
+		if err := r.queue.Enqueue(ctx, msg); err != nil {
+			slog.Error("reconciler: error reencolando QUEUED",
+				"document_id", doc.ID, "error", err)
+			continue
+		}
+		reenqueued++
+	}
 	return reenqueued, nil
 }
 

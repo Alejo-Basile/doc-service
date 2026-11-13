@@ -24,6 +24,9 @@ func (c *mockClock) Now() time.Time { return c.t }
 type mockRepo struct {
 	docs        map[string]*domain.Document
 	updateCalls []updateCall
+	// order, si no es nil, registra "transition" para probar el orden
+	// transición → encolado en los sweeps del reconciliador.
+	order *[]string
 }
 
 type updateCall struct {
@@ -56,6 +59,7 @@ func (m *mockRepo) UpdateStatus(ctx context.Context, id string, from, to domain.
 		return false, nil
 	}
 	doc.Status = to
+	doc.UpdatedAt = time.Now().UTC()
 	return true, nil
 }
 
@@ -85,7 +89,11 @@ func (m *mockRepo) UpdateStatusWithHistory(ctx context.Context, id string, from,
 	if !ok || doc.Status != from {
 		return false, nil
 	}
+	if m.order != nil {
+		*m.order = append(*m.order, "transition")
+	}
 	doc.Status = to
+	doc.UpdatedAt = time.Now().UTC()
 	entry.At = time.Now().UTC()
 	doc.History = append(doc.History, entry)
 	return true, nil
@@ -109,9 +117,14 @@ func newMockStorage() *mockStorage {
 // mockQueue implementa ports.WorkQueue para tests.
 type mockQueue struct {
 	enqueued []ports.WorkMessage
+	// order, si no es nil, registra "enqueue" para probar el orden de efectos.
+	order *[]string
 }
 
 func (m *mockQueue) Enqueue(_ context.Context, msg ports.WorkMessage) error {
+	if m.order != nil {
+		*m.order = append(*m.order, "enqueue")
+	}
 	m.enqueued = append(m.enqueued, msg)
 	return nil
 }
@@ -1086,5 +1099,105 @@ func TestCrossCheck_IgnoraEntradasDePrefijo(t *testing.T) {
 	}
 	if len(storage.deleted) != 0 {
 		t.Errorf("storage.deleted = %v, want vacío (no se purga nada)", storage.deleted)
+	}
+}
+
+func TestSweepStuckUploaded_TransicionaAntesDeEncolar(t *testing.T) {
+	repo := newMockRepo()
+	now := time.Now().UTC()
+	doc := &domain.Document{ID: "d1", Status: domain.StatusUploaded, ObjectKey: "k", CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now.Add(-2 * time.Hour)}
+	repo.docs["d1"] = doc
+	var order []string
+	repo.order = &order
+	q := &mockQueue{order: &order}
+	st := newMockStorage()
+	st.objects["k"] = true
+	r := New(repo, st, q, nil, &mockClock{t: now}, time.Minute, 30*time.Minute, time.Minute)
+	res, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Reenqueued != 1 {
+		t.Fatalf("Reenqueued = %d", res.Reenqueued)
+	}
+	if repo.docs["d1"].Status != domain.StatusQueued {
+		t.Fatalf("status = %v", repo.docs["d1"].Status)
+	}
+	if len(order) != 2 || order[0] != "transition" || order[1] != "enqueue" {
+		t.Fatalf("orden = %v, want [transition enqueue]", order)
+	}
+}
+
+func TestSweepStuckQueued_ReencolaSinCambiarEstado(t *testing.T) {
+	repo := newMockRepo()
+	now := time.Now().UTC()
+	doc := &domain.Document{ID: "d1", Status: domain.StatusQueued, ObjectKey: "k", CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now.Add(-2 * time.Hour)}
+	repo.docs["d1"] = doc
+	q := &mockQueue{}
+	st := newMockStorage()
+	r := New(repo, st, q, nil, &mockClock{t: now}, time.Minute, 30*time.Minute, time.Minute)
+	res, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Reenqueued != 1 {
+		t.Fatalf("Reenqueued = %d", res.Reenqueued)
+	}
+	if len(q.enqueued) != 1 {
+		t.Fatalf("enqueued = %d", len(q.enqueued))
+	}
+	if repo.docs["d1"].Status != domain.StatusQueued {
+		t.Fatalf("status changed")
+	}
+}
+
+func TestSweepStuckQueued_RespetaSafetyAge(t *testing.T) {
+	repo := newMockRepo()
+	now := time.Now().UTC()
+	doc := &domain.Document{ID: "d1", Status: domain.StatusQueued, ObjectKey: "k", CreatedAt: now.Add(-1 * time.Minute), UpdatedAt: now.Add(-2 * time.Hour)}
+	repo.docs["d1"] = doc
+	q := &mockQueue{}
+	st := newMockStorage()
+	r := New(repo, st, q, nil, &mockClock{t: now}, time.Minute, 30*time.Minute, 15*time.Minute)
+	_, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(q.enqueued) != 0 {
+		t.Fatalf("enqueued = %d", len(q.enqueued))
+	}
+}
+
+func TestSweepStuckQueued_NoReencolaReciente(t *testing.T) {
+	repo := newMockRepo()
+	now := time.Now().UTC()
+	doc := &domain.Document{ID: "d1", Status: domain.StatusQueued, ObjectKey: "k", CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now.Add(-5 * time.Minute)}
+	repo.docs["d1"] = doc
+	q := &mockQueue{}
+	st := newMockStorage()
+	r := New(repo, st, q, nil, &mockClock{t: now}, time.Minute, 30*time.Minute, time.Minute)
+	_, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(q.enqueued) != 0 {
+		t.Fatalf("enqueued = %d", len(q.enqueued))
+	}
+}
+
+func TestSweepStuckQueued_IgnoraSinObjectKey(t *testing.T) {
+	repo := newMockRepo()
+	now := time.Now().UTC()
+	doc := &domain.Document{ID: "d1", Status: domain.StatusQueued, ObjectKey: "", CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now.Add(-2 * time.Hour)}
+	repo.docs["d1"] = doc
+	q := &mockQueue{}
+	st := newMockStorage()
+	r := New(repo, st, q, nil, &mockClock{t: now}, time.Minute, 30*time.Minute, time.Minute)
+	_, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(q.enqueued) != 0 {
+		t.Fatalf("enqueued = %d", len(q.enqueued))
 	}
 }

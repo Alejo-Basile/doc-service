@@ -169,7 +169,7 @@ func main() {
 		"base_backoff", relayCfg.BaseBackoff.String(),
 	)
 	watcher := changestream.NewWatcher(
-		watcherClient, tokenStore, relay.NewWithConfig(queue, workSchemaVersion, relayCfg).Handler(),
+		watcherClient, tokenStore, relay.NewWithConfig(queue, repo, workSchemaVersion, relayCfg).Handler(),
 		changestream.DefaultWatcherConfig(),
 	)
 	go func() {
