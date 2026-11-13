@@ -93,3 +93,24 @@ jobs:
           MINIO_TEST_ACCESS_KEY: minioadmin
           MINIO_TEST_SECRET_KEY: minioadmin123
         run: go test -race -count=1 ./internal/adapters/mongo/... ./internal/adapters/changestream/... ./internal/adapters/relay/... ./internal/adapters/redis/... ./internal/adapters/minio/... ./internal/metrics/...
+
+  image-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build image for scanning
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: doc-service:ci
+      - name: scan image for critical vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: doc-service:ci
+          format: table
+          severity: CRITICAL
+          exit-code: '1'

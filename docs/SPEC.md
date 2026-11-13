@@ -161,7 +161,7 @@ stateDiagram-v2
     PENDING_UPLOAD --> UPLOADED: MinIO notifica ObjectCreated
     PENDING_UPLOAD --> UPLOADED: Reconciliador confirma el objeto (HEAD) antes de expirar
     PENDING_UPLOAD --> UPLOAD_EXPIRED: Vencido y objeto ausente (confirmado por HEAD)
-    UPLOADED --> QUEUED: XADD a pdf-processing
+    UPLOADED --> QUEUED: transición a QUEUED y luego XADD a pdf-processing
     QUEUED --> PROCESSING: Worker reclama (XREADGROUP)
     PROCESSING --> COMPLETED: Texto extraído y persistido (transición condicional)
     PROCESSING --> REJECTED: El objeto no es un PDF (cabecera %PDF- ausente)

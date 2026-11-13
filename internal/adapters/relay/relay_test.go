@@ -57,7 +57,7 @@ func TestRelay_EncolaEventoUPLOADED(t *testing.T) {
 		t.Skipf("Redis no disponible (%s): %v", redisAddr, err)
 	}
 
-	r := New(queue, 1)
+	r := New(queue, repo, 1)
 	w := changestream.NewWatcher(mclient, tokenStore, r.Handler(), changestream.DefaultWatcherConfig())
 
 	watcherDone := make(chan struct{})
@@ -142,8 +142,8 @@ func TestRelay_DosWatchersUnSoloMensaje(t *testing.T) {
 	queue := redidadapter.NewWorkQueue(redisAddr, redisPassword, queueCfg)
 	defer queue.Close()
 
-	r1 := New(queue, 1)
-	r2 := New(queue, 1)
+	r1 := New(queue, repo, 1)
+	r2 := New(queue, repo, 1)
 
 	w1 := changestream.NewWatcher(mclient, tokenStore, r1.Handler(), changestream.DefaultWatcherConfig())
 	w2 := changestream.NewWatcher(mclient, tokenStore, r2.Handler(), changestream.DefaultWatcherConfig())
@@ -216,7 +216,7 @@ func (q *flakyQueue) Ping(_ context.Context) error { return nil }
 func TestRelay_ReintentaHastaEncolar(t *testing.T) {
 	// La cola falla 2 veces y al 3.er intento encola.
 	q := &flakyQueue{failN: 2}
-	r := NewWithConfig(q, 1, Config{MaxRetries: 5, BaseBackoff: time.Millisecond})
+	r := NewWithConfig(q, &fakeRelayRepo{}, 1, Config{MaxRetries: 5, BaseBackoff: time.Millisecond})
 
 	err := r.Handler()(context.Background(), changestream.Event{
 		DocumentID: "doc-1",
@@ -237,7 +237,7 @@ func TestRelay_ReintentaHastaEncolar(t *testing.T) {
 func TestRelay_AgotaReintentosYDevuelveError(t *testing.T) {
 	// La cola siempre falla.
 	q := &flakyQueue{failN: 100}
-	r := NewWithConfig(q, 1, Config{MaxRetries: 3, BaseBackoff: time.Millisecond})
+	r := NewWithConfig(q, &fakeRelayRepo{}, 1, Config{MaxRetries: 3, BaseBackoff: time.Millisecond})
 
 	err := r.Handler()(context.Background(), changestream.Event{
 		DocumentID: "doc-2",
@@ -254,7 +254,7 @@ func TestRelay_AgotaReintentosYDevuelveError(t *testing.T) {
 
 func TestRelay_CancelacionDeContexto_Aborta(t *testing.T) {
 	q := &flakyQueue{failN: 100}
-	r := NewWithConfig(q, 1, Config{MaxRetries: 100, BaseBackoff: 50 * time.Millisecond})
+	r := NewWithConfig(q, &fakeRelayRepo{}, 1, Config{MaxRetries: 100, BaseBackoff: 50 * time.Millisecond})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // ya cancelado
@@ -267,7 +267,7 @@ func TestRelay_CancelacionDeContexto_Aborta(t *testing.T) {
 
 func TestRelay_EventoNoUploaded_NoEncola(t *testing.T) {
 	q := &flakyQueue{}
-	r := NewWithConfig(q, 1, Config{MaxRetries: 3, BaseBackoff: time.Millisecond})
+	r := NewWithConfig(q, &fakeRelayRepo{}, 1, Config{MaxRetries: 3, BaseBackoff: time.Millisecond})
 
 	err := r.Handler()(context.Background(), changestream.Event{DocumentID: "doc-4", Status: "QUEUED"})
 	if err != nil {
@@ -275,5 +275,170 @@ func TestRelay_EventoNoUploaded_NoEncola(t *testing.T) {
 	}
 	if q.calls != 0 {
 		t.Errorf("llamadas = %d, want 0 (no es UPLOADED)", q.calls)
+	}
+}
+
+type fakeRelayRepo struct{}
+
+func (f *fakeRelayRepo) Insert(ctx context.Context, doc *domain.Document) error { return nil }
+func (f *fakeRelayRepo) GetByID(ctx context.Context, id string) (*domain.Document, error) {
+	return &domain.Document{ID: id, Status: domain.StatusQueued}, nil
+}
+func (f *fakeRelayRepo) UpdateStatus(ctx context.Context, id string, from, to domain.Status, fields map[string]any) (bool, error) {
+	return true, nil
+}
+func (f *fakeRelayRepo) UpdateStatusWithHistory(ctx context.Context, id string, from, to domain.Status, entry domain.StatusEntry, extraSet map[string]any) (bool, error) {
+	return true, nil
+}
+func (f *fakeRelayRepo) List(ctx context.Context, filter ports.ListFilter) ([]*domain.Document, int64, error) {
+	return nil, 0, nil
+}
+func (f *fakeRelayRepo) ListByCursor(ctx context.Context, filter ports.CursorFilter) ([]*domain.Document, string, error) {
+	return nil, "", nil
+}
+
+type relayOrder struct{ steps *[]string }
+
+type orderRepo struct {
+	relayOrder
+	doc   *domain.Document
+	fail  error
+	apply bool
+}
+
+func (o *orderRepo) Insert(ctx context.Context, doc *domain.Document) error { return nil }
+func (o *orderRepo) GetByID(ctx context.Context, id string) (*domain.Document, error) {
+	if o.doc == nil {
+		return nil, ports.ErrNotFound
+	}
+	return o.doc, nil
+}
+func (o *orderRepo) UpdateStatus(ctx context.Context, id string, from, to domain.Status, fields map[string]any) (bool, error) {
+	return o.UpdateStatusWithHistory(ctx, id, from, to, domain.StatusEntry{}, fields)
+}
+func (o *orderRepo) UpdateStatusWithHistory(ctx context.Context, id string, from, to domain.Status, entry domain.StatusEntry, extraSet map[string]any) (bool, error) {
+	*o.steps = append(*o.steps, "transition")
+	if o.fail != nil {
+		return false, o.fail
+	}
+	if o.apply {
+		if o.doc != nil {
+			o.doc.Status = to
+		}
+	}
+	return o.apply, nil
+}
+func (o *orderRepo) List(ctx context.Context, filter ports.ListFilter) ([]*domain.Document, int64, error) {
+	return nil, 0, nil
+}
+func (o *orderRepo) ListByCursor(ctx context.Context, filter ports.CursorFilter) ([]*domain.Document, string, error) {
+	return nil, "", nil
+}
+
+type orderQueue struct{ relayOrder }
+
+func (o *orderQueue) Enqueue(ctx context.Context, msg ports.WorkMessage) error {
+	*o.steps = append(*o.steps, "enqueue")
+	return nil
+}
+func (o *orderQueue) Ping(ctx context.Context) error { return nil }
+
+func TestRelay_TransicionaQueuedAntesDeEncolar(t *testing.T) {
+	order := &relayOrder{steps: new([]string)}
+	repo := &orderRepo{relayOrder: *order, doc: &domain.Document{ID: "d1", Status: domain.StatusUploaded}, apply: true}
+	q := &orderQueue{relayOrder: *order}
+	// share the same steps slice
+	repo.relayOrder.steps = order.steps
+	q.relayOrder.steps = order.steps
+	r := New(q, repo, 1)
+	err := r.Handler()(context.Background(), changestream.Event{DocumentID: "d1", Status: "UPLOADED", ObjectKey: "k", CorrelationID: "c"})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(*order.steps) != 2 || (*order.steps)[0] != "transition" || (*order.steps)[1] != "enqueue" {
+		t.Fatalf("order = %v", order.steps)
+	}
+	if repo.doc.Status != domain.StatusQueued {
+		t.Fatalf("status = %v", repo.doc.Status)
+	}
+}
+
+func TestRelay_NoEncolaSiDocumentoYaTerminal(t *testing.T) {
+	order := &relayOrder{steps: new([]string)}
+	repo := &orderRepo{relayOrder: *order, doc: &domain.Document{ID: "d1", Status: domain.StatusCompleted}, apply: false}
+	q := &orderQueue{relayOrder: *order}
+	repo.relayOrder.steps = order.steps
+	q.relayOrder.steps = order.steps
+	r := New(q, repo, 1)
+	err := r.Handler()(context.Background(), changestream.Event{DocumentID: "d1", Status: "UPLOADED", ObjectKey: "k"})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(*order.steps) != 1 || (*order.steps)[0] != "transition" {
+		t.Fatalf("order = %v", order.steps)
+	}
+}
+
+func TestRelay_ReencolaSiYaEstaQueued(t *testing.T) {
+	order := &relayOrder{steps: new([]string)}
+	repo := &orderRepo{relayOrder: *order, doc: &domain.Document{ID: "d1", Status: domain.StatusQueued}, apply: false}
+	q := &orderQueue{relayOrder: *order}
+	repo.relayOrder.steps = order.steps
+	q.relayOrder.steps = order.steps
+	r := New(q, repo, 1)
+	err := r.Handler()(context.Background(), changestream.Event{DocumentID: "d1", Status: "UPLOADED", ObjectKey: "k"})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(*order.steps) != 2 || (*order.steps)[0] != "transition" || (*order.steps)[1] != "enqueue" {
+		t.Fatalf("order = %v", order.steps)
+	}
+}
+
+func TestRelay_NoEncolaSiSigueUploaded(t *testing.T) {
+	order := &relayOrder{steps: new([]string)}
+	repo := &orderRepo{relayOrder: *order, doc: &domain.Document{ID: "d1", Status: domain.StatusUploaded}, apply: false}
+	q := &orderQueue{relayOrder: *order}
+	repo.relayOrder.steps = order.steps
+	q.relayOrder.steps = order.steps
+	r := New(q, repo, 1)
+	err := r.Handler()(context.Background(), changestream.Event{DocumentID: "d1", Status: "UPLOADED", ObjectKey: "k"})
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if len(*order.steps) != 1 {
+		t.Fatalf("order = %v", order.steps)
+	}
+}
+
+func TestRelay_ErrorDeRepoNoEncola(t *testing.T) {
+	order := &relayOrder{steps: new([]string)}
+	repo := &orderRepo{relayOrder: *order, doc: &domain.Document{ID: "d1", Status: domain.StatusUploaded}, fail: fmt.Errorf("boom"), apply: false}
+	q := &orderQueue{relayOrder: *order}
+	repo.relayOrder.steps = order.steps
+	q.relayOrder.steps = order.steps
+	r := New(q, repo, 1)
+	err := r.Handler()(context.Background(), changestream.Event{DocumentID: "d1", Status: "UPLOADED", ObjectKey: "k"})
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if len(*order.steps) != 1 {
+		t.Fatalf("order = %v", order.steps)
+	}
+}
+
+func TestRelay_EventoNoUploaded_NoUsaRepo(t *testing.T) {
+	order := &relayOrder{steps: new([]string)}
+	repo := &orderRepo{relayOrder: *order, doc: &domain.Document{ID: "d1", Status: domain.StatusQueued}, apply: false}
+	q := &orderQueue{relayOrder: *order}
+	repo.relayOrder.steps = order.steps
+	q.relayOrder.steps = order.steps
+	r := New(q, repo, 1)
+	err := r.Handler()(context.Background(), changestream.Event{DocumentID: "d1", Status: "QUEUED", ObjectKey: "k"})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(*order.steps) != 0 {
+		t.Fatalf("order = %v", order.steps)
 	}
 }
