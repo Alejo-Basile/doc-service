@@ -99,6 +99,19 @@ func (r *Reconciler) RegisterRoutes(engine *gin.Engine) {
 		}
 		c.JSON(200, result)
 	})
+	internal.GET("/cross-check", func(c *gin.Context) {
+		report, err := r.CrossCheckNow(c.Request.Context())
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, report)
+	})
+}
+
+// CrossCheckNow ejecuta el cross-check de solo lectura y devuelve el reporte.
+func (r *Reconciler) CrossCheckNow(ctx context.Context) (*CrossCheckReport, error) {
+	return r.crossCheck(ctx, r.clock.Now())
 }
 
 // Result resume lo que hizo un sweep.
@@ -656,7 +669,7 @@ func (r *Reconciler) sweepCompletedMissingTxt(ctx context.Context, now time.Time
 			continue
 		}
 		// Verificar que el .txt exista en MinIO.
-		_, err := r.storage.Stat(ctx, doc.TxtRef)
+		_, err := r.storage.StatTXT(ctx, doc.TxtRef)
 		if err != nil {
 			if isNotFound(err) {
 				count++
@@ -720,7 +733,7 @@ func (r *Reconciler) crossCheck(ctx context.Context, now time.Time) (*CrossCheck
 				report.CompletedNoTxt = append(report.CompletedNoTxt, doc.ID)
 			} else if now.Sub(doc.CreatedAt) >= r.minSafetyAge {
 				// Solo verificar si pasó el umbral de seguridad.
-				if _, err := r.storage.Stat(ctx, doc.TxtRef); err != nil && isNotFound(err) {
+				if _, err := r.storage.StatTXT(ctx, doc.TxtRef); err != nil && isNotFound(err) {
 					report.CompletedNoTxt = append(report.CompletedNoTxt, doc.ID)
 				}
 			}
@@ -755,6 +768,25 @@ func (r *Reconciler) crossCheck(ctx context.Context, now time.Time) (*CrossCheck
 			}
 		}
 		report.RawBucketObjects = int64(rawObjects)
+	}
+
+	// 3b. Listar objetos del bucket extracted-txt.
+	type txtLister interface {
+		ListObjectsTXT(ctx context.Context) ([]ports.ObjectInfo, error)
+	}
+	if l, ok := r.storage.(txtLister); ok {
+		objects, err := l.ListObjectsTXT(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list txt objects: %w", err)
+		}
+		txtObjects := 0
+		for _, obj := range objects {
+			if strings.HasSuffix(obj.Key, "/") {
+				continue
+			}
+			txtObjects++
+		}
+		report.TXTBucketObjects = int64(txtObjects)
 	}
 
 	// 4. Redis stream length.
