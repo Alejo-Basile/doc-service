@@ -304,6 +304,8 @@ type orderRepo struct {
 	doc   *domain.Document
 	fail  error
 	apply bool
+	entry domain.StatusEntry
+	extra map[string]any
 }
 
 func (o *orderRepo) Insert(ctx context.Context, doc *domain.Document) error { return nil }
@@ -318,6 +320,8 @@ func (o *orderRepo) UpdateStatus(ctx context.Context, id string, from, to domain
 }
 func (o *orderRepo) UpdateStatusWithHistory(ctx context.Context, id string, from, to domain.Status, entry domain.StatusEntry, extraSet map[string]any) (bool, error) {
 	*o.steps = append(*o.steps, "transition")
+	o.entry = entry
+	o.extra = extraSet
 	if o.fail != nil {
 		return false, o.fail
 	}
@@ -335,10 +339,14 @@ func (o *orderRepo) ListByCursor(ctx context.Context, filter ports.CursorFilter)
 	return nil, "", nil
 }
 
-type orderQueue struct{ relayOrder }
+type orderQueue struct {
+	relayOrder
+	msg ports.WorkMessage
+}
 
 func (o *orderQueue) Enqueue(ctx context.Context, msg ports.WorkMessage) error {
 	*o.steps = append(*o.steps, "enqueue")
+	o.msg = msg
 	return nil
 }
 func (o *orderQueue) Ping(ctx context.Context) error { return nil }
@@ -363,19 +371,92 @@ func TestRelay_TransicionaQueuedAntesDeEncolar(t *testing.T) {
 	}
 }
 
-func TestRelay_NoEncolaSiDocumentoYaTerminal(t *testing.T) {
+func TestRelay_TransicionPersisteDatosDelEvento(t *testing.T) {
 	order := &relayOrder{steps: new([]string)}
-	repo := &orderRepo{relayOrder: *order, doc: &domain.Document{ID: "d1", Status: domain.StatusCompleted}, apply: false}
+	repo := &orderRepo{relayOrder: *order, doc: &domain.Document{ID: "d1", Status: domain.StatusUploaded}, apply: true}
 	q := &orderQueue{relayOrder: *order}
 	repo.relayOrder.steps = order.steps
 	q.relayOrder.steps = order.steps
 	r := New(q, repo, 1)
-	err := r.Handler()(context.Background(), changestream.Event{DocumentID: "d1", Status: "UPLOADED", ObjectKey: "k"})
+	err := r.Handler()(context.Background(), changestream.Event{
+		DocumentID:    "d1",
+		Status:        "UPLOADED",
+		ObjectKey:     "raw-pdfs/d1.pdf",
+		CorrelationID: "c-1",
+	})
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
-	if len(*order.steps) != 1 || (*order.steps)[0] != "transition" {
-		t.Fatalf("order = %v", order.steps)
+	if got := repo.extra["object_key"]; got != "raw-pdfs/d1.pdf" {
+		t.Errorf("extraSet object_key = %v, want %q", got, "raw-pdfs/d1.pdf")
+	}
+	if repo.entry.Actor != domain.ActorDocService {
+		t.Errorf("entry.Actor = %v, want %v", repo.entry.Actor, domain.ActorDocService)
+	}
+	if repo.entry.CorrelationID != "c-1" {
+		t.Errorf("entry.CorrelationID = %v, want %q", repo.entry.CorrelationID, "c-1")
+	}
+}
+
+func TestRelay_ObjectKeyDerivadoPersisteYCoincideConMensaje(t *testing.T) {
+	esperado := "raw-pdfs/d1.pdf"
+	casos := []struct {
+		nombre      string
+		eventObjKey string
+	}{
+		{"evento sin object_key", ""},
+		{"evento con otra object_key", "otra-clave.pdf"},
+	}
+	for _, tt := range casos {
+		t.Run(tt.nombre, func(t *testing.T) {
+			order := &relayOrder{steps: new([]string)}
+			repo := &orderRepo{relayOrder: *order, doc: &domain.Document{ID: "d1", Status: domain.StatusUploaded}, apply: true}
+			q := &orderQueue{relayOrder: *order}
+			repo.relayOrder.steps = order.steps
+			q.relayOrder.steps = order.steps
+			r := New(q, repo, 1)
+			err := r.Handler()(context.Background(), changestream.Event{
+				DocumentID: "d1",
+				Status:     "UPLOADED",
+				ObjectKey:  tt.eventObjKey,
+			})
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			if got := repo.extra["object_key"]; got != esperado {
+				t.Errorf("document object_key = %v, want %q", got, esperado)
+			}
+			if q.msg.ObjectKey != esperado {
+				t.Errorf("mensaje object_key = %q, want %q", q.msg.ObjectKey, esperado)
+			}
+		})
+	}
+}
+
+func TestRelay_NoEncolaSiDocumentoNoPublicable(t *testing.T) {
+	casos := []struct {
+		nombre string
+		status domain.Status
+	}{
+		{"PROCESSING", domain.StatusProcessing},
+		{"COMPLETED", domain.StatusCompleted},
+	}
+	for _, tt := range casos {
+		t.Run(tt.nombre, func(t *testing.T) {
+			order := &relayOrder{steps: new([]string)}
+			repo := &orderRepo{relayOrder: *order, doc: &domain.Document{ID: "d1", Status: tt.status}, apply: false}
+			q := &orderQueue{relayOrder: *order}
+			repo.relayOrder.steps = order.steps
+			q.relayOrder.steps = order.steps
+			r := New(q, repo, 1)
+			err := r.Handler()(context.Background(), changestream.Event{DocumentID: "d1", Status: "UPLOADED", ObjectKey: "k"})
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			if len(*order.steps) != 1 || (*order.steps)[0] != "transition" {
+				t.Fatalf("order = %v, want solo [transition] (sin enqueue)", *order.steps)
+			}
+		})
 	}
 }
 

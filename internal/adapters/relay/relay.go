@@ -80,6 +80,11 @@ func (r *Relay) Handler() changestream.Handler {
 			return nil
 		}
 
+		// Clave derivada una sola vez (contrato §11.3: object_key es siempre
+		// raw-pdfs/<document_id>.pdf). Se persiste en la transición y se usa en
+		// el mensaje para que documento y cola nunca diverjan.
+		objectKey := fmt.Sprintf("raw-pdfs/%s.pdf", event.DocumentID)
+
 		// Invariante de orden: la transición UPLOADED -> QUEUED debe ocurrir ANTES
 		// del XADD. Así un mensaje en el stream siempre refiere a un doc ya QUEUED.
 		applied, err := r.repo.UpdateStatusWithHistory(ctx, event.DocumentID,
@@ -89,7 +94,7 @@ func (r *Relay) Handler() changestream.Handler {
 				Actor:         domain.ActorDocService,
 				CorrelationID: event.CorrelationID,
 			},
-			nil,
+			map[string]any{"object_key": objectKey},
 		)
 		if err != nil {
 			return fmt.Errorf("transicionar a QUEUED %s: %w", event.DocumentID, err)
@@ -119,16 +124,10 @@ func (r *Relay) Handler() changestream.Handler {
 
 		msg := ports.WorkMessage{
 			DocumentID:    event.DocumentID,
-			ObjectKey:     event.ObjectKey,
+			ObjectKey:     objectKey,
 			CorrelationID: event.CorrelationID,
 			EnqueuedAt:    time.Now().UTC().Format(time.RFC3339),
 			SchemaVersion: r.schemaVer,
-		}
-
-		// Si el ObjectKey viene vacío en el evento, derivarlo del document_id
-		// (es la regla del contrato: object_key = raw-pdfs/<id>.pdf).
-		if msg.ObjectKey == "" {
-			msg.ObjectKey = fmt.Sprintf("raw-pdfs/%s.pdf", event.DocumentID)
 		}
 
 		err = r.enqueueWithRetry(ctx, msg)
