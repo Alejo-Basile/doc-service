@@ -101,13 +101,15 @@ func (m *mockRepo) UpdateStatusWithHistory(ctx context.Context, id string, from,
 
 // mockStorage implementa ports.ObjectStorage (y el listado opcional).
 type mockStorage struct {
-	objects map[string]bool // key → exists
-	pdfData []byte
+	objects    map[string]bool // key → exists
+	txtObjects map[string]bool
+	pdfData    []byte
 	// statErr permite simular errores de infraestructura (p. ej. NoSuchBucket).
 	statErr error
 	// listObjects soporta la aserción `lister` de purgeOrphanObjects (S4-P2-02).
-	listObjects []ports.ObjectInfo
-	deleted     []string
+	listObjects    []ports.ObjectInfo
+	listObjectsTXT []ports.ObjectInfo
+	deleted        []string
 }
 
 func newMockStorage() *mockStorage {
@@ -161,6 +163,27 @@ func (m *mockStorage) Stat(ctx context.Context, objectKey string) (ports.ObjectI
 		return ports.ObjectInfo{Key: objectKey}, nil
 	}
 	return ports.ObjectInfo{}, errNotFound
+}
+
+func (m *mockStorage) StatTXT(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
+	if m.statErr != nil {
+		return ports.ObjectInfo{}, m.statErr
+	}
+	bucket := m.objects
+	if m.txtObjects != nil {
+		bucket = m.txtObjects
+	}
+	if bucket[objectKey] {
+		return ports.ObjectInfo{Key: objectKey}, nil
+	}
+	return ports.ObjectInfo{}, errNotFound
+}
+
+func (m *mockStorage) ListObjectsTXT(ctx context.Context) ([]ports.ObjectInfo, error) {
+	if m.listObjectsTXT != nil {
+		return m.listObjectsTXT, nil
+	}
+	return m.listObjects, nil
 }
 
 func (m *mockStorage) GetRange(ctx context.Context, objectKey string, start, end int64) ([]byte, error) {

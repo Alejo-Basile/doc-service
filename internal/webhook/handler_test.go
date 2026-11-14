@@ -110,6 +110,13 @@ func (m *mockStorage) Stat(ctx context.Context, objectKey string) (ports.ObjectI
 	return ports.ObjectInfo{Key: objectKey}, nil
 }
 
+func (m *mockStorage) StatTXT(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
+	if m.statErr != nil {
+		return ports.ObjectInfo{}, m.statErr
+	}
+	return ports.ObjectInfo{Key: objectKey}, nil
+}
+
 func (m *mockStorage) GetRange(ctx context.Context, objectKey string, start, end int64) ([]byte, error) {
 	if m.rangeErr != nil {
 		return nil, m.rangeErr
@@ -131,6 +138,10 @@ func (m *mockStorage) PresignGetTXT(ctx context.Context, objectKey string, expir
 }
 
 func (m *mockStorage) ListObjects(ctx context.Context) ([]ports.ObjectInfo, error) {
+	return nil, nil
+}
+
+func (m *mockStorage) ListObjectsTXT(ctx context.Context) ([]ports.ObjectInfo, error) {
 	return nil, nil
 }
 

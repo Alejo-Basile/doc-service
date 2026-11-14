@@ -185,6 +185,21 @@ func (o *ObjectStorage) Stat(ctx context.Context, objectKey string) (ports.Objec
 	}, nil
 }
 
+// StatTXT verifica la existencia de un objeto (HEAD) en el bucket extracted-txt.
+func (o *ObjectStorage) StatTXT(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
+	info, err := o.client.StatObject(ctx, o.bucketTXT, objectKey, miniogo.StatObjectOptions{})
+	if err != nil {
+		return ports.ObjectInfo{}, fmt.Errorf("stat %s/%s: %w", o.bucketTXT, objectKey, err)
+	}
+
+	return ports.ObjectInfo{
+		Key:          objectKey,
+		Size:         info.Size,
+		ContentType:  info.ContentType,
+		LastModified: info.LastModified,
+	}, nil
+}
+
 // GetRange lee un rango de bytes del objeto (para validar %PDF-).
 // start y end son inclusivos (RFC 7233). Usa el bucket raw.
 func (o *ObjectStorage) GetRange(ctx context.Context, objectKey string, start, end int64) ([]byte, error) {
@@ -280,11 +295,23 @@ func (o *ObjectStorage) MakeBucket(ctx context.Context, bucket string) error {
 
 // ListObjects lista todos los objetos del bucket raw (para purga de huérfanos, S4-P2-02).
 func (o *ObjectStorage) ListObjects(ctx context.Context) ([]ports.ObjectInfo, error) {
+	return o.listObjects(ctx, o.bucketRaw)
+}
+
+// ListObjectsTXT lista todos los objetos del bucket extracted-txt.
+func (o *ObjectStorage) ListObjectsTXT(ctx context.Context) ([]ports.ObjectInfo, error) {
+	return o.listObjects(ctx, o.bucketTXT)
+}
+
+func (o *ObjectStorage) listObjects(ctx context.Context, bucket string) ([]ports.ObjectInfo, error) {
 	var objects []ports.ObjectInfo
 
-	for obj := range o.client.ListObjects(ctx, o.bucketRaw, miniogo.ListObjectsOptions{Recursive: true}) {
+	for obj := range o.client.ListObjects(ctx, bucket, miniogo.ListObjectsOptions{Recursive: true}) {
 		if obj.Err != nil {
-			return nil, fmt.Errorf("list objects %s: %w", o.bucketRaw, obj.Err)
+			return nil, fmt.Errorf("list objects %s: %w", bucket, obj.Err)
+		}
+		if strings.HasSuffix(obj.Key, "/") {
+			continue
 		}
 		objects = append(objects, ports.ObjectInfo{
 			Key:          obj.Key,
