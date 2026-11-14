@@ -68,8 +68,10 @@ type ResumeTokenStore interface {
 type ObjectStorage interface {
 	// PresignPost genera una URL prefirmada POST con política (SPEC §5.1).
 	PresignPost(ctx context.Context, objectKey string, opts PresignPostOptions) (*PresignPostResult, error)
-	// Stat verifica la existencia de un objeto (HEAD).
+	// Stat verifica la existencia de un objeto (HEAD) en el bucket raw.
 	Stat(ctx context.Context, objectKey string) (ObjectInfo, error)
+	// StatTXT verifica la existencia de un objeto (HEAD) en el bucket extracted-txt.
+	StatTXT(ctx context.Context, objectKey string) (ObjectInfo, error)
 	// GetRange lee un rango de bytes del objeto (para validar %PDF-).
 	GetRange(ctx context.Context, objectKey string, start, end int64) ([]byte, error)
 	// Delete elimina un objeto.
@@ -80,6 +82,8 @@ type ObjectStorage interface {
 	PresignGetTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error)
 	// ListObjects lista todos los objetos del bucket raw (para purga de huérfanos).
 	ListObjects(ctx context.Context) ([]ObjectInfo, error)
+	// ListObjectsTXT lista todos los objetos del bucket extracted-txt.
+	ListObjectsTXT(ctx context.Context) ([]ObjectInfo, error)
 }
 
 // PresignPostOptions configura la política de la URL prefirmada.
