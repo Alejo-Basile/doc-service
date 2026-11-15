@@ -211,3 +211,69 @@ func TestErrorLogMiddleware_RegistraErroresDeGin(t *testing.T) {
 		t.Errorf("path esperado '/boom', got %v", entry["path"])
 	}
 }
+
+func TestRateLimitHeadersMiddleware_Echo(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	casos := []struct {
+		name     string
+		inbound  map[string]string
+		expected map[string]string
+		absent   []string
+	}{
+		{
+			name:     "single limit",
+			inbound:  map[string]string{"X-RateLimit-Limit": "10"},
+			expected: map[string]string{"X-RateLimit-Limit": "10"},
+		},
+		{
+			name:     "absent not echoed",
+			inbound:  map[string]string{},
+			expected: map[string]string{},
+		},
+		{
+			name:     "evil not echoed",
+			inbound:  map[string]string{"X-Evil": "boom"},
+			expected: map[string]string{},
+		},
+		{
+			name: "multiple",
+			inbound: map[string]string{
+				"X-RateLimit-Limit":     "10",
+				"X-RateLimit-Remaining": "5",
+				"Retry-After":           "1",
+			},
+			expected: map[string]string{
+				"X-RateLimit-Limit":     "10",
+				"X-RateLimit-Remaining": "5",
+				"Retry-After":           "1",
+			},
+		},
+	}
+	for _, tc := range casos {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := gin.New()
+			engine.Use(RateLimitHeadersMiddleware())
+			engine.GET("/t", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+			req := httptest.NewRequest(http.MethodGet, "/t", nil)
+			for k, v := range tc.inbound {
+				req.Header.Set(k, v)
+			}
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+			for k, v := range tc.expected {
+				if got := w.Header().Get(k); got != v {
+					t.Errorf("%s esperado %q, got %q", k, v, got)
+				}
+			}
+			// absent headers must not be present
+			for _, h := range []string{"X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset", "X-RateLimit-Retry-After", "X-RateLimit-Degraded", "Retry-After", "X-Evil"} {
+				if _, in := tc.expected[h]; in {
+					continue
+				}
+				if got := w.Header().Get(h); got != "" {
+					t.Errorf("header %s no debería estar, got %q", h, got)
+				}
+			}
+		})
+	}
+}
