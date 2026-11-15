@@ -54,6 +54,7 @@ func (s *Server) RegisterAPI(registrars ...RouteRegistrar) {
 func (s *Server) registerRoutes() {
 	// Middlewares globales: correlation_id → request logging → error logging → recovery.
 	s.engine.Use(
+		RateLimitHeadersMiddleware(),
 		CorrelationIDMiddleware(),
 		RequestLoggerMiddleware(),
 		ErrorLogMiddleware(),
