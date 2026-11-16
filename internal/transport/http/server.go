@@ -7,6 +7,7 @@ import (
 	"time"
 
 	_ "github.com/Alejo-Basile/doc-service/internal/metrics"
+	"github.com/Alejo-Basile/doc-service/internal/ports"
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -14,10 +15,13 @@ import (
 // Server encapsula el motor Gin y sus rutas.
 type Server struct {
 	engine *gin.Engine
+	probes []ports.HealthProbe
 }
 
-// NewServer crea un servidor HTTP con el modo de Gin según el entorno.
-func NewServer(debug bool) *Server {
+// NewServer creates an HTTP server with Gin's mode based on the environment.
+// probes feeds /readyz: when none is injected, only process liveness is
+// verified (compatibility with starts/tests that do not wire dependencies).
+func NewServer(debug bool, probes ...ports.HealthProbe) *Server {
 	if !debug {
 		gin.SetMode(gin.ReleaseMode)
 	} else {
@@ -27,7 +31,7 @@ func NewServer(debug bool) *Server {
 	engine := gin.New()
 	engine.Use(gin.Recovery())
 
-	s := &Server{engine: engine}
+	s := &Server{engine: engine, probes: probes}
 	s.registerRoutes()
 	return s
 }
@@ -61,10 +65,11 @@ func (s *Server) registerRoutes() {
 		gin.Recovery(),
 	)
 
-	// Health checks (SPEC §10: /healthz y /readyz deben verificar dependencias reales,
-	// pero en esta fase solo responden proceso vivo).
+	// Health checks (SPEC §10). /healthz is pure liveness (the Dockerfile
+	// HEALTHCHECK depends on its semantics); /readyz probes Mongo, Redis and
+	// MinIO through the injected health probes.
 	s.engine.GET("/healthz", handleHealthz)
-	s.engine.GET("/readyz", handleReadyz)
+	s.engine.GET("/readyz", s.handleReadyz)
 
 	// Métricas Prometheus (SPEC §10): scrapeado por el stack de observabilidad.
 	// Se monta con gin.WrapH porque promhttp.Handler expone http.Handler, no gin.HandlerFunc.
