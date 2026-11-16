@@ -156,7 +156,14 @@ func main() {
 	)
 
 	// --- Servidor HTTP ---
-	server := httpserver.NewServer(cfg.Debug)
+	// /readyz probes real connectivity of the critical dependencies (SPEC §11.7).
+	// Redis reuses the queue's client: no extra connection is opened.
+	healthProbes := []ports.HealthProbe{
+		mongoadapter.NewHealthProbe(mongoClient),
+		redisadapter.NewHealthProbe(queue.Client()),
+		minioadapter.NewHealthProbe(storage),
+	}
+	server := httpserver.NewServer(cfg.Debug, healthProbes...)
 	server.RegisterAPI(docsHandler, webhookHandler, internalHandler, rel)
 	httpSrv := server.NewHTTPServer(cfg.Addr())
 
