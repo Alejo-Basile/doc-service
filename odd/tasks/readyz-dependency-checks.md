@@ -54,6 +54,16 @@ Suite de integración: dejada al job de CI (requiere Mongo replica set/Redis/Min
 
 ## Progreso
 - 2026-11-16: feature creada; exploración previa completada (3 explore subagents).
+- 2026-11-16: T1–T4 completas. Work-unit commit `3b2f5b4` en `feat/readyz-dependency-checks`.
+  Verificación independiente (gentle-ai-verify): 7/7 PASS. Review nativa (1 lens `review-reliability`,
+  lineage `review-4ba643a039f3cb7a`): APROBADA, autoridad quemada (`review-acknowledged/v1`).
+  4 findings advisory no bloqueantes (R3-01..R3-04) — ver "Hallazgos advisory" abajo.
+
+## Hallazgos advisory de la review (no bloqueantes, trabajo posterior)
+- R3-01 (WARNING): los probes corren fuera de `gin.Recovery`; un panic en `Check` tumbaría el proceso.
+- R3-02 (SUGGESTION): los errores crudos se loguean en servidor y podrían contener DSN en logs.
+- R3-03 (SUGGESTION): ventana benigna donde un probe puede reportarse `timeout` con resultado ya disponible.
+- R3-04 (SUGGESTION): el camino de compatibilidad sin probes (200 con checks vacíos) no tiene test.
 
 ## Verificación registrada
 - 2026-11-16 (T4): tests herméticos `/readyz` en `internal/transport/http/health_test.go`
