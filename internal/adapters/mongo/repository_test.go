@@ -453,7 +453,7 @@ func TestDocumentRepository_WorkerCompleted_Condicional(t *testing.T) {
 		ok, err := repo.UpdateStatusWithHistory(ctx, doc.ID,
 			domain.StatusProcessing, domain.StatusCompleted,
 			entry,
-			map[string]any{"txt_ref": fmt.Sprintf("extracted-txt/%s.txt", doc.ID)},
+			map[string]any{"md_ref": fmt.Sprintf("extracted-md/%s.md", doc.ID)},
 		)
 		if err != nil {
 			t.Fatalf("UpdateStatusWithHistory falló: %v", err)
@@ -469,8 +469,8 @@ func TestDocumentRepository_WorkerCompleted_Condicional(t *testing.T) {
 		if got.Status != domain.StatusCompleted {
 			t.Errorf("Status esperado %q, got %q", domain.StatusCompleted, got.Status)
 		}
-		if got.TxtRef == "" {
-			t.Error("TxtRef no se actualizó")
+		if got.MdRef == "" {
+			t.Error("MdRef no se actualizó")
 		}
 		if len(got.History) != 2 {
 			t.Fatalf("history longitud esperada 2, got %d", len(got.History))
@@ -509,7 +509,7 @@ func TestDocumentRepository_WorkerCompleted_Condicional(t *testing.T) {
 			ok, err := repo.UpdateStatusWithHistory(ctx, doc.ID,
 				domain.StatusProcessing, domain.StatusCompleted,
 				entry,
-				map[string]any{"txt_ref": fmt.Sprintf("extracted-txt/%s.txt", doc.ID)},
+				map[string]any{"md_ref": fmt.Sprintf("extracted-md/%s.md", doc.ID)},
 			)
 			if err != nil {
 				t.Fatalf("UpdateStatusWithHistory no debía fallar con error: %v", err)
@@ -525,8 +525,8 @@ func TestDocumentRepository_WorkerCompleted_Condicional(t *testing.T) {
 			if despues.Status != c.estado {
 				t.Errorf("Status esperado %q (sin cambios), got %q", c.estado, despues.Status)
 			}
-			if despues.TxtRef != "" {
-				t.Errorf("TxtRef debía quedar vacío, got %q", despues.TxtRef)
+			if despues.MdRef != "" {
+				t.Errorf("MdRef debía quedar vacío, got %q", despues.MdRef)
 			}
 			if len(despues.History) != len(antes.History) {
 				t.Errorf("history no debía cambiar: antes %d, después %d",

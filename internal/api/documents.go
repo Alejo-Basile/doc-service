@@ -197,6 +197,7 @@ func (h *DocumentHandler) GetDocument(c *gin.Context) {
 		"document_id":    doc.ID,
 		"status":         string(doc.Status),
 		"object_key":     doc.ObjectKey,
+		"md_ref":         doc.MdRef,
 		"txt_ref":        doc.TxtRef,
 		"correlation_id": doc.CorrelationID,
 		"schema_version": doc.SchemaVersion,
@@ -208,7 +209,7 @@ func (h *DocumentHandler) GetDocument(c *gin.Context) {
 }
 
 // DownloadDocument maneja GET /api/v2/documents/:id/download (S3-P2-09).
-// Entrega una URL prefirmada de lectura del bucket extracted-txt
+// Entrega una URL prefirmada de lectura del bucket extracted-md
 // únicamente si el documento está en COMPLETED.
 func (h *DocumentHandler) DownloadDocument(c *gin.Context) {
 	id := c.Param("id")
@@ -236,24 +237,31 @@ func (h *DocumentHandler) DownloadDocument(c *gin.Context) {
 		return
 	}
 
-	// txt_ref es la clave del objeto en extracted-txt.
-	if doc.TxtRef == "" {
+	// Resolución con fallback legacy (D5): md_ref primero; si no existe, txt_ref.
+	// Cada referencia usa su bucket correspondiente.
+	ref, legacy := doc.ExtractedRef()
+	if ref == "" {
 		respondProblem(c, http.StatusConflict, "conflict",
 			"Resultado no disponible",
-			"el documento está COMPLETED pero no tiene txt_ref")
+			"el documento está COMPLETED pero no tiene md_ref ni txt_ref")
 		return
 	}
 
 	// URL prefirmada de lectura con expiración corta (5 min).
-	downloadURL, err := h.storage.PresignGetTXT(c.Request.Context(), doc.TxtRef, 5*time.Minute)
+	var downloadURL string
+	if legacy {
+		downloadURL, err = h.storage.PresignGetLegacyTXT(c.Request.Context(), ref, 5*time.Minute)
+	} else {
+		downloadURL, err = h.storage.PresignGetMD(c.Request.Context(), ref, 5*time.Minute)
+	}
 	if err != nil {
-		slog.Error("download: presign GET TXT", "error", err, "document_id", id, "txt_ref", doc.TxtRef)
+		slog.Error("download: presign GET", "error", err, "document_id", id, "ref", ref, "legacy", legacy)
 		respondProblem(c, http.StatusInternalServerError, "internal", "Error generando URL de descarga", "")
 		return
 	}
 
 	slog.Info("download URL generada",
-		"document_id", id, "txt_ref", doc.TxtRef,
+		"document_id", id, "ref", ref, "legacy", legacy,
 	)
 
 	c.JSON(http.StatusOK, gin.H{

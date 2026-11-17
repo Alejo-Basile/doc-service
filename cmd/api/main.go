@@ -88,14 +88,15 @@ func main() {
 	}
 
 	rawStorage, err := minioadapter.New(minioadapter.Config{
-		Endpoint:       cfg.MinIOEndpoint,
-		PublicEndpoint: cfg.MinIOPublicEndpoint,
-		AccessKey:      cfg.MinIOAccessKey,
-		SecretKey:      cfg.MinIOSecretKey,
-		UseSSL:         false, // TLS termina en el edge (Traefik); el endpoint interno es plano.
-		BucketRaw:      cfg.MinIOBucketRaw,
-		BucketTXT:      cfg.MinIOBucketTXT,
-		Region:         cfg.MinIORegion,
+		Endpoint:        cfg.MinIOEndpoint,
+		PublicEndpoint:  cfg.MinIOPublicEndpoint,
+		AccessKey:       cfg.MinIOAccessKey,
+		SecretKey:       cfg.MinIOSecretKey,
+		UseSSL:          false, // TLS termina en el edge (Traefik); el endpoint interno es plano.
+		BucketRaw:       cfg.MinIOBucketRaw,
+		BucketMD:        cfg.MinIOBucketMD,
+		BucketLegacyTXT: cfg.MinIOLegacyBucketTXT,
+		Region:          cfg.MinIORegion,
 	})
 	if err != nil {
 		slog.Error("no se pudo inicializar el adaptador MinIO", "error", err.Error())

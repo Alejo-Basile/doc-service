@@ -124,11 +124,21 @@ func (s *objectStorage) Stat(ctx context.Context, objectKey string) (ports.Objec
 	return info, err
 }
 
-func (s *objectStorage) StatTXT(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
+func (s *objectStorage) StatMD(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
 	var info ports.ObjectInfo
 	err := s.b.Do(func() error {
 		var err error
-		info, err = s.inner.StatTXT(ctx, objectKey)
+		info, err = s.inner.StatMD(ctx, objectKey)
+		return err
+	})
+	return info, err
+}
+
+func (s *objectStorage) StatLegacyTXT(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
+	var info ports.ObjectInfo
+	err := s.b.Do(func() error {
+		var err error
+		info, err = s.inner.StatLegacyTXT(ctx, objectKey)
 		return err
 	})
 	return info, err
@@ -148,8 +158,8 @@ func (s *objectStorage) Delete(ctx context.Context, objectKey string) error {
 	return s.b.Do(func() error { return s.inner.Delete(ctx, objectKey) })
 }
 
-func (s *objectStorage) DeleteTXT(ctx context.Context, objectKey string) error {
-	return s.b.Do(func() error { return s.inner.DeleteTXT(ctx, objectKey) })
+func (s *objectStorage) DeleteMD(ctx context.Context, objectKey string) error {
+	return s.b.Do(func() error { return s.inner.DeleteMD(ctx, objectKey) })
 }
 
 func (s *objectStorage) PresignGet(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
@@ -162,11 +172,21 @@ func (s *objectStorage) PresignGet(ctx context.Context, objectKey string, expiry
 	return url, err
 }
 
-func (s *objectStorage) PresignGetTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
+func (s *objectStorage) PresignGetMD(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
 	var url string
 	err := s.b.Do(func() error {
 		var err error
-		url, err = s.inner.PresignGetTXT(ctx, objectKey, expiry)
+		url, err = s.inner.PresignGetMD(ctx, objectKey, expiry)
+		return err
+	})
+	return url, err
+}
+
+func (s *objectStorage) PresignGetLegacyTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
+	var url string
+	err := s.b.Do(func() error {
+		var err error
+		url, err = s.inner.PresignGetLegacyTXT(ctx, objectKey, expiry)
 		return err
 	})
 	return url, err
@@ -182,11 +202,11 @@ func (s *objectStorage) ListObjects(ctx context.Context) ([]ports.ObjectInfo, er
 	return list, err
 }
 
-func (s *objectStorage) ListObjectsTXT(ctx context.Context) ([]ports.ObjectInfo, error) {
+func (s *objectStorage) ListObjectsMD(ctx context.Context) ([]ports.ObjectInfo, error) {
 	var list []ports.ObjectInfo
 	err := s.b.Do(func() error {
 		var err error
-		list, err = s.inner.ListObjectsTXT(ctx)
+		list, err = s.inner.ListObjectsMD(ctx)
 		return err
 	})
 	return list, err

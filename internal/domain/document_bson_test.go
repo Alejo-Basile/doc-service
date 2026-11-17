@@ -18,7 +18,7 @@ func TestDocument_BSONRoundtrip(t *testing.T) {
 		ID:            "01J9Z8QK3M7X2V0N4P6R8T1Y0B",
 		Status:        StatusCompleted,
 		ObjectKey:     "raw-pdfs/01J9Z8QK3M7X2V0N4P6R8T1Y0B.pdf",
-		TxtRef:        "extracted-txt/01J9Z8QK3M7X2V0N4P6R8T1Y0B.txt",
+		MdRef:         "extracted-md/01J9Z8QK3M7X2V0N4P6R8T1Y0B.md",
 		FailureReason: "",
 		CorrelationID: "corr-abc-123",
 		SchemaVersion: 1,
@@ -46,7 +46,7 @@ func TestDocument_BSONRoundtrip(t *testing.T) {
 	// Verificar que los nombres de campo BSON son los esperados (schema v1).
 	// Nota: failure_reason está vacío (omitempty) y no aparece — es correcto.
 	camposEsperados := []string{
-		"_id", "status", "object_key", "txt_ref",
+		"_id", "status", "object_key", "md_ref",
 		"correlation_id", "schema_version", "expires_at", "created_at",
 		"updated_at", "history",
 	}
@@ -103,7 +103,7 @@ func TestDocument_BSONOpcionalesVacios(t *testing.T) {
 		ID:            "01TEST",
 		Status:        StatusPendingUpload,
 		ObjectKey:     "",
-		TxtRef:        "",
+		MdRef:         "",
 		FailureReason: "",
 		CorrelationID: "corr-1",
 		SchemaVersion: 1,
@@ -123,8 +123,8 @@ func TestDocument_BSONOpcionalesVacios(t *testing.T) {
 		t.Fatalf("bson.Unmarshal falló: %v", err)
 	}
 
-	// object_key, txt_ref y failure_reason están vacíos → no deben aparecer.
-	for _, campo := range []string{"object_key", "txt_ref", "failure_reason"} {
+	// object_key, md_ref y failure_reason están vacíos → no deben aparecer.
+	for _, campo := range []string{"object_key", "md_ref", "txt_ref", "failure_reason"} {
 		if _, ok := m[campo]; ok {
 			t.Errorf("campo %q no debería aparecer en BSON cuando está vacío (omitempty)", campo)
 		}
@@ -145,4 +145,50 @@ func keys(m bson.M) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestDocument_BSONLegacyTxtRef verifica que un documento legacy conserva
+// txt_ref en el roundtrip BSON (compatibilidad de lectura D5).
+func TestDocument_BSONLegacyTxtRef(t *testing.T) {
+	original := &Document{
+		ID:            "01LEGACYTXTREF000000000000",
+		Status:        StatusCompleted,
+		ObjectKey:     "raw-pdfs/01LEGACYTXTREF000000000000.pdf",
+		TxtRef:        "extracted-txt/01LEGACYTXTREF000000000000.txt",
+		CorrelationID: "corr-legacy-1",
+		SchemaVersion: 1,
+		ExpiresAt:     time.Now().UTC().Add(time.Hour).Truncate(time.Millisecond),
+		CreatedAt:     time.Now().UTC().Truncate(time.Millisecond),
+		UpdatedAt:     time.Now().UTC().Truncate(time.Millisecond),
+		History: []StatusEntry{
+			{Status: StatusCompleted, Actor: ActorWorker, CorrelationID: "corr-legacy-1", At: time.Now().UTC().Truncate(time.Millisecond)},
+		},
+	}
+
+	data, err := bson.Marshal(original)
+	if err != nil {
+		t.Fatalf("bson.Marshal falló: %v", err)
+	}
+	var m bson.M
+	if err := bson.Unmarshal(data, &m); err != nil {
+		t.Fatalf("bson.Unmarshal a mapa falló: %v", err)
+	}
+	if got, ok := m["txt_ref"].(string); !ok || got != original.TxtRef {
+		t.Errorf("txt_ref = %v, want %q", m["txt_ref"], original.TxtRef)
+	}
+	// md_ref vacío no debe aparecer en un documento legacy.
+	if _, ok := m["md_ref"]; ok {
+		t.Error("md_ref no debería aparecer cuando está vacío (omitempty)")
+	}
+
+	var roundtrip Document
+	if err := bson.Unmarshal(data, &roundtrip); err != nil {
+		t.Fatalf("bson.Unmarshal a Document falló: %v", err)
+	}
+	if roundtrip.TxtRef != original.TxtRef {
+		t.Errorf("TxtRef roundtrip = %q, want %q", roundtrip.TxtRef, original.TxtRef)
+	}
+	if ref, legacy := roundtrip.ExtractedRef(); ref != original.TxtRef || !legacy {
+		t.Errorf("ExtractedRef() = (%q, %v), want (%q, true)", ref, legacy, original.TxtRef)
+	}
 }

@@ -16,7 +16,7 @@ Colección: **`documents`** (nombre configurable vía `MONGO_DATABASE`, default 
   "_id": "01J9Z8QK3M7X2V0N4P6R8T1Y0B",
   "status": "PENDING_UPLOAD",
   "object_key": "",
-  "txt_ref": "",
+  "md_ref": "",
   "failure_reason": "",
   "correlation_id": "01J9Z8QK3M7X2V0N4P6R8T1Y0B",
   "schema_version": 1,
@@ -47,7 +47,7 @@ Colección: **`documents`** (nombre configurable vía `MONGO_DATABASE`, default 
   "_id": "01J9Z8QK3M7X2V0N4P6R8T1Y0B",
   "status": "COMPLETED",
   "object_key": "raw-pdfs/01J9Z8QK3M7X2V0N4P6R8T1Y0B.pdf",
-  "txt_ref": "extracted-txt/01J9Z8QK3M7X2V0N4P6R8T1Y0B.txt",
+  "md_ref": "extracted-md/01J9Z8QK3M7X2V0N4P6R8T1Y0B.md",
   "failure_reason": "",
   "correlation_id": "corr-abc-123",
   "schema_version": 1,
@@ -73,7 +73,7 @@ Colección: **`documents`** (nombre configurable vía `MONGO_DATABASE`, default 
 | `_id` | string (ULID) | sí | ULID ordenable por tiempo (SPEC §5.4). El driver Mongo lo usa como `_id` nativo; no hay campo separado `id`. |
 | `status` | string | sí | Estado del ciclo de vida (SPEC §4). Se consulta para reconciliación, dashboards y debugging. |
 | `object_key` | string | no (vacío hasta UPLOADED) | Clave del PDF en MinIO. Derivable de `_id` (`raw-pdfs/<id>.pdf`), se almacena para no recomputar y para poder validar consistencia. |
-| `txt_ref` | string | no (vacío hasta COMPLETED) | Referencia al `.txt` extraído en MinIO. Se setea solo en la transición COMPLETED (ADR-0006). |
+| `md_ref` | string | no (vacío hasta COMPLETED) | Referencia al `.md` extraído en MinIO. Se setea solo en la transición COMPLETED (ADR-0006). |
 | `failure_reason` | string | no | Causa del fallo/rechazo. Se setea solo en transiciones a FAILED, REJECTED o EXTRACTION_FAILED (SPEC §4). |
 | `correlation_id` | string | sí | ID de trazabilidad extremo a extremo. Propaga entre doc-service, Redis y worker. |
 | `schema_version` | int | sí | Versión del contrato del documento. Un worker que no entiende la versión **no procesa** (SPEC §5.4). Default: 1. |
@@ -158,7 +158,7 @@ type Document struct {
     ID            string        `bson:"_id" json:"id"`
     Status        Status        `bson:"status" json:"status"`
     ObjectKey     string        `bson:"object_key,omitempty" json:"object_key,omitempty"`
-    TxtRef        string        `bson:"txt_ref,omitempty" json:"txt_ref,omitempty"`
+    MdRef         string        `bson:"md_ref,omitempty" json:"md_ref,omitempty"`
     FailureReason string        `bson:"failure_reason,omitempty" json:"failure_reason,omitempty"`
     CorrelationID string        `bson:"correlation_id" json:"correlation_id"`
     SchemaVersion int           `bson:"schema_version" json:"schema_version"`
