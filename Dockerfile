@@ -4,7 +4,7 @@
 # los endpoints /internal/* NO se publican al host (solo Traefik enruta /api/v2).
 
 # --- Build -------------------------------------------------------------------
-FROM golang:1.26.10-alpine AS build
+FROM golang:1.26.11-alpine AS build
 # No descargar toolchains remotas: usar la del builder (>= toolchain de go.mod).
 ENV GOTOOLCHAIN=local
 WORKDIR /src
