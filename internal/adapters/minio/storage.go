@@ -228,6 +228,14 @@ func (o *ObjectStorage) Delete(ctx context.Context, objectKey string) error {
 	return nil
 }
 
+// DeleteTXT elimina un objeto del bucket extracted-txt (purga de huérfanos, SPEC §6.5).
+func (o *ObjectStorage) DeleteTXT(ctx context.Context, objectKey string) error {
+	if err := o.client.RemoveObject(ctx, o.bucketTXT, objectKey, miniogo.RemoveObjectOptions{}); err != nil {
+		return fmt.Errorf("delete %s/%s: %w", o.bucketTXT, objectKey, err)
+	}
+	return nil
+}
+
 // PresignGet genera una URL prefirmada de lectura del bucket raw.
 func (o *ObjectStorage) PresignGet(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
 	u, err := o.presignClient.PresignedGetObject(ctx, o.bucketRaw, objectKey, expiry, nil)

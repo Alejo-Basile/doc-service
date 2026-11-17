@@ -371,6 +371,25 @@ func (r *Reconciler) deleteObject(ctx context.Context, actions *actionReport, dr
 	return nil
 }
 
+// deleteTXTObject purga un objeto del bucket extracted-txt o, en dry-run, solo
+// lo planifica. Espeja a deleteObject para que el choke point de dry-run cubra
+// también las mutaciones sobre el bucket de textos (SPEC §6.5).
+func (r *Reconciler) deleteTXTObject(ctx context.Context, actions *actionReport, dryRun bool, objectKey string) error {
+	actions.planned++
+	if dryRun {
+		slog.Info("reconciler: acción planificada (dry-run)",
+			"action", "delete_txt_object",
+			"object_key", objectKey,
+		)
+		return nil
+	}
+	if err := r.storage.DeleteTXT(ctx, objectKey); err != nil {
+		return err
+	}
+	actions.executed++
+	return nil
+}
+
 // sweepResult acumula contadores de un sweep parcial.
 type sweepResult struct {
 	expired   int
@@ -602,15 +621,21 @@ func (r *Reconciler) sweepOrphans(ctx context.Context, now time.Time, dryRun boo
 		return 0, fmt.Errorf("list all docs: %w", err)
 	}
 
-	// Construir set de object_keys válidos.
+	// Construir los sets de claves válidas con el mismo predicado del pass raw:
+	// cualquier documento (sin importar estado ni edad) con la referencia
+	// seteada protege su objeto.
 	validKeys := make(map[string]bool, len(docs))
+	validTxtKeys := make(map[string]bool, len(docs))
 	for _, doc := range docs {
 		if doc.ObjectKey != "" {
 			validKeys[doc.ObjectKey] = true
 		}
+		if doc.TxtRef != "" {
+			validTxtKeys[doc.TxtRef] = true
+		}
 	}
 
-	// Listar objetos en MinIO y purgar huérfanos.
+	// Listar objetos en MinIO y purgar huérfanos del bucket raw.
 	// Nota: esto requiere un método ListObjects en ObjectStorage.
 	// Por ahora, la implementación del adapter MinIO debe proveerlo.
 	// Se retorna 0 si el storage no soporta listado.
@@ -619,7 +644,14 @@ func (r *Reconciler) sweepOrphans(ctx context.Context, now time.Time, dryRun boo
 		return purged, err
 	}
 
-	return purged, nil
+	// Segundo pass: huérfanos del bucket extracted-txt (SPEC §6.5). Mismo
+	// umbral de edad y misma regla de referencia (doc.TxtRef).
+	purgedTXT, err := r.purgeOrphanTXT(ctx, validTxtKeys, threshold, dryRun, actions)
+	if err != nil {
+		return purged + purgedTXT, err
+	}
+
+	return purged + purgedTXT, nil
 }
 
 // purgeOrphanObjects implementa la purga efectiva. Se delega al adapter.
@@ -663,6 +695,48 @@ func (r *Reconciler) purgeOrphanObjects(ctx context.Context, validKeys map[strin
 		purged++
 		if !dryRun {
 			slog.Info("reconciler: objeto huérfano purgado",
+				"object_key", obj.Key,
+				"last_modified", obj.LastModified,
+			)
+		}
+	}
+
+	return purged, nil
+}
+
+// purgeOrphanTXT purga objetos del bucket extracted-txt sin documento que los
+// referencie (TxtRef) y más antiguos que el umbral. Espeja la semántica de
+// purgeOrphanObjects (mismo umbral, idempotencia y choke point de dry-run),
+// pero sobre el bucket de textos (SPEC §6.5).
+func (r *Reconciler) purgeOrphanTXT(ctx context.Context, validKeys map[string]bool, threshold time.Time, dryRun bool, actions *actionReport) (int, error) {
+	objects, err := r.storage.ListObjectsTXT(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("list txt objects: %w", err)
+	}
+
+	purged := 0
+	for _, obj := range objects {
+		// Ignorar entradas de prefijo (common prefixes) del listado.
+		if strings.HasSuffix(obj.Key, "/") {
+			continue
+		}
+		// No purgar si algún documento referencia el .txt.
+		if validKeys[obj.Key] {
+			continue
+		}
+		// No purgar si el objeto es más nuevo que el umbral.
+		if obj.LastModified.After(threshold) {
+			continue
+		}
+
+		if err := r.deleteTXTObject(ctx, actions, dryRun, obj.Key); err != nil {
+			slog.Error("reconciler: error purgando objeto huérfano txt",
+				"object_key", obj.Key, "error", err)
+			continue
+		}
+		purged++
+		if !dryRun {
+			slog.Info("reconciler: objeto huérfano txt purgado",
 				"object_key", obj.Key,
 				"last_modified", obj.LastModified,
 			)

@@ -111,6 +111,7 @@ type mockStorage struct {
 	listObjects    []ports.ObjectInfo
 	listObjectsTXT []ports.ObjectInfo
 	deleted        []string
+	deletedTXT     []string // purgas del bucket extracted-txt (T2, SPEC §6.5)
 }
 
 func newMockStorage() *mockStorage {
@@ -181,10 +182,7 @@ func (m *mockStorage) StatTXT(ctx context.Context, objectKey string) (ports.Obje
 }
 
 func (m *mockStorage) ListObjectsTXT(ctx context.Context) ([]ports.ObjectInfo, error) {
-	if m.listObjectsTXT != nil {
-		return m.listObjectsTXT, nil
-	}
-	return m.listObjects, nil
+	return m.listObjectsTXT, nil
 }
 
 func (m *mockStorage) GetRange(ctx context.Context, objectKey string, start, end int64) ([]byte, error) {
@@ -197,6 +195,12 @@ func (m *mockStorage) GetRange(ctx context.Context, objectKey string, start, end
 func (m *mockStorage) Delete(ctx context.Context, objectKey string) error {
 	m.deleted = append(m.deleted, objectKey)
 	delete(m.objects, objectKey)
+	return nil
+}
+
+func (m *mockStorage) DeleteTXT(ctx context.Context, objectKey string) error {
+	m.deletedTXT = append(m.deletedTXT, objectKey)
+	delete(m.txtObjects, objectKey)
 	return nil
 }
 
@@ -1184,6 +1188,125 @@ func TestSweepOrphans_SinObjetos_NoPurga(t *testing.T) {
 	}
 	if result.OrphansPurged != 0 {
 		t.Errorf("OrphansPurged = %d, want 0", result.OrphansPurged)
+	}
+}
+
+// --- Huérfanos en extracted-txt (T2, SPEC §6.5) ---
+
+// TestSweepOrphans_PurgaTxtHuerfano cubre el segundo pass sobre el bucket
+// extracted-txt: un objeto sin documento que lo referencie (TxtRef) y más
+// antiguo que el umbral se purga, mientras el txt referenciado y el huérfano
+// reciente quedan intactos. Espeja la semántica del pass de raw.
+func TestSweepOrphans_PurgaTxtHuerfano(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+
+	// Documento que referencia su .txt: no debe purgarse.
+	referenced := "extracted-txt/doc-1.txt"
+	repo.docs["doc-1"] = &domain.Document{
+		ID:        "doc-1",
+		Status:    domain.StatusCompleted,
+		ObjectKey: "raw-pdfs/doc-1.pdf",
+		TxtRef:    referenced,
+		CreatedAt: now.Add(-time.Hour),
+	}
+
+	storage.listObjectsTXT = []ports.ObjectInfo{
+		// Referenciado y antiguo → NO se borra.
+		{Key: referenced, LastModified: now.Add(-30 * 24 * time.Hour)},
+		// Huérfano antiguo (> 7 días) → SÍ se borra.
+		{Key: "extracted-txt/huerfano-viejo.txt", LastModified: now.Add(-30 * 24 * time.Hour)},
+		// Huérfano reciente (< 7 días) → NO se borra todavía.
+		{Key: "extracted-txt/huerfano-nuevo.txt", LastModified: now.Add(-time.Hour)},
+	}
+
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if result.OrphansPurged != 1 {
+		t.Fatalf("OrphansPurged = %d, want 1", result.OrphansPurged)
+	}
+	if len(storage.deletedTXT) != 1 || storage.deletedTXT[0] != "extracted-txt/huerfano-viejo.txt" {
+		t.Fatalf("deletedTXT = %v, want [extracted-txt/huerfano-viejo.txt]", storage.deletedTXT)
+	}
+	for _, k := range storage.deletedTXT {
+		if k == referenced {
+			t.Errorf("borró un txt referenciado por un documento: %s", k)
+		}
+	}
+	if len(storage.deleted) != 0 {
+		t.Errorf("deleted (raw) = %v, want vacío: el pass txt no debe tocar raw", storage.deleted)
+	}
+}
+
+// TestSweepOrphans_NoPurgaTxtReferenciado fija la garantía de seguridad: un
+// objeto de extracted-txt referenciado por cualquier documento (aunque sea
+// antiguo) jamás se borra.
+func TestSweepOrphans_NoPurgaTxtReferenciado(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+
+	referenced := "extracted-txt/doc-ref.txt"
+	repo.docs["doc-ref"] = &domain.Document{
+		ID:        "doc-ref",
+		Status:    domain.StatusCompleted,
+		ObjectKey: "raw-pdfs/doc-ref.pdf",
+		TxtRef:    referenced,
+		CreatedAt: now.Add(-time.Hour),
+	}
+	storage.listObjectsTXT = []ports.ObjectInfo{
+		{Key: referenced, LastModified: now.Add(-30 * 24 * time.Hour)},
+	}
+
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if result.OrphansPurged != 0 {
+		t.Errorf("OrphansPurged = %d, want 0 (txt referenciado)", result.OrphansPurged)
+	}
+	if len(storage.deletedTXT) != 0 {
+		t.Errorf("deletedTXT = %v, want vacío (txt referenciado)", storage.deletedTXT)
+	}
+}
+
+// TestSweepOrphans_DryRun_PlanificaTxtSinBorrar prueba que la purga de txt pasa
+// por el choke point de dry-run (deleteTXTObject): se planifica y cuenta, pero
+// no se ejecuta ningún borrado (SPEC §6.5, T1).
+func TestSweepOrphans_DryRun_PlanificaTxtSinBorrar(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+
+	storage.listObjectsTXT = []ports.ObjectInfo{
+		{Key: "extracted-txt/huerfano-dry.txt", LastModified: now.Add(-30 * 24 * time.Hour)},
+	}
+
+	r := New(repo, storage, nil, nil, &mockClock{now},
+		10*time.Minute, 30*time.Minute, 15*time.Minute, WithDryRun(true))
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if result.OrphansPurged != 1 {
+		t.Errorf("OrphansPurged = %d, want 1 (planificado)", result.OrphansPurged)
+	}
+	if len(storage.deletedTXT) != 0 {
+		t.Errorf("deletedTXT = %v, want 0 en dry-run", storage.deletedTXT)
+	}
+	if result.PlannedActions == 0 {
+		t.Error("PlannedActions = 0, want > 0 (el plan debe reportarse)")
+	}
+	if result.ExecutedActions != 0 {
+		t.Errorf("ExecutedActions = %d, want 0 en dry-run", result.ExecutedActions)
 	}
 }
 

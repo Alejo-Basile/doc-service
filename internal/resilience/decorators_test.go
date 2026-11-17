@@ -91,6 +91,11 @@ func (s *stubStorage) Delete(_ context.Context, _ string) error {
 	return s.err
 }
 
+func (s *stubStorage) DeleteTXT(_ context.Context, _ string) error {
+	s.calls = append(s.calls, "DeleteTXT")
+	return s.err
+}
+
 func (s *stubStorage) PresignGet(_ context.Context, _ string, _ time.Duration) (string, error) {
 	s.calls = append(s.calls, "PresignGet")
 	return s.url, s.err
@@ -192,6 +197,9 @@ func TestDecorators_ForwardResultsAndErrors(t *testing.T) {
 		if err := decorated.Delete(ctx, "raw-pdfs/doc-1.pdf"); err != nil {
 			t.Errorf("Delete: %v", err)
 		}
+		if err := decorated.DeleteTXT(ctx, "extracted-txt/doc-1.txt"); err != nil {
+			t.Errorf("DeleteTXT: %v", err)
+		}
 		if got, err := decorated.PresignGet(ctx, "raw-pdfs/doc-1.pdf", time.Minute); err != nil || got != "https://s3/get" {
 			t.Errorf("PresignGet: got (%q, %v), want (%q, nil)", got, err, "https://s3/get")
 		}
@@ -205,7 +213,7 @@ func TestDecorators_ForwardResultsAndErrors(t *testing.T) {
 			t.Errorf("ListObjectsTXT: got (%v, %v), want (mismo slice, nil)", got, err)
 		}
 
-		wantCalls := []string{"PresignPost", "Stat", "StatTXT", "GetRange", "Delete", "PresignGet", "PresignGetTXT", "ListObjects", "ListObjectsTXT"}
+		wantCalls := []string{"PresignPost", "Stat", "StatTXT", "GetRange", "Delete", "DeleteTXT", "PresignGet", "PresignGetTXT", "ListObjects", "ListObjectsTXT"}
 		if !equalStrings(inner.calls, wantCalls) {
 			t.Errorf("métodos invocados: %v, want %v", inner.calls, wantCalls)
 		}
@@ -279,6 +287,7 @@ func TestDecorators_AllMethodsRouteThroughBreaker(t *testing.T) {
 			{"StatTXT", func() error { _, err := decorated.StatTXT(ctx, "k"); return err }},
 			{"GetRange", func() error { _, err := decorated.GetRange(ctx, "k", 0, 1); return err }},
 			{"Delete", func() error { return decorated.Delete(ctx, "k") }},
+			{"DeleteTXT", func() error { return decorated.DeleteTXT(ctx, "k") }},
 			{"PresignGet", func() error { _, err := decorated.PresignGet(ctx, "k", time.Minute); return err }},
 			{"PresignGetTXT", func() error { _, err := decorated.PresignGetTXT(ctx, "k", time.Minute); return err }},
 			{"ListObjects", func() error { _, err := decorated.ListObjects(ctx); return err }},

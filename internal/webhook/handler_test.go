@@ -129,6 +129,8 @@ func (m *mockStorage) GetRange(ctx context.Context, objectKey string, start, end
 
 func (m *mockStorage) Delete(ctx context.Context, objectKey string) error { return nil }
 
+func (m *mockStorage) DeleteTXT(ctx context.Context, objectKey string) error { return nil }
+
 func (m *mockStorage) PresignGet(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
 	return "", nil
 }
