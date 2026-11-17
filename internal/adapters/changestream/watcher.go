@@ -232,6 +232,16 @@ func (w *Watcher) watchOnce(ctx context.Context) error {
 		"resumed", token != "",
 	)
 
+	// Stream fresco (primer arranque o token descartado): los eventos que ya
+	// ocurrieron no van a llegar por el Change Stream. Se recuperan los
+	// documentos que quedaron en UPLOADED; el relay es idempotente, asi que el
+	// solapamiento con el stream vivo no duplica trabajo real.
+	if token == "" {
+		if err := w.catchUp(ctx); err != nil {
+			return fmt.Errorf("catch-up: %w", err)
+		}
+	}
+
 	for stream.Next(ctx) {
 		var raw bson.M
 		if err := stream.Decode(&raw); err != nil {
@@ -333,22 +343,55 @@ func (w *Watcher) discardToken(ctx context.Context, cause error) error {
 	return errResumeTokenInvalid
 }
 
-// parseEvent extrae los campos relevantes del evento del Change Stream.
-func (w *Watcher) parseEvent(raw bson.M) (Event, error) {
-	// fullDocument puede venir como bson.M o bson.D según el decoder.
-	var fullDoc bson.M
-	switch fd := raw["fullDocument"].(type) {
-	case bson.M:
-		fullDoc = fd
-	case bson.D:
-		fullDoc = make(bson.M, len(fd))
-		for _, e := range fd {
-			fullDoc[e.Key] = e.Value
-		}
-	default:
-		return Event{}, fmt.Errorf("fullDocument no es un documento: %T", raw["fullDocument"])
+// catchUp procesa los documentos que ya están en UPLOADED cuando el stream
+// arranca sin resume token. Sin esto, descartar el token (p.ej. Mongo responde
+// "cannot resume stream") deja esos documentos sin relay hasta que el
+// reconciliador actúe minutos después.
+func (w *Watcher) catchUp(ctx context.Context) error {
+	cursor, err := w.coll.Find(ctx, bson.M{"status": "UPLOADED"})
+	if err != nil {
+		return fmt.Errorf("find UPLOADED: %w", err)
 	}
+	defer func() {
+		_ = cursor.Close(ctx)
+	}()
 
+	processed := 0
+	var firstErr error
+	for cursor.Next(ctx) {
+		var fullDoc bson.M
+		if err := cursor.Decode(&fullDoc); err != nil {
+			slog.Error("watcher: catch-up decode", "error", err)
+			continue
+		}
+		event := eventFromFullDoc(fullDoc)
+		if event.DocumentID == "" {
+			continue
+		}
+		processed++
+		if err := w.handler(ctx, event); err != nil {
+			slog.Error("watcher: catch-up no pudo procesar el documento",
+				"document_id", event.DocumentID,
+				"error", err,
+			)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	if err := cursor.Err(); err != nil {
+		return fmt.Errorf("catch-up cursor: %w", err)
+	}
+	if processed > 0 {
+		slog.Info("watcher: catch-up de documentos UPLOADED", "procesados", processed)
+	}
+	// Un fallo se propaga para que Run reintente con backoff; el catch-up es
+	// idempotente y volvera a procesar lo que haya quedado pendiente.
+	return firstErr
+}
+
+// eventFromFullDoc arma un Event a partir del documento completo de Mongo.
+func eventFromFullDoc(fullDoc bson.M) Event {
 	docID, _ := fullDoc["_id"].(string)
 	status, _ := fullDoc["status"].(string)
 	objectKey, _ := fullDoc["object_key"].(string)
@@ -366,23 +409,40 @@ func (w *Watcher) parseEvent(raw bson.M) (Event, error) {
 		schemaVersion = int(v)
 	}
 
-	var resumeToken bson.Raw
-	if rt, ok := raw["_id"].(bson.M); ok {
-		if data, ok := rt["data"]; ok {
-			if rawBytes, ok := data.(bson.Raw); ok {
-				resumeToken = rawBytes
-			}
-		}
-	}
-
 	return Event{
 		DocumentID:    docID,
 		Status:        status,
 		ObjectKey:     objectKey,
 		CorrelationID: corrID,
 		SchemaVersion: schemaVersion,
-		ResumeToken:   resumeToken,
-	}, nil
+	}
+}
+
+// parseEvent extrae los campos relevantes del evento del Change Stream.
+func (w *Watcher) parseEvent(raw bson.M) (Event, error) {
+	// fullDocument puede venir como bson.M o bson.D según el decoder.
+	var fullDoc bson.M
+	switch fd := raw["fullDocument"].(type) {
+	case bson.M:
+		fullDoc = fd
+	case bson.D:
+		fullDoc = make(bson.M, len(fd))
+		for _, e := range fd {
+			fullDoc[e.Key] = e.Value
+		}
+	default:
+		return Event{}, fmt.Errorf("fullDocument no es un documento: %T", raw["fullDocument"])
+	}
+
+	event := eventFromFullDoc(fullDoc)
+	if rt, ok := raw["_id"].(bson.M); ok {
+		if data, ok := rt["data"]; ok {
+			if rawBytes, ok := data.(bson.Raw); ok {
+				event.ResumeToken = rawBytes
+			}
+		}
+	}
+	return event, nil
 }
 
 // tokenToString serializa un resume token bson.Raw a string JSON.
