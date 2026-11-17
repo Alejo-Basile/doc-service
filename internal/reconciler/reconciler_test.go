@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -741,6 +742,254 @@ func TestRegisterRoutes_ReconcileRequiereToken(t *testing.T) {
 	}
 	if w := do(token); w.Code != http.StatusOK {
 		t.Fatalf("token válido: status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+}
+
+// --- Modo dry-run (SPEC §6.5, T1) ---
+
+// TestRunOnce_DryRun_DetectaPeroNoMuta cubre el contrato central del dry-run:
+// la corrida detecta igual que en modo normal (contenedores del Result en
+// verde) pero no ejecuta NINGUNA mutación: 0 updates, 0 enqueues, 0 deletes.
+// El reporte debe distinguir acciones planificadas de ejecutadas.
+func TestRunOnce_DryRun_DetectaPeroNoMuta(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+
+	// 1) PENDING_UPLOAD vencido sin objeto → planifica UPLOAD_EXPIRED.
+	repo.docs["doc-expired"] = &domain.Document{
+		ID:        "doc-expired",
+		Status:    domain.StatusPendingUpload,
+		ObjectKey: "raw-pdfs/doc-expired.pdf",
+		ExpiresAt: now.Add(-time.Hour),
+		CreatedAt: now.Add(-2 * time.Hour),
+	}
+	// 2) PENDING_UPLOAD vencido con PDF válido → planifica UPLOADED.
+	repo.docs["doc-recover"] = &domain.Document{
+		ID:        "doc-recover",
+		Status:    domain.StatusPendingUpload,
+		ObjectKey: "raw-pdfs/doc-recover.pdf",
+		ExpiresAt: now.Add(-time.Hour),
+		CreatedAt: now.Add(-2 * time.Hour),
+	}
+	storage.objects["raw-pdfs/doc-recover.pdf"] = true
+	// 3) UPLOADED estancado con objeto → planifica QUEUED + Enqueue.
+	repo.docs["doc-uploaded"] = &domain.Document{
+		ID:        "doc-uploaded",
+		Status:    domain.StatusUploaded,
+		ObjectKey: "raw-pdfs/doc-uploaded.pdf",
+		CreatedAt: now.Add(-2 * time.Hour),
+		UpdatedAt: now.Add(-2 * time.Hour),
+	}
+	storage.objects["raw-pdfs/doc-uploaded.pdf"] = true
+	// 4) QUEUED estancado → planifica Enqueue (sin transición).
+	repo.docs["doc-queued"] = &domain.Document{
+		ID:        "doc-queued",
+		Status:    domain.StatusQueued,
+		ObjectKey: "raw-pdfs/doc-queued.pdf",
+		CreatedAt: now.Add(-2 * time.Hour),
+		UpdatedAt: now.Add(-2 * time.Hour),
+	}
+	// 5) Huérfano antiguo en MinIO → planifica Delete.
+	storage.listObjects = []ports.ObjectInfo{
+		{Key: "raw-pdfs/huerfano-viejo.pdf", LastModified: now.Add(-30 * 24 * time.Hour)},
+	}
+
+	r := New(repo, storage, queue, nil, &mockClock{now},
+		10*time.Minute, 30*time.Minute, 15*time.Minute, WithDryRun(true))
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	// Detección intacta: los contadores reportan lo que se habría hecho.
+	if result.ExpiredPending != 1 || result.RecoveredUploaded != 1 {
+		t.Errorf("detección PENDING_UPLOAD = (expired %d, recovered %d), want (1, 1)",
+			result.ExpiredPending, result.RecoveredUploaded)
+	}
+	if result.Reenqueued != 2 {
+		t.Errorf("Reenqueued = %d, want 2 (UPLOADED + QUEUED estancados)", result.Reenqueued)
+	}
+	if result.OrphansPurged != 1 {
+		t.Errorf("OrphansPurged = %d, want 1 (huérfano antiguo detectado)", result.OrphansPurged)
+	}
+
+	// Cero mutaciones.
+	if len(repo.updateCalls) != 0 {
+		t.Errorf("updateCalls = %+v, want 0 en dry-run", repo.updateCalls)
+	}
+	if len(queue.enqueued) != 0 {
+		t.Errorf("enqueued = %d, want 0 en dry-run", len(queue.enqueued))
+	}
+	if len(storage.deleted) != 0 {
+		t.Errorf("deleted = %v, want 0 en dry-run", storage.deleted)
+	}
+
+	// Reporte planificado vs ejecutado.
+	if !result.DryRun {
+		t.Error("DryRun = false en el reporte, want true")
+	}
+	if result.PlannedActions == 0 {
+		t.Error("PlannedActions = 0, want > 0 (el plan debe reportarse)")
+	}
+	if result.ExecutedActions != 0 {
+		t.Errorf("ExecutedActions = %d, want 0 en dry-run", result.ExecutedActions)
+	}
+
+	// Los documentos quedan exactamente como estaban.
+	if doc := repo.docs["doc-expired"]; doc.Status != domain.StatusPendingUpload {
+		t.Errorf("doc-expired status = %s, want PENDING_UPLOAD (intacto)", doc.Status)
+	}
+	if doc := repo.docs["doc-uploaded"]; doc.Status != domain.StatusUploaded {
+		t.Errorf("doc-uploaded status = %s, want UPLOADED (intacto)", doc.Status)
+	}
+}
+
+// TestRunOnce_ModoEjecucion_ReportaPlanificadoYEjecutado fija el otro lado del
+// contrato: sin dry-run, el reporte cuenta las acciones efectivamente ejecutadas.
+func TestRunOnce_ModoEjecucion_ReportaPlanificadoYEjecutado(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+
+	doc := &domain.Document{
+		ID:        "doc-uploaded",
+		Status:    domain.StatusUploaded,
+		ObjectKey: "raw-pdfs/doc-uploaded.pdf",
+		CreatedAt: now.Add(-2 * time.Hour),
+		UpdatedAt: now.Add(-2 * time.Hour),
+	}
+	repo.docs["doc-uploaded"] = doc
+	storage.objects[doc.ObjectKey] = true
+
+	r := New(repo, storage, queue, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if result.DryRun {
+		t.Error("DryRun = true sin configurarlo")
+	}
+	// Transición UPLOADED→QUEUED + un Enqueue.
+	if result.PlannedActions != 2 {
+		t.Errorf("PlannedActions = %d, want 2 (transición + enqueue)", result.PlannedActions)
+	}
+	if result.ExecutedActions != 2 {
+		t.Errorf("ExecutedActions = %d, want 2 (ambas acciones se ejecutaron)", result.ExecutedActions)
+	}
+	if doc.Status != domain.StatusQueued || len(queue.enqueued) != 1 {
+		t.Errorf("estado/encolado = (%s, %d), want (QUEUED, 1)", doc.Status, len(queue.enqueued))
+	}
+}
+
+// TestRegisterRoutes_ReconcileDryRunOverride verifica que ?dry_run=1 fuerza el
+// modo planificado aunque la config esté en modo ejecución, y que la respuesta
+// serializa el reporte (dry_run + contadores).
+func TestRegisterRoutes_ReconcileDryRunOverride(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const token = "internal-test-token"
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+	repo.docs["doc-expired"] = &domain.Document{
+		ID:        "doc-expired",
+		Status:    domain.StatusPendingUpload,
+		ObjectKey: "raw-pdfs/doc-expired.pdf",
+		ExpiresAt: now.Add(-time.Hour),
+		CreatedAt: now.Add(-2 * time.Hour),
+	}
+
+	// Config en modo ejecución (DryRun=false): el query param debe ganar.
+	r := New(repo, storage, queue, nil, &mockClock{now},
+		10*time.Minute, 30*time.Minute, 15*time.Minute, WithInternalToken(token))
+	engine := gin.New()
+	r.RegisterRoutes(engine)
+
+	req := httptest.NewRequest(http.MethodPost, "/internal/reconcile?dry_run=1", nil)
+	req.Header.Set("X-Internal-Token", token)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	if len(repo.updateCalls) != 0 {
+		t.Errorf("updateCalls = %+v, want 0 con ?dry_run=1", repo.updateCalls)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"dry_run":true`) {
+		t.Errorf("respuesta sin dry_run=true: %s", body)
+	}
+	if !strings.Contains(body, `"planned_actions"`) {
+		t.Errorf("respuesta sin planned_actions: %s", body)
+	}
+}
+
+// TestRegisterRoutes_ReconcileDryRunOverrideFalse verifica que ?dry_run=0
+// desactiva el dry-run configurado para esa invocación (override en ambos sentidos).
+func TestRegisterRoutes_ReconcileDryRunOverrideFalse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const token = "internal-test-token"
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	repo.docs["doc-expired"] = &domain.Document{
+		ID:        "doc-expired",
+		Status:    domain.StatusPendingUpload,
+		ObjectKey: "raw-pdfs/doc-expired.pdf",
+		ExpiresAt: now.Add(-time.Hour),
+		CreatedAt: now.Add(-2 * time.Hour),
+	}
+
+	r := New(repo, storage, nil, nil, &mockClock{now},
+		10*time.Minute, 30*time.Minute, 15*time.Minute,
+		WithInternalToken(token), WithDryRun(true))
+	engine := gin.New()
+	r.RegisterRoutes(engine)
+
+	req := httptest.NewRequest(http.MethodPost, "/internal/reconcile?dry_run=0", nil)
+	req.Header.Set("X-Internal-Token", token)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	if len(repo.updateCalls) != 1 {
+		t.Errorf("updateCalls = %+v, want 1 con ?dry_run=0", repo.updateCalls)
+	}
+	if repo.docs["doc-expired"].Status != domain.StatusUploadExpired {
+		t.Errorf("status = %s, want UPLOAD_EXPIRED (?dry_run=0 ejecuta)", repo.docs["doc-expired"].Status)
+	}
+}
+
+// TestRegisterRoutes_ReconcileDryRunInvalido verifica que un valor no booleano
+// de ?dry_run se rechaza con 400 en vez de caer silenciosamente al modo configurado.
+func TestRegisterRoutes_ReconcileDryRunInvalido(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const token = "internal-test-token"
+
+	repo := newMockRepo()
+	storage := newMockStorage()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	r := New(repo, storage, nil, nil, &mockClock{now},
+		10*time.Minute, 30*time.Minute, 15*time.Minute, WithInternalToken(token))
+	engine := gin.New()
+	r.RegisterRoutes(engine)
+
+	req := httptest.NewRequest(http.MethodPost, "/internal/reconcile?dry_run=quizas", nil)
+	req.Header.Set("X-Internal-Token", token)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body.String())
 	}
 }
 

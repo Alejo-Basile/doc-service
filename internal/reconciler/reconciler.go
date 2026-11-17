@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,6 +41,7 @@ type Reconciler struct {
 	stuckAfter    time.Duration // umbral para UPLOADED estancados / reencolado
 	minSafetyAge  time.Duration // edad mínima: documentos más jóvenes nunca se tocan (S6-P2-02)
 	internalToken string        // token compartido para proteger el endpoint manual (SPEC §9)
+	dryRun        bool          // modo planificado: detecta y loguea, no muta nada (SPEC §6.5)
 }
 
 // Option configura un Reconciler en construcción (functional options).
@@ -49,6 +51,12 @@ type Option func(*Reconciler)
 // con el token compartido de los endpoints internos (SPEC §9).
 func WithInternalToken(token string) Option {
 	return func(r *Reconciler) { r.internalToken = token }
+}
+
+// WithDryRun activa el modo dry-run: todas las acciones destructivas se
+// planifican y loguean, pero ninguna se ejecuta (SPEC §6.5).
+func WithDryRun(enabled bool) Option {
+	return func(r *Reconciler) { r.dryRun = enabled }
 }
 
 // New crea un Reconciler con dependencias inyectadas.
@@ -92,7 +100,18 @@ func (r *Reconciler) RegisterRoutes(engine *gin.Engine) {
 	internal := engine.Group("/internal")
 	internal.Use(httpserver.InternalTokenMiddleware(r.internalToken))
 	internal.POST("/reconcile", func(c *gin.Context) {
-		result, err := r.RunOnce(c.Request.Context())
+		dryRun := r.dryRun
+		if raw, ok := c.GetQuery("dry_run"); ok {
+			v, err := strconv.ParseBool(raw)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": "parámetro dry_run inválido: usar true/false (o 1/0)",
+				})
+				return
+			}
+			dryRun = v // override puntual del modo configurado
+		}
+		result, err := r.runOnce(c.Request.Context(), dryRun)
 		if err != nil {
 			c.JSON(500, gin.H{"error": err.Error()})
 			return
@@ -125,6 +144,12 @@ type Result struct {
 	Errors            int               `json:"errors"`
 	LockAcquired      bool              `json:"lock_acquired"`
 	CrossCheckReport  *CrossCheckReport `json:"cross_check,omitempty"` // S6-P2-01
+	// DryRun indica que la corrida solo planificó. PlannedActions cuenta las
+	// acciones que el sweep propuso y ExecutedActions las que se aplicaron
+	// (en dry-run queda siempre en 0, SPEC §6.5, T1).
+	DryRun          bool `json:"dry_run"`
+	PlannedActions  int  `json:"planned_actions"`
+	ExecutedActions int  `json:"executed_actions"`
 }
 
 // CrossCheckReport resume la verificación cruzada MongoDB ↔ MinIO ↔ Redis (S6-P2-01).
@@ -154,6 +179,7 @@ func (r *Reconciler) Start(ctx context.Context) {
 	slog.Info("reconciler iniciado",
 		"interval", r.interval.String(),
 		"stuck_after", r.stuckAfter.String(),
+		"dry_run", r.dryRun,
 	)
 
 	ticker := time.NewTicker(r.interval)
@@ -189,7 +215,15 @@ func (r *Reconciler) Start(ctx context.Context) {
 // RunOnce ejecuta un sweep completo y devuelve el resultado.
 // Si hay lease configurado y no se puede adquirir, retorna resultado vacío sin error.
 func (r *Reconciler) RunOnce(ctx context.Context) (*Result, error) {
-	result := &Result{}
+	return r.runOnce(ctx, r.dryRun)
+}
+
+// runOnce implementa el sweep con el modo (dry-run o ejecución) resuelto por el
+// llamador: el loop periódico usa el configurado y el endpoint manual permite
+// override por invocación (SPEC §6.5).
+func (r *Reconciler) runOnce(ctx context.Context, dryRun bool) (*Result, error) {
+	result := &Result{DryRun: dryRun}
+	actions := &actionReport{}
 	now := r.clock.Now()
 
 	// Bloqueo distribuido (S4-P2-03): evitar ejecución concurrente entre réplicas.
@@ -211,7 +245,7 @@ func (r *Reconciler) RunOnce(ctx context.Context) (*Result, error) {
 	}
 
 	// 1. Documentos PENDING_UPLOAD con expires_at vencido.
-	expiredPending, err := r.sweepExpiredPending(ctx, now)
+	expiredPending, err := r.sweepExpiredPending(ctx, now, dryRun, actions)
 	if err != nil {
 		return nil, fmt.Errorf("sweep expired pending: %w", err)
 	}
@@ -219,14 +253,14 @@ func (r *Reconciler) RunOnce(ctx context.Context) (*Result, error) {
 	result.RecoveredUploaded = expiredPending.recovered
 
 	// 2. Documentos UPLOADED estancados → transición + reencolar (S4-P2-01/07).
-	reenqueued, err := r.sweepStuckUploaded(ctx, now)
+	reenqueued, err := r.sweepStuckUploaded(ctx, now, dryRun, actions)
 	if err != nil {
 		return nil, fmt.Errorf("sweep stuck uploaded: %w", err)
 	}
 	result.Reenqueued = reenqueued
 
 	// 2b. Documentos QUEUED estancados → reencolar sin cambiar estado (cierra ventana de crash).
-	reenqueued2, err := r.sweepStuckQueued(ctx, now)
+	reenqueued2, err := r.sweepStuckQueued(ctx, now, dryRun, actions)
 	if err != nil {
 		return nil, fmt.Errorf("sweep stuck queued: %w", err)
 	}
@@ -240,7 +274,7 @@ func (r *Reconciler) RunOnce(ctx context.Context) (*Result, error) {
 	result.StuckDetected = stuck
 
 	// 4. Purga de objetos huérfanos en MinIO (S4-P2-02).
-	orphans, err := r.sweepOrphans(ctx, now)
+	orphans, err := r.sweepOrphans(ctx, now, dryRun, actions)
 	if err != nil {
 		slog.Warn("reconciler: sweep orphans falló (no crítico)", "error", err)
 	}
@@ -260,7 +294,81 @@ func (r *Reconciler) RunOnce(ctx context.Context) (*Result, error) {
 	}
 	result.CrossCheckReport = report
 
+	result.PlannedActions = actions.planned
+	result.ExecutedActions = actions.executed
+	if dryRun && actions.planned > 0 {
+		slog.Info("reconciler: dry-run completado (ninguna mutación ejecutada)",
+			"planned_actions", actions.planned,
+		)
+	}
+
 	return result, nil
+}
+
+// actionReport acumula las acciones planificadas por el sweep y cuántas se
+// ejecutaron de verdad (en dry-run todas quedan planificadas).
+type actionReport struct {
+	planned  int
+	executed int
+}
+
+// updateStatusWithHistory ejecuta la transición condicional (con historial) o,
+// en dry-run, solo la registra como acción planificada (SPEC §6.5).
+// Devuelve true en dry-run para que el plan incluya las acciones en cascada.
+func (r *Reconciler) updateStatusWithHistory(
+	ctx context.Context, actions *actionReport, dryRun bool,
+	id string, from, to domain.Status, entry domain.StatusEntry, extraSet map[string]any,
+) (bool, error) {
+	actions.planned++
+	if dryRun {
+		slog.Info("reconciler: acción planificada (dry-run)",
+			"action", "update_status",
+			"document_id", id,
+			"from", from,
+			"to", to,
+		)
+		return true, nil
+	}
+	ok, err := r.repo.UpdateStatusWithHistory(ctx, id, from, to, entry, extraSet)
+	if err == nil && ok {
+		actions.executed++
+	}
+	return ok, err
+}
+
+// enqueue encola el mensaje de trabajo o, en dry-run, solo lo planifica.
+func (r *Reconciler) enqueue(ctx context.Context, actions *actionReport, dryRun bool, msg ports.WorkMessage) error {
+	actions.planned++
+	if dryRun {
+		slog.Info("reconciler: acción planificada (dry-run)",
+			"action", "enqueue",
+			"document_id", msg.DocumentID,
+			"object_key", msg.ObjectKey,
+		)
+		return nil
+	}
+	if err := r.queue.Enqueue(ctx, msg); err != nil {
+		return err
+	}
+	actions.executed++
+	return nil
+}
+
+// deleteObject purga el objeto o, en dry-run, solo lo planifica.
+func (r *Reconciler) deleteObject(ctx context.Context, actions *actionReport, dryRun bool, objectKey string) error {
+	actions.planned++
+	if dryRun {
+		slog.Info("reconciler: acción planificada (dry-run)",
+			"action", "delete_object",
+			"object_key", objectKey,
+		)
+		return nil
+	}
+	if err := r.storage.Delete(ctx, objectKey); err != nil {
+		return err
+	}
+	actions.executed++
+	return nil
 }
 
 // sweepResult acumula contadores de un sweep parcial.
@@ -271,7 +379,7 @@ type sweepResult struct {
 
 // sweepExpiredPending busca documentos PENDING_UPLOAD vencidos y actúa.
 // Respeta el umbral de seguridad: documentos más jóvenes que minSafetyAge no se tocan.
-func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time) (*sweepResult, error) {
+func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time, dryRun bool, actions *actionReport) (*sweepResult, error) {
 	result := &sweepResult{}
 
 	docs, _, err := r.repo.List(ctx, ports.ListFilter{
@@ -300,7 +408,7 @@ func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time) (*s
 
 		if exists {
 			// Objeto existe pero el webhook no llegó: recuperar → UPLOADED.
-			recovered, err := r.validateAndRecover(ctx, doc)
+			recovered, err := r.validateAndRecover(ctx, doc, actions, dryRun)
 			if err != nil {
 				slog.Error("reconciler: error validando/recuperando",
 					"document_id", doc.ID, "error", err)
@@ -308,12 +416,14 @@ func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time) (*s
 			}
 			if recovered {
 				result.recovered++
-				slog.Info("reconciler: documento recuperado (webhook perdido)",
-					"document_id", doc.ID, "object_key", doc.ObjectKey)
+				if !dryRun {
+					slog.Info("reconciler: documento recuperado (webhook perdido)",
+						"document_id", doc.ID, "object_key", doc.ObjectKey)
+				}
 			}
 		} else {
 			// Objeto no existe → UPLOAD_EXPIRED.
-			ok, err := r.repo.UpdateStatusWithHistory(ctx, doc.ID,
+			ok, err := r.updateStatusWithHistory(ctx, actions, dryRun, doc.ID,
 				domain.StatusPendingUpload, domain.StatusUploadExpired,
 				domain.StatusEntry{
 					Status:        domain.StatusUploadExpired,
@@ -330,8 +440,10 @@ func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time) (*s
 			}
 			if ok {
 				result.expired++
-				slog.Info("reconciler: documento expirado (objeto no encontrado)",
-					"document_id", doc.ID)
+				if !dryRun {
+					slog.Info("reconciler: documento expirado (objeto no encontrado)",
+						"document_id", doc.ID)
+				}
 			}
 		}
 	}
@@ -341,7 +453,7 @@ func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time) (*s
 
 // sweepStuckUploaded busca documentos UPLOADED estancados cuyo objeto exista
 // y los reencola a Redis Streams (S4-P2-01/07).
-func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time) (int, error) {
+func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time, dryRun bool, actions *actionReport) (int, error) {
 	if r.queue == nil {
 		return 0, nil // sin queue configurado
 	}
@@ -376,7 +488,7 @@ func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time) (int
 		}
 		if !exists {
 			// Objeto no existe: marcar FAILED con causa normalizada.
-			_, _ = r.repo.UpdateStatusWithHistory(ctx, doc.ID,
+			_, _ = r.updateStatusWithHistory(ctx, actions, dryRun, doc.ID,
 				domain.StatusUploaded, domain.StatusFailed,
 				domain.StatusEntry{
 					Status:        domain.StatusFailed,
@@ -390,7 +502,7 @@ func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time) (int
 		}
 
 		// Invariante de orden: transicionar UPLOADED → QUEUED PRIMERO, luego XADD.
-		ok, err := r.repo.UpdateStatusWithHistory(ctx, doc.ID,
+		ok, err := r.updateStatusWithHistory(ctx, actions, dryRun, doc.ID,
 			domain.StatusUploaded, domain.StatusQueued,
 			domain.StatusEntry{
 				Status:        domain.StatusQueued,
@@ -417,14 +529,16 @@ func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time) (int
 			EnqueuedAt:    now.Format(time.RFC3339),
 			SchemaVersion: doc.SchemaVersion,
 		}
-		if err := r.queue.Enqueue(ctx, msg); err != nil {
+		if err := r.enqueue(ctx, actions, dryRun, msg); err != nil {
 			slog.Error("reconciler: error reencolando documento",
 				"document_id", doc.ID, "error", err)
 			continue
 		}
 		reenqueued++
-		slog.Info("reconciler: documento reencolado (UPLOADED estancado)",
-			"document_id", doc.ID, "object_key", doc.ObjectKey)
+		if !dryRun {
+			slog.Info("reconciler: documento reencolado (UPLOADED estancado)",
+				"document_id", doc.ID, "object_key", doc.ObjectKey)
+		}
 	}
 
 	return reenqueued, nil
@@ -432,7 +546,7 @@ func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time) (int
 
 // sweepStuckQueued reencola documentos QUEUED cuyo mensaje pudo haberse perdido
 // (crash entre transición y XADD, o ACK espurio). No cambia el estado.
-func (r *Reconciler) sweepStuckQueued(ctx context.Context, now time.Time) (int, error) {
+func (r *Reconciler) sweepStuckQueued(ctx context.Context, now time.Time, dryRun bool, actions *actionReport) (int, error) {
 	if r.queue == nil {
 		return 0, nil
 	}
@@ -464,7 +578,7 @@ func (r *Reconciler) sweepStuckQueued(ctx context.Context, now time.Time) (int, 
 			EnqueuedAt:    now.Format(time.RFC3339),
 			SchemaVersion: doc.SchemaVersion,
 		}
-		if err := r.queue.Enqueue(ctx, msg); err != nil {
+		if err := r.enqueue(ctx, actions, dryRun, msg); err != nil {
 			slog.Error("reconciler: error reencolando QUEUED",
 				"document_id", doc.ID, "error", err)
 			continue
@@ -477,7 +591,7 @@ func (r *Reconciler) sweepStuckQueued(ctx context.Context, now time.Time) (int, 
 // sweepOrphans purga objetos en MinIO que no tengan documento asociado
 // y que sean más antiguos que el umbral (S4-P2-02).
 // Nunca borra documentos de MongoDB (SPEC).
-func (r *Reconciler) sweepOrphans(ctx context.Context, now time.Time) (int, error) {
+func (r *Reconciler) sweepOrphans(ctx context.Context, now time.Time, dryRun bool, actions *actionReport) (int, error) {
 	// Umbral conservador: 7 días. Los objetos de documentos activos
 	// nunca alcanzan esta antigüedad porque los documentos tienen su propio TTL.
 	threshold := now.Add(-7 * 24 * time.Hour)
@@ -500,7 +614,7 @@ func (r *Reconciler) sweepOrphans(ctx context.Context, now time.Time) (int, erro
 	// Nota: esto requiere un método ListObjects en ObjectStorage.
 	// Por ahora, la implementación del adapter MinIO debe proveerlo.
 	// Se retorna 0 si el storage no soporta listado.
-	purged, err := r.purgeOrphanObjects(ctx, validKeys, threshold)
+	purged, err := r.purgeOrphanObjects(ctx, validKeys, threshold, dryRun, actions)
 	if err != nil {
 		return purged, err
 	}
@@ -509,7 +623,7 @@ func (r *Reconciler) sweepOrphans(ctx context.Context, now time.Time) (int, erro
 }
 
 // purgeOrphanObjects implementa la purga efectiva. Se delega al adapter.
-func (r *Reconciler) purgeOrphanObjects(ctx context.Context, validKeys map[string]bool, threshold time.Time) (int, error) {
+func (r *Reconciler) purgeOrphanObjects(ctx context.Context, validKeys map[string]bool, threshold time.Time, dryRun bool, actions *actionReport) (int, error) {
 	// Usar el adapter de MinIO si implementa ListObjects.
 	// Como el puerto ObjectStorage no lo tiene todavía, usamos una aserción.
 	type lister interface {
@@ -541,16 +655,18 @@ func (r *Reconciler) purgeOrphanObjects(ctx context.Context, validKeys map[strin
 			continue
 		}
 
-		if err := r.storage.Delete(ctx, obj.Key); err != nil {
+		if err := r.deleteObject(ctx, actions, dryRun, obj.Key); err != nil {
 			slog.Error("reconciler: error purgando objeto huérfano",
 				"object_key", obj.Key, "error", err)
 			continue
 		}
 		purged++
-		slog.Info("reconciler: objeto huérfano purgado",
-			"object_key", obj.Key,
-			"last_modified", obj.LastModified,
-		)
+		if !dryRun {
+			slog.Info("reconciler: objeto huérfano purgado",
+				"object_key", obj.Key,
+				"last_modified", obj.LastModified,
+			)
+		}
 	}
 
 	return purged, nil
@@ -558,14 +674,14 @@ func (r *Reconciler) purgeOrphanObjects(ctx context.Context, validKeys map[strin
 
 // validateAndRecover verifica el PDF y transiciona PENDING_UPLOAD → UPLOADED.
 // Devuelve (true, nil) si se recuperó; (false, nil) si el PDF era inválido (REJECTED).
-func (r *Reconciler) validateAndRecover(ctx context.Context, doc *domain.Document) (bool, error) {
+func (r *Reconciler) validateAndRecover(ctx context.Context, doc *domain.Document, actions *actionReport, dryRun bool) (bool, error) {
 	data, err := r.storage.GetRange(ctx, doc.ObjectKey, 0, 5)
 	if err != nil {
 		return false, fmt.Errorf("get range: %w", err)
 	}
 
 	if len(data) < 5 || string(data[:5]) != "%PDF-" {
-		_, err := r.repo.UpdateStatusWithHistory(ctx, doc.ID,
+		_, err := r.updateStatusWithHistory(ctx, actions, dryRun, doc.ID,
 			domain.StatusPendingUpload, domain.StatusRejected,
 			domain.StatusEntry{
 				Status:        domain.StatusRejected,
@@ -578,7 +694,7 @@ func (r *Reconciler) validateAndRecover(ctx context.Context, doc *domain.Documen
 		return false, err
 	}
 
-	_, err = r.repo.UpdateStatusWithHistory(ctx, doc.ID,
+	_, err = r.updateStatusWithHistory(ctx, actions, dryRun, doc.ID,
 		domain.StatusPendingUpload, domain.StatusUploaded,
 		domain.StatusEntry{
 			Status:        domain.StatusUploaded,
