@@ -107,9 +107,9 @@ Reglas de la fase:
 
 ### Fase 5 — Verificación E2E y cierre
 
-- [ ] T5.1 Suite de integración con servicios (Mongo **replica set**, Redis, MinIO) según `AGENTS.md`
-- [ ] T5.2 E2E chain (si se restaura `tests/e2e/chain`): `md_ref` no vacío, `.md` presente en `extracted-md`, descarga OK
-- [ ] T5.3 Actualizar `docs/ESTADO.md` (avance, PRs, bloqueos, próxima tarea)
+- [x] T5.1 Suite de integración con servicios (Mongo **replica set**, Redis, MinIO) según `AGENTS.md` — 6/6 paquetes ok en local con Docker (mongo:7 --replSet rs0, redis:7, bitnamilegacy/minio)
+- [ ] T5.2 E2E chain (si se restaura `tests/e2e/chain`): `md_ref` no vacío, `.md` presente en `extracted-md`, descarga OK — **pendiente**: `tests/e2e/` no existe en el repo (requiere infraestructura + worker)
+- [x] T5.3 Actualizar `docs/ESTADO.md` (avance, PRs, bloqueos, próxima tarea)
 
 ## 5. Entrega
 
@@ -139,6 +139,11 @@ go test -race -count=1 $PKGS
 - Fase 5 agrega la verificación E2E con servicios reales.
 
 ## Registro de progreso
+
+- 2026-11-17: Fase 5 (verificación) — suite de integración completa en verde en local (Docker:
+  Mongo réplica-set + Redis + MinIO): mongo, changestream, relay, redis, minio, metrics 6/6 ok.
+  Suite hermética 12/12 ok. T5.2 (E2E) pendiente: `tests/e2e/` no existe; requiere worker +
+  infraestructura. Fases 1-3 completas, Fase 4 con T4.1/T4.2 pendientes de coordinación externa.
 
 - 2026-11-17: Fase 4 (contrato con extraction-worker) — T4.3/T4.4 verificados en código (sin
   cambios), T4.5 decidido (se conserva `TXT_REF_MISSING`), T4.1/T4.2 pendientes de coordinación

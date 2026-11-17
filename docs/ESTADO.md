@@ -107,10 +107,20 @@ Variables de config propias: `MONGO_URI`, `MONGO_MAX_POOL`, `MONGO_TIMEOUT_MS`, 
 - **D5 decidida por el usuario (2026-11-17)**: compatibilidad de lectura con **read-fallback**
   (`md_ref` primero; si falta, `txt_ref` legacy con su bucket correspondiente). Escrituras nuevas
   solo `md_ref`; objetos TXT históricos intactos. Ver `docs/design/legacy-txt-fallback.md`.
-- **Pendiente en `cambiomd.md`**: Fase 3 (implementar el fallback + tests), Fase 4 (contrato con
-  `extraction-worker` — el worker todavía NO genera Markdown — + bucket `extracted-md` en infra +
-  T4.5 `TXT_REF_MISSING`), Fase 5 (integración + E2E).
-  **Próxima tarea**: implementar Fase 3 de `cambiomd.md`.
+- **Fase 3 de `cambiomd.md` COMPLETA** (commit `d04a8bb`): read-fallback implementado —
+  `ExtractedRef()` (md_ref primero, txt_ref legacy si falta), `StatLegacyTXT`/`PresignGetLegacyTXT`
+  solo lectura (el puerto no expone delete/list del bucket legacy: los objetos TXT históricos
+  jamás se tocan), fallback en `DownloadDocument` y verificaciones COMPLETED del reconciliador,
+  `MINIO_LEGACY_BUCKET_TXT` (default `extracted-txt`). TDD RED→GREEN observado. Runbook de retiro:
+  `docs/design/legacy-txt-fallback.md`.
+- **Fase 4** (commit `58c15fc`): contrato propuesto en `docs/design/contrato-extraction-worker.md`.
+  T4.3/T4.4 verificados en código (sin cambios). T4.5: se conserva `TXT_REF_MISSING` (compartido
+  con el worker; renombrar es breaking). T4.1 pendiente P3 (worker) y T4.2 pendiente P1 (bucket
+  `extracted-md` en infra) — sin bloqueo para doc-service. **No se asume que el worker ya genera
+  Markdown.**
+- **Fase 5**: integración 6/6 ok en local (Docker: Mongo réplica-set + Redis + MinIO); hermética
+  12/12 ok. T5.2 (E2E) pendiente: `tests/e2e/` no existe.
+  **Próxima tarea**: coordinar T4.1/T4.2 con P3/P1, o prioridades 3/4 de `tareas-revision.md`.
 
 ### Cambios de esta sesión (2026-11-17) — Reconciliador P2 (SPEC §6.5)
 - **Prioridad 2 de `tareas-revision.md` completa** en la rama `feat/reconciliador-p2` (base `26199f8` = `main`
