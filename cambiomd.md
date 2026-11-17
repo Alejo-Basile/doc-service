@@ -99,11 +99,11 @@ Reglas de la fase:
 
 ### Fase 4 — Contrato con `extraction-worker` e infra
 
-- [ ] T4.1 Verificar que el worker escribe `md_ref` = `extracted-md/<id>.md` al marcar `PROCESSING→COMPLETED` (ADR-0006)
-- [ ] T4.2 Infra (repo `infra`, no desde acá): crear bucket `extracted-md` con política equivalente a `extracted-txt` (escritura solo worker, lectura doc-service y descarga)
-- [ ] T4.3 Mensaje de cola: sin cambios de forma; `schema_version` se mantiene (documentar en el PR)
-- [ ] T4.4 Webhook MinIO: sigue filtrando solo `raw-pdfs`; sin cambios de código
-- [ ] T4.5 Failure-reason `TXT_REF_MISSING` (`FailureReasonTxtMissing` en `internal/domain/document.go`): valor persistido en Mongo/API y compartido con el worker. Decidir con el worker si pasa a `MD_REF_MISSING` (con compat para valores legacy) o se conserva el código histórico. **Quedó fuera de Fase 1 a propósito**.
+- [ ] T4.1 Verificar que el worker escribe `md_ref` = `extracted-md/<id>.md` al marcar `PROCESSING→COMPLETED` (ADR-0006) — **pendiente P3** (repo externo); contrato propuesto en `docs/design/contrato-extraction-worker.md`. No se asume que el worker ya genera Markdown
+- [ ] T4.2 Infra (repo `infra`, no desde acá): crear bucket `extracted-md` con política equivalente a `extracted-txt` — **pendiente P1**
+- [x] T4.3 Mensaje de cola: sin cambios de forma; `schema_version` se mantiene — **verificado en código** (`WorkMessage` sin `attempts`, SPEC §11.3); documentado en `docs/design/contrato-extraction-worker.md`
+- [x] T4.4 Webhook MinIO: sigue filtrando solo `raw-pdfs`; sin cambios de código — **verificado en código**
+- [x] T4.5 Failure-reason `TXT_REF_MISSING`: **se conserva el código histórico** hasta coordinar el rename con el worker (valor persistido + compartido; renombrar es breaking). Decisión registrada en `docs/design/contrato-extraction-worker.md` §3.
 
 ### Fase 5 — Verificación E2E y cierre
 
@@ -139,6 +139,11 @@ go test -race -count=1 $PKGS
 - Fase 5 agrega la verificación E2E con servicios reales.
 
 ## Registro de progreso
+
+- 2026-11-17: Fase 4 (contrato con extraction-worker) — T4.3/T4.4 verificados en código (sin
+  cambios), T4.5 decidido (se conserva `TXT_REF_MISSING`), T4.1/T4.2 pendientes de coordinación
+  externa (P3 worker / P1 infra) — sin bloqueo para doc-service. Contrato propuesto:
+  `docs/design/contrato-extraction-worker.md`. No se asume que el worker ya genera Markdown.
 
 - 2026-11-17: Fase 3 completada — D5 (read-fallback) implementada. `Document.TxtRef` (solo
   lectura legacy) + `ExtractedRef()` (md_ref primero; txt_ref solo si md_ref vacío); métodos
