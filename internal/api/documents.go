@@ -197,7 +197,7 @@ func (h *DocumentHandler) GetDocument(c *gin.Context) {
 		"document_id":    doc.ID,
 		"status":         string(doc.Status),
 		"object_key":     doc.ObjectKey,
-		"txt_ref":        doc.TxtRef,
+		"md_ref":         doc.MdRef,
 		"correlation_id": doc.CorrelationID,
 		"schema_version": doc.SchemaVersion,
 		"failure_reason": doc.FailureReason,
@@ -208,7 +208,7 @@ func (h *DocumentHandler) GetDocument(c *gin.Context) {
 }
 
 // DownloadDocument maneja GET /api/v2/documents/:id/download (S3-P2-09).
-// Entrega una URL prefirmada de lectura del bucket extracted-txt
+// Entrega una URL prefirmada de lectura del bucket extracted-md
 // únicamente si el documento está en COMPLETED.
 func (h *DocumentHandler) DownloadDocument(c *gin.Context) {
 	id := c.Param("id")
@@ -236,24 +236,24 @@ func (h *DocumentHandler) DownloadDocument(c *gin.Context) {
 		return
 	}
 
-	// txt_ref es la clave del objeto en extracted-txt.
-	if doc.TxtRef == "" {
+	// md_ref es la clave del objeto en extracted-md.
+	if doc.MdRef == "" {
 		respondProblem(c, http.StatusConflict, "conflict",
 			"Resultado no disponible",
-			"el documento está COMPLETED pero no tiene txt_ref")
+			"el documento está COMPLETED pero no tiene md_ref")
 		return
 	}
 
 	// URL prefirmada de lectura con expiración corta (5 min).
-	downloadURL, err := h.storage.PresignGetTXT(c.Request.Context(), doc.TxtRef, 5*time.Minute)
+	downloadURL, err := h.storage.PresignGetMD(c.Request.Context(), doc.MdRef, 5*time.Minute)
 	if err != nil {
-		slog.Error("download: presign GET TXT", "error", err, "document_id", id, "txt_ref", doc.TxtRef)
+		slog.Error("download: presign GET MD", "error", err, "document_id", id, "md_ref", doc.MdRef)
 		respondProblem(c, http.StatusInternalServerError, "internal", "Error generando URL de descarga", "")
 		return
 	}
 
 	slog.Info("download URL generada",
-		"document_id", id, "txt_ref", doc.TxtRef,
+		"document_id", id, "md_ref", doc.MdRef,
 	)
 
 	c.JSON(http.StatusOK, gin.H{

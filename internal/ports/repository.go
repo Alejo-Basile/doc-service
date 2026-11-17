@@ -70,22 +70,22 @@ type ObjectStorage interface {
 	PresignPost(ctx context.Context, objectKey string, opts PresignPostOptions) (*PresignPostResult, error)
 	// Stat verifica la existencia de un objeto (HEAD) en el bucket raw.
 	Stat(ctx context.Context, objectKey string) (ObjectInfo, error)
-	// StatTXT verifica la existencia de un objeto (HEAD) en el bucket extracted-txt.
-	StatTXT(ctx context.Context, objectKey string) (ObjectInfo, error)
+	// StatMD verifica la existencia de un objeto (HEAD) en el bucket extracted-md.
+	StatMD(ctx context.Context, objectKey string) (ObjectInfo, error)
 	// GetRange lee un rango de bytes del objeto (para validar %PDF-).
 	GetRange(ctx context.Context, objectKey string, start, end int64) ([]byte, error)
 	// Delete elimina un objeto del bucket raw.
 	Delete(ctx context.Context, objectKey string) error
-	// DeleteTXT elimina un objeto del bucket extracted-txt (purga de huérfanos, SPEC §6.5).
-	DeleteTXT(ctx context.Context, objectKey string) error
+	// DeleteMD elimina un objeto del bucket extracted-md (purga de huérfanos, SPEC §6.5).
+	DeleteMD(ctx context.Context, objectKey string) error
 	// PresignGet genera una URL prefirmada de lectura.
 	PresignGet(ctx context.Context, objectKey string, expiry time.Duration) (string, error)
-	// PresignGetTXT genera una URL prefirmada de lectura del bucket extracted-txt.
-	PresignGetTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error)
+	// PresignGetMD genera una URL prefirmada de lectura del bucket extracted-md.
+	PresignGetMD(ctx context.Context, objectKey string, expiry time.Duration) (string, error)
 	// ListObjects lista todos los objetos del bucket raw (para purga de huérfanos).
 	ListObjects(ctx context.Context) ([]ObjectInfo, error)
-	// ListObjectsTXT lista todos los objetos del bucket extracted-txt.
-	ListObjectsTXT(ctx context.Context) ([]ObjectInfo, error)
+	// ListObjectsMD lista todos los objetos del bucket extracted-md.
+	ListObjectsMD(ctx context.Context) ([]ObjectInfo, error)
 }
 
 // PresignPostOptions configura la política de la URL prefirmada.

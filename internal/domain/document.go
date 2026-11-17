@@ -185,7 +185,7 @@ type Document struct {
 	ID            string        `bson:"_id" json:"id"`
 	Status        Status        `bson:"status" json:"status"`
 	ObjectKey     string        `bson:"object_key,omitempty" json:"object_key,omitempty"`
-	TxtRef        string        `bson:"txt_ref,omitempty" json:"txt_ref,omitempty"`
+	MdRef         string        `bson:"md_ref,omitempty" json:"md_ref,omitempty"`
 	FailureReason string        `bson:"failure_reason,omitempty" json:"failure_reason,omitempty"`
 	CorrelationID string        `bson:"correlation_id" json:"correlation_id"`
 	SchemaVersion int           `bson:"schema_version" json:"schema_version"`

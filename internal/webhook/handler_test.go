@@ -110,7 +110,7 @@ func (m *mockStorage) Stat(ctx context.Context, objectKey string) (ports.ObjectI
 	return ports.ObjectInfo{Key: objectKey}, nil
 }
 
-func (m *mockStorage) StatTXT(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
+func (m *mockStorage) StatMD(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
 	if m.statErr != nil {
 		return ports.ObjectInfo{}, m.statErr
 	}
@@ -129,13 +129,13 @@ func (m *mockStorage) GetRange(ctx context.Context, objectKey string, start, end
 
 func (m *mockStorage) Delete(ctx context.Context, objectKey string) error { return nil }
 
-func (m *mockStorage) DeleteTXT(ctx context.Context, objectKey string) error { return nil }
+func (m *mockStorage) DeleteMD(ctx context.Context, objectKey string) error { return nil }
 
 func (m *mockStorage) PresignGet(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
 	return "", nil
 }
 
-func (m *mockStorage) PresignGetTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
+func (m *mockStorage) PresignGetMD(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
 	return "", nil
 }
 
@@ -143,7 +143,7 @@ func (m *mockStorage) ListObjects(ctx context.Context) ([]ports.ObjectInfo, erro
 	return nil, nil
 }
 
-func (m *mockStorage) ListObjectsTXT(ctx context.Context) ([]ports.ObjectInfo, error) {
+func (m *mockStorage) ListObjectsMD(ctx context.Context) ([]ports.ObjectInfo, error) {
 	return nil, nil
 }
 
@@ -326,7 +326,7 @@ func TestHandleEvent_WrongPrefix_Ignored(t *testing.T) {
 		"EventName": "s3:ObjectCreated:Put",
 		"s3": map[string]any{
 			"bucket": map[string]any{"name": "raw-pdfs"},
-			"object": map[string]any{"key": "extracted-txt/doc-1.txt"},
+			"object": map[string]any{"key": "extracted-md/doc-1.md"},
 		},
 	})
 

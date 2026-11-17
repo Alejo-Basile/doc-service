@@ -108,16 +108,16 @@ func (m *mockRepo) UpdateStatusWithHistory(ctx context.Context, id string, from,
 
 // mockStorage implementa ports.ObjectStorage (y el listado opcional).
 type mockStorage struct {
-	objects    map[string]bool // key → exists
-	txtObjects map[string]bool
-	pdfData    []byte
+	objects   map[string]bool // key → exists
+	mdObjects map[string]bool
+	pdfData   []byte
 	// statErr permite simular errores de infraestructura (p. ej. NoSuchBucket).
 	statErr error
 	// listObjects soporta la aserción `lister` de purgeOrphanObjects (S4-P2-02).
-	listObjects    []ports.ObjectInfo
-	listObjectsTXT []ports.ObjectInfo
-	deleted        []string
-	deletedTXT     []string // purgas del bucket extracted-txt (T2, SPEC §6.5)
+	listObjects   []ports.ObjectInfo
+	listObjectsMD []ports.ObjectInfo
+	deleted       []string
+	deletedMD     []string // purgas del bucket extracted-md (T2, SPEC §6.5)
 }
 
 func newMockStorage() *mockStorage {
@@ -173,13 +173,13 @@ func (m *mockStorage) Stat(ctx context.Context, objectKey string) (ports.ObjectI
 	return ports.ObjectInfo{}, errNotFound
 }
 
-func (m *mockStorage) StatTXT(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
+func (m *mockStorage) StatMD(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
 	if m.statErr != nil {
 		return ports.ObjectInfo{}, m.statErr
 	}
 	bucket := m.objects
-	if m.txtObjects != nil {
-		bucket = m.txtObjects
+	if m.mdObjects != nil {
+		bucket = m.mdObjects
 	}
 	if bucket[objectKey] {
 		return ports.ObjectInfo{Key: objectKey}, nil
@@ -187,11 +187,8 @@ func (m *mockStorage) StatTXT(ctx context.Context, objectKey string) (ports.Obje
 	return ports.ObjectInfo{}, errNotFound
 }
 
-func (m *mockStorage) ListObjectsTXT(ctx context.Context) ([]ports.ObjectInfo, error) {
-	if m.listObjectsTXT != nil {
-		return m.listObjectsTXT, nil
-	}
-	return m.listObjects, nil
+func (m *mockStorage) ListObjectsMD(ctx context.Context) ([]ports.ObjectInfo, error) {
+	return m.listObjectsMD, nil
 }
 
 func (m *mockStorage) GetRange(ctx context.Context, objectKey string, start, end int64) ([]byte, error) {
@@ -207,9 +204,9 @@ func (m *mockStorage) Delete(ctx context.Context, objectKey string) error {
 	return nil
 }
 
-func (m *mockStorage) DeleteTXT(ctx context.Context, objectKey string) error {
-	m.deletedTXT = append(m.deletedTXT, objectKey)
-	delete(m.txtObjects, objectKey)
+func (m *mockStorage) DeleteMD(ctx context.Context, objectKey string) error {
+	m.deletedMD = append(m.deletedMD, objectKey)
+	delete(m.mdObjects, objectKey)
 	return nil
 }
 
@@ -217,7 +214,7 @@ func (m *mockStorage) PresignGet(ctx context.Context, objectKey string, expiry t
 	return "", nil
 }
 
-func (m *mockStorage) PresignGetTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
+func (m *mockStorage) PresignGetMD(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
 	return "", nil
 }
 
@@ -530,33 +527,33 @@ func TestRunOnce_SafetyAge_NoTocaDocumentosRecientes(t *testing.T) {
 	}
 }
 
-// --- Completed sin .txt (S5-P2-03) ---
+// --- Completed sin .md (S5-P2-03) ---
 
-func TestRunOnce_CompletedSinTxt_Detectado(t *testing.T) {
+func TestRunOnce_CompletedSinMd_Detectado(t *testing.T) {
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	repo := newMockRepo()
 	storage := newMockStorage()
 
-	// Documento COMPLETED sin txt_ref, creado hace 1h (pasó safety age).
+	// Documento COMPLETED sin md_ref, creado hace 1h (pasó safety age).
 	doc := &domain.Document{
-		ID:        "doc-no-txt",
+		ID:        "doc-no-md",
 		Status:    domain.StatusCompleted,
-		ObjectKey: "raw-pdfs/doc-no-txt.pdf",
+		ObjectKey: "raw-pdfs/doc-no-md.pdf",
 		CreatedAt: now.Add(-time.Hour),
 		UpdatedAt: now.Add(-time.Hour),
 	}
-	repo.docs["doc-no-txt"] = doc
+	repo.docs["doc-no-md"] = doc
 
-	// Segundo documento COMPLETED con txt_ref que no existe en MinIO.
+	// Segundo documento COMPLETED con md_ref que no existe en MinIO.
 	doc2 := &domain.Document{
-		ID:        "doc-txt-missing",
+		ID:        "doc-md-missing",
 		Status:    domain.StatusCompleted,
-		ObjectKey: "raw-pdfs/doc-txt-missing.pdf",
-		TxtRef:    "extracted-txt/doc-txt-missing.txt",
+		ObjectKey: "raw-pdfs/doc-md-missing.pdf",
+		MdRef:     "extracted-md/doc-md-missing.md",
 		CreatedAt: now.Add(-time.Hour),
 		UpdatedAt: now.Add(-time.Hour),
 	}
-	repo.docs["doc-txt-missing"] = doc2
+	repo.docs["doc-md-missing"] = doc2
 
 	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
 	result, err := r.RunOnce(context.Background())
@@ -565,8 +562,8 @@ func TestRunOnce_CompletedSinTxt_Detectado(t *testing.T) {
 	}
 
 	// Ambos deben ser detectados.
-	if result.CompletedNoTxt != 2 {
-		t.Errorf("CompletedNoTxt = %d, want 2", result.CompletedNoTxt)
+	if result.CompletedNoMd != 2 {
+		t.Errorf("CompletedNoMd = %d, want 2", result.CompletedNoMd)
 	}
 
 	// No debe transicionar (solo detección).
@@ -590,7 +587,7 @@ func TestCrossCheck_GeneraReporte(t *testing.T) {
 	}
 	repo.docs["doc-failed"] = docFailed
 
-	// Documento COMPLETED sin txt_ref.
+	// Documento COMPLETED sin md_ref.
 	docCompleted := &domain.Document{
 		ID:        "doc-completed",
 		Status:    domain.StatusCompleted,
@@ -618,8 +615,8 @@ func TestCrossCheck_GeneraReporte(t *testing.T) {
 	if len(report.FailedNoReason) != 1 {
 		t.Errorf("FailedNoReason = %v, want 1 doc", report.FailedNoReason)
 	}
-	if len(report.CompletedNoTxt) != 1 {
-		t.Errorf("CompletedNoTxt = %v, want 1 doc", report.CompletedNoTxt)
+	if len(report.CompletedNoMd) != 1 {
+		t.Errorf("CompletedNoMd = %v, want 1 doc", report.CompletedNoMd)
 	}
 	if report.YoungUntouched != 1 {
 		t.Errorf("YoungUntouched = %d, want 1", report.YoungUntouched)
@@ -636,14 +633,14 @@ func TestCrossCheck_DatosSanos_ReporteVacio(t *testing.T) {
 	storage := newMockStorage()
 	queue := &mockQueue{}
 
-	// Documento COMPLETED sano: tiene object_key y txt_ref, ambos existen.
+	// Documento COMPLETED sano: tiene object_key y md_ref, ambos existen.
 	completedKey := "raw-pdfs/doc-completed.pdf"
-	completedTxt := "extracted-txt/doc-completed.txt"
+	completedMd := "extracted-md/doc-completed.md"
 	repo.docs["doc-completed"] = &domain.Document{
 		ID:        "doc-completed",
 		Status:    domain.StatusCompleted,
 		ObjectKey: completedKey,
-		TxtRef:    completedTxt,
+		MdRef:     completedMd,
 		CreatedAt: now.Add(-time.Hour),
 	}
 
@@ -658,7 +655,7 @@ func TestCrossCheck_DatosSanos_ReporteVacio(t *testing.T) {
 
 	// MinIO tiene exactamente los mismos objetos que referencian los documentos.
 	storage.objects[completedKey] = true
-	storage.objects[completedTxt] = true
+	storage.objects[completedMd] = true
 	storage.objects[activeKey] = true
 	storage.listObjects = []ports.ObjectInfo{
 		{Key: completedKey},
@@ -688,8 +685,8 @@ func TestCrossCheck_DatosSanos_ReporteVacio(t *testing.T) {
 	if len(report.MissingRawObjects) != 0 {
 		t.Errorf("MissingRawObjects = %v, want 0", report.MissingRawObjects)
 	}
-	if len(report.CompletedNoTxt) != 0 {
-		t.Errorf("CompletedNoTxt = %v, want 0", report.CompletedNoTxt)
+	if len(report.CompletedNoMd) != 0 {
+		t.Errorf("CompletedNoMd = %v, want 0", report.CompletedNoMd)
 	}
 	if len(report.FailedNoReason) != 0 {
 		t.Errorf("FailedNoReason = %v, want 0", report.FailedNoReason)
@@ -1204,34 +1201,34 @@ func TestSweepOrphans_SinObjetos_NoPurga(t *testing.T) {
 	}
 }
 
-// --- Huérfanos en extracted-txt (T2, SPEC §6.5) ---
+// --- Huérfanos en extracted-md (T2, SPEC §6.5) ---
 
-// TestSweepOrphans_PurgaTxtHuerfano cubre el segundo pass sobre el bucket
-// extracted-txt: un objeto sin documento que lo referencie (TxtRef) y más
-// antiguo que el umbral se purga, mientras el txt referenciado y el huérfano
+// TestSweepOrphans_PurgaMdHuerfano cubre el segundo pass sobre el bucket
+// extracted-md: un objeto sin documento que lo referencie (MdRef) y más
+// antiguo que el umbral se purga, mientras el md referenciado y el huérfano
 // reciente quedan intactos. Espeja la semántica del pass de raw.
-func TestSweepOrphans_PurgaTxtHuerfano(t *testing.T) {
+func TestSweepOrphans_PurgaMdHuerfano(t *testing.T) {
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	repo := newMockRepo()
 	storage := newMockStorage()
 
-	// Documento que referencia su .txt: no debe purgarse.
-	referenced := "extracted-txt/doc-1.txt"
+	// Documento que referencia su .md: no debe purgarse.
+	referenced := "extracted-md/doc-1.md"
 	repo.docs["doc-1"] = &domain.Document{
 		ID:        "doc-1",
 		Status:    domain.StatusCompleted,
 		ObjectKey: "raw-pdfs/doc-1.pdf",
-		TxtRef:    referenced,
+		MdRef:     referenced,
 		CreatedAt: now.Add(-time.Hour),
 	}
 
-	storage.listObjectsTXT = []ports.ObjectInfo{
+	storage.listObjectsMD = []ports.ObjectInfo{
 		// Referenciado y antiguo → NO se borra.
 		{Key: referenced, LastModified: now.Add(-30 * 24 * time.Hour)},
 		// Huérfano antiguo (> 7 días) → SÍ se borra.
-		{Key: "extracted-txt/huerfano-viejo.txt", LastModified: now.Add(-30 * 24 * time.Hour)},
+		{Key: "extracted-md/huerfano-viejo.md", LastModified: now.Add(-30 * 24 * time.Hour)},
 		// Huérfano reciente (< 7 días) → NO se borra todavía.
-		{Key: "extracted-txt/huerfano-nuevo.txt", LastModified: now.Add(-time.Hour)},
+		{Key: "extracted-md/huerfano-nuevo.md", LastModified: now.Add(-time.Hour)},
 	}
 
 	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
@@ -1243,36 +1240,36 @@ func TestSweepOrphans_PurgaTxtHuerfano(t *testing.T) {
 	if result.OrphansPurged != 1 {
 		t.Fatalf("OrphansPurged = %d, want 1", result.OrphansPurged)
 	}
-	if len(storage.deletedTXT) != 1 || storage.deletedTXT[0] != "extracted-txt/huerfano-viejo.txt" {
-		t.Fatalf("deletedTXT = %v, want [extracted-txt/huerfano-viejo.txt]", storage.deletedTXT)
+	if len(storage.deletedMD) != 1 || storage.deletedMD[0] != "extracted-md/huerfano-viejo.md" {
+		t.Fatalf("deletedMD = %v, want [extracted-md/huerfano-viejo.md]", storage.deletedMD)
 	}
-	for _, k := range storage.deletedTXT {
+	for _, k := range storage.deletedMD {
 		if k == referenced {
-			t.Errorf("borró un txt referenciado por un documento: %s", k)
+			t.Errorf("borró un md referenciado por un documento: %s", k)
 		}
 	}
 	if len(storage.deleted) != 0 {
-		t.Errorf("deleted (raw) = %v, want vacío: el pass txt no debe tocar raw", storage.deleted)
+		t.Errorf("deleted (raw) = %v, want vacío: el pass md no debe tocar raw", storage.deleted)
 	}
 }
 
-// TestSweepOrphans_NoPurgaTxtReferenciado fija la garantía de seguridad: un
-// objeto de extracted-txt referenciado por cualquier documento (aunque sea
+// TestSweepOrphans_NoPurgaMdReferenciado fija la garantía de seguridad: un
+// objeto de extracted-md referenciado por cualquier documento (aunque sea
 // antiguo) jamás se borra.
-func TestSweepOrphans_NoPurgaTxtReferenciado(t *testing.T) {
+func TestSweepOrphans_NoPurgaMdReferenciado(t *testing.T) {
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	repo := newMockRepo()
 	storage := newMockStorage()
 
-	referenced := "extracted-txt/doc-ref.txt"
+	referenced := "extracted-md/doc-ref.md"
 	repo.docs["doc-ref"] = &domain.Document{
 		ID:        "doc-ref",
 		Status:    domain.StatusCompleted,
 		ObjectKey: "raw-pdfs/doc-ref.pdf",
-		TxtRef:    referenced,
+		MdRef:     referenced,
 		CreatedAt: now.Add(-time.Hour),
 	}
-	storage.listObjectsTXT = []ports.ObjectInfo{
+	storage.listObjectsMD = []ports.ObjectInfo{
 		{Key: referenced, LastModified: now.Add(-30 * 24 * time.Hour)},
 	}
 
@@ -1283,23 +1280,23 @@ func TestSweepOrphans_NoPurgaTxtReferenciado(t *testing.T) {
 	}
 
 	if result.OrphansPurged != 0 {
-		t.Errorf("OrphansPurged = %d, want 0 (txt referenciado)", result.OrphansPurged)
+		t.Errorf("OrphansPurged = %d, want 0 (md referenciado)", result.OrphansPurged)
 	}
-	if len(storage.deletedTXT) != 0 {
-		t.Errorf("deletedTXT = %v, want vacío (txt referenciado)", storage.deletedTXT)
+	if len(storage.deletedMD) != 0 {
+		t.Errorf("deletedMD = %v, want vacío (md referenciado)", storage.deletedMD)
 	}
 }
 
-// TestSweepOrphans_DryRun_PlanificaTxtSinBorrar prueba que la purga de txt pasa
-// por el choke point de dry-run (deleteTXTObject): se planifica y cuenta, pero
+// TestSweepOrphans_DryRun_PlanificaMdSinBorrar prueba que la purga de md pasa
+// por el choke point de dry-run (deleteMDObject): se planifica y cuenta, pero
 // no se ejecuta ningún borrado (SPEC §6.5, T1).
-func TestSweepOrphans_DryRun_PlanificaTxtSinBorrar(t *testing.T) {
+func TestSweepOrphans_DryRun_PlanificaMdSinBorrar(t *testing.T) {
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	repo := newMockRepo()
 	storage := newMockStorage()
 
-	storage.listObjectsTXT = []ports.ObjectInfo{
-		{Key: "extracted-txt/huerfano-dry.txt", LastModified: now.Add(-30 * 24 * time.Hour)},
+	storage.listObjectsMD = []ports.ObjectInfo{
+		{Key: "extracted-md/huerfano-dry.md", LastModified: now.Add(-30 * 24 * time.Hour)},
 	}
 
 	r := New(repo, storage, nil, nil, &mockClock{now},
@@ -1312,8 +1309,8 @@ func TestSweepOrphans_DryRun_PlanificaTxtSinBorrar(t *testing.T) {
 	if result.OrphansPurged != 1 {
 		t.Errorf("OrphansPurged = %d, want 1 (planificado)", result.OrphansPurged)
 	}
-	if len(storage.deletedTXT) != 0 {
-		t.Errorf("deletedTXT = %v, want 0 en dry-run", storage.deletedTXT)
+	if len(storage.deletedMD) != 0 {
+		t.Errorf("deletedMD = %v, want 0 en dry-run", storage.deletedMD)
 	}
 	if result.PlannedActions == 0 {
 		t.Error("PlannedActions = 0, want > 0 (el plan debe reportarse)")
@@ -1478,10 +1475,10 @@ func TestCrossCheck_IgnoraEntradasDePrefijo(t *testing.T) {
 	doc := &domain.Document{
 		ID:        "doc-a",
 		Status:    domain.StatusCompleted,
-		CreatedAt: now, // joven: salta la rama de Stat de completed_no_txt
+		CreatedAt: now, // joven: salta la rama de Stat de completed_no_md
 		UpdatedAt: now,
 		ObjectKey: "raw-pdfs/doc-a.pdf",
-		TxtRef:    "extracted-txt/doc-a.txt",
+		MdRef:     "extracted-md/doc-a.md",
 	}
 	repo.docs["doc-a"] = doc
 

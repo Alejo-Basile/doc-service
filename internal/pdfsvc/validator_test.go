@@ -23,7 +23,7 @@ func (m *mockStorage) Stat(ctx context.Context, objectKey string) (ports.ObjectI
 	return ports.ObjectInfo{}, nil
 }
 
-func (m *mockStorage) StatTXT(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
+func (m *mockStorage) StatMD(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
 	return ports.ObjectInfo{}, nil
 }
 
@@ -52,7 +52,7 @@ func (m *mockStorage) Delete(ctx context.Context, objectKey string) error {
 	return nil
 }
 
-func (m *mockStorage) DeleteTXT(ctx context.Context, objectKey string) error {
+func (m *mockStorage) DeleteMD(ctx context.Context, objectKey string) error {
 	return nil
 }
 
@@ -60,7 +60,7 @@ func (m *mockStorage) PresignGet(ctx context.Context, objectKey string, expiry t
 	return "", nil
 }
 
-func (m *mockStorage) PresignGetTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
+func (m *mockStorage) PresignGetMD(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
 	return "", nil
 }
 
@@ -68,7 +68,7 @@ func (m *mockStorage) ListObjects(ctx context.Context) ([]ports.ObjectInfo, erro
 	return nil, nil
 }
 
-func (m *mockStorage) ListObjectsTXT(ctx context.Context) ([]ports.ObjectInfo, error) {
+func (m *mockStorage) ListObjectsMD(ctx context.Context) ([]ports.ObjectInfo, error) {
 	return nil, nil
 }
 

@@ -15,7 +15,7 @@ func setEnv(t *testing.T, vars map[string]string) {
 		"HTTP_PORT", "DEBUG",
 		"MONGO_URI", "MONGO_DATABASE",
 		"MINIO_ENDPOINT", "MINIO_PUBLIC_ENDPOINT", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY",
-		"MINIO_BUCKET_RAW", "MINIO_BUCKET_TXT", "MINIO_WEBHOOK_SECRET", "MINIO_REGION",
+		"MINIO_BUCKET_RAW", "MINIO_BUCKET_MD", "MINIO_WEBHOOK_SECRET", "MINIO_REGION",
 		"REDIS_ADDR", "REDIS_PASSWORD", "REDIS_STREAM_KEY",
 		"REDIS_SENTINEL_ADDRS", "REDIS_MASTER_NAME", "INTERNAL_TOKEN",
 		"MAX_PDF_BYTES", "RECONCILE_INTERVAL_MIN", "DOC_UPLOAD_GRACE_MIN",
@@ -64,8 +64,8 @@ func TestLoad_ConfigCompleta_Sucede(t *testing.T) {
 	if cfg.MinIOBucketRaw != "raw-pdfs" {
 		t.Errorf("MinIOBucketRaw default esperado 'raw-pdfs', got %q", cfg.MinIOBucketRaw)
 	}
-	if cfg.MinIOBucketTXT != "extracted-txt" {
-		t.Errorf("MinIOBucketTXT default esperado 'extracted-txt', got %q", cfg.MinIOBucketTXT)
+	if cfg.MinIOBucketMD != "extracted-md" {
+		t.Errorf("MinIOBucketMD default esperado 'extracted-md', got %q", cfg.MinIOBucketMD)
 	}
 	if cfg.MinIORegion != "us-east-1" {
 		t.Errorf("MinIORegion default esperado 'us-east-1', got %q", cfg.MinIORegion)

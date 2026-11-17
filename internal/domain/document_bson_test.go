@@ -18,7 +18,7 @@ func TestDocument_BSONRoundtrip(t *testing.T) {
 		ID:            "01J9Z8QK3M7X2V0N4P6R8T1Y0B",
 		Status:        StatusCompleted,
 		ObjectKey:     "raw-pdfs/01J9Z8QK3M7X2V0N4P6R8T1Y0B.pdf",
-		TxtRef:        "extracted-txt/01J9Z8QK3M7X2V0N4P6R8T1Y0B.txt",
+		MdRef:         "extracted-md/01J9Z8QK3M7X2V0N4P6R8T1Y0B.md",
 		FailureReason: "",
 		CorrelationID: "corr-abc-123",
 		SchemaVersion: 1,
@@ -46,7 +46,7 @@ func TestDocument_BSONRoundtrip(t *testing.T) {
 	// Verificar que los nombres de campo BSON son los esperados (schema v1).
 	// Nota: failure_reason está vacío (omitempty) y no aparece — es correcto.
 	camposEsperados := []string{
-		"_id", "status", "object_key", "txt_ref",
+		"_id", "status", "object_key", "md_ref",
 		"correlation_id", "schema_version", "expires_at", "created_at",
 		"updated_at", "history",
 	}
@@ -103,7 +103,7 @@ func TestDocument_BSONOpcionalesVacios(t *testing.T) {
 		ID:            "01TEST",
 		Status:        StatusPendingUpload,
 		ObjectKey:     "",
-		TxtRef:        "",
+		MdRef:         "",
 		FailureReason: "",
 		CorrelationID: "corr-1",
 		SchemaVersion: 1,
@@ -123,8 +123,8 @@ func TestDocument_BSONOpcionalesVacios(t *testing.T) {
 		t.Fatalf("bson.Unmarshal falló: %v", err)
 	}
 
-	// object_key, txt_ref y failure_reason están vacíos → no deben aparecer.
-	for _, campo := range []string{"object_key", "txt_ref", "failure_reason"} {
+	// object_key, md_ref y failure_reason están vacíos → no deben aparecer.
+	for _, campo := range []string{"object_key", "md_ref", "failure_reason"} {
 		if _, ok := m[campo]; ok {
 			t.Errorf("campo %q no debería aparecer en BSON cuando está vacío (omitempty)", campo)
 		}

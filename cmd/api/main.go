@@ -94,7 +94,7 @@ func main() {
 		SecretKey:      cfg.MinIOSecretKey,
 		UseSSL:         false, // TLS termina en el edge (Traefik); el endpoint interno es plano.
 		BucketRaw:      cfg.MinIOBucketRaw,
-		BucketTXT:      cfg.MinIOBucketTXT,
+		BucketMD:       cfg.MinIOBucketMD,
 		Region:         cfg.MinIORegion,
 	})
 	if err != nil {

@@ -133,7 +133,7 @@ func (m *mockStorage) Stat(ctx context.Context, objectKey string) (ports.ObjectI
 	return ports.ObjectInfo{}, nil
 }
 
-func (m *mockStorage) StatTXT(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
+func (m *mockStorage) StatMD(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
 	return ports.ObjectInfo{}, nil
 }
 
@@ -143,21 +143,21 @@ func (m *mockStorage) GetRange(ctx context.Context, objectKey string, start, end
 
 func (m *mockStorage) Delete(ctx context.Context, objectKey string) error { return nil }
 
-func (m *mockStorage) DeleteTXT(ctx context.Context, objectKey string) error { return nil }
+func (m *mockStorage) DeleteMD(ctx context.Context, objectKey string) error { return nil }
 
 func (m *mockStorage) PresignGet(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
 	return "", nil
 }
 
-func (m *mockStorage) PresignGetTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
-	return "https://s3.example.com/extracted-txt/" + objectKey, nil
+func (m *mockStorage) PresignGetMD(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
+	return "https://s3.example.com/extracted-md/" + objectKey, nil
 }
 
 func (m *mockStorage) ListObjects(ctx context.Context) ([]ports.ObjectInfo, error) {
 	return nil, nil
 }
 
-func (m *mockStorage) ListObjectsTXT(ctx context.Context) ([]ports.ObjectInfo, error) {
+func (m *mockStorage) ListObjectsMD(ctx context.Context) ([]ports.ObjectInfo, error) {
 	return nil, nil
 }
 
@@ -466,7 +466,7 @@ func TestGetDocument_ConCampos(t *testing.T) {
 
 	doc := domain.NewDocument("corr-campos", time.Now().UTC().Add(30*time.Minute))
 	doc.SetObjectKey("raw-pdfs")
-	doc.TxtRef = "extracted-txt/test.txt"
+	doc.MdRef = "extracted-md/test.md"
 	_ = repo.Insert(context.Background(), doc)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v2/documents/"+doc.ID, nil)
@@ -483,7 +483,7 @@ func TestGetDocument_ConCampos(t *testing.T) {
 	}
 
 	// Campos que deben estar presentes.
-	campos := []string{"document_id", "status", "object_key", "txt_ref", "correlation_id", "schema_version", "failure_reason", "created_at", "updated_at", "expires_at"}
+	campos := []string{"document_id", "status", "object_key", "md_ref", "correlation_id", "schema_version", "failure_reason", "created_at", "updated_at", "expires_at"}
 	for _, c := range campos {
 		if _, ok := resp[c]; !ok {
 			t.Errorf("campo %q no encontrado en la respuesta", c)
@@ -498,7 +498,7 @@ func TestDownloadDocument_Completed_OK(t *testing.T) {
 
 	doc := domain.NewDocument("corr-dl-1", time.Now().UTC().Add(30*time.Minute))
 	doc.Status = domain.StatusCompleted
-	doc.TxtRef = "extracted-txt/doc-dl-1.txt"
+	doc.MdRef = "extracted-md/doc-dl-1.md"
 	_ = repo.Insert(context.Background(), doc)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v2/documents/"+doc.ID+"/download", nil)

@@ -28,7 +28,7 @@ type Config struct {
 	MinIOAccessKey      string
 	MinIOSecretKey      string
 	MinIOBucketRaw      string
-	MinIOBucketTXT      string
+	MinIOBucketMD       string
 	MinIOWebhookSecret  string
 	// MinIORegion es la región SigV4 usada para firmar URLs prefirmadas.
 	MinIORegion string
@@ -64,7 +64,7 @@ const (
 	defaultHTTPPort          = 8080
 	defaultMongoDatabase     = "documents"
 	defaultMinIOBucketRaw    = "raw-pdfs"
-	defaultMinIOBucketTXT    = "extracted-txt"
+	defaultMinIOBucketMD     = "extracted-md"
 	defaultMinIORegion       = "us-east-1"
 	defaultRedisStreamKey    = "stream:pdf-processing"
 	defaultMaxPDFBytes       = 26214400 // 25 MB (SPEC §5.1)
@@ -86,7 +86,7 @@ func Load() (*Config, error) {
 		MinIOAccessKey:      strings.TrimSpace(os.Getenv("MINIO_ACCESS_KEY")),
 		MinIOSecretKey:      strings.TrimSpace(os.Getenv("MINIO_SECRET_KEY")),
 		MinIOBucketRaw:      envStr("MINIO_BUCKET_RAW", defaultMinIOBucketRaw),
-		MinIOBucketTXT:      envStr("MINIO_BUCKET_TXT", defaultMinIOBucketTXT),
+		MinIOBucketMD:       envStr("MINIO_BUCKET_MD", defaultMinIOBucketMD),
 		MinIOWebhookSecret:  strings.TrimSpace(os.Getenv("MINIO_WEBHOOK_SECRET")),
 		MinIORegion:         envStr("MINIO_REGION", defaultMinIORegion),
 		RedisAddr:           strings.TrimSpace(os.Getenv("REDIS_ADDR")),

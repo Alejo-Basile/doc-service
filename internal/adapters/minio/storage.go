@@ -28,8 +28,8 @@ type Config struct {
 	UseSSL         bool
 	// BucketRaw es el bucket de PDFs crudos.
 	BucketRaw string
-	// BucketTXT es el bucket de textos extraídos.
-	BucketTXT string
+	// BucketMD es el bucket de markdown extraído.
+	BucketMD string
 	// Region es la región SigV4 usada para firmar; vacía usa defaultRegion.
 	Region string
 }
@@ -45,7 +45,7 @@ type ObjectStorage struct {
 	publicEndpoint  string
 	publicEndpointU *url.URL
 	bucketRaw       string
-	bucketTXT       string
+	bucketMD        string
 }
 
 // New crea un ObjectStorage conectado a MinIO.
@@ -92,7 +92,7 @@ func New(cfg Config) (*ObjectStorage, error) {
 		publicEndpoint:  pubEP,
 		publicEndpointU: pubU,
 		bucketRaw:       cfg.BucketRaw,
-		bucketTXT:       cfg.BucketTXT,
+		bucketMD:        cfg.BucketMD,
 	}, nil
 }
 
@@ -185,11 +185,11 @@ func (o *ObjectStorage) Stat(ctx context.Context, objectKey string) (ports.Objec
 	}, nil
 }
 
-// StatTXT verifica la existencia de un objeto (HEAD) en el bucket extracted-txt.
-func (o *ObjectStorage) StatTXT(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
-	info, err := o.client.StatObject(ctx, o.bucketTXT, objectKey, miniogo.StatObjectOptions{})
+// StatMD verifica la existencia de un objeto (HEAD) en el bucket extracted-md.
+func (o *ObjectStorage) StatMD(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
+	info, err := o.client.StatObject(ctx, o.bucketMD, objectKey, miniogo.StatObjectOptions{})
 	if err != nil {
-		return ports.ObjectInfo{}, fmt.Errorf("stat %s/%s: %w", o.bucketTXT, objectKey, err)
+		return ports.ObjectInfo{}, fmt.Errorf("stat %s/%s: %w", o.bucketMD, objectKey, err)
 	}
 
 	return ports.ObjectInfo{
@@ -228,10 +228,10 @@ func (o *ObjectStorage) Delete(ctx context.Context, objectKey string) error {
 	return nil
 }
 
-// DeleteTXT elimina un objeto del bucket extracted-txt (purga de huérfanos, SPEC §6.5).
-func (o *ObjectStorage) DeleteTXT(ctx context.Context, objectKey string) error {
-	if err := o.client.RemoveObject(ctx, o.bucketTXT, objectKey, miniogo.RemoveObjectOptions{}); err != nil {
-		return fmt.Errorf("delete %s/%s: %w", o.bucketTXT, objectKey, err)
+// DeleteMD elimina un objeto del bucket extracted-md (purga de huérfanos, SPEC §6.5).
+func (o *ObjectStorage) DeleteMD(ctx context.Context, objectKey string) error {
+	if err := o.client.RemoveObject(ctx, o.bucketMD, objectKey, miniogo.RemoveObjectOptions{}); err != nil {
+		return fmt.Errorf("delete %s/%s: %w", o.bucketMD, objectKey, err)
 	}
 	return nil
 }
@@ -254,11 +254,11 @@ func (o *ObjectStorage) PresignGet(ctx context.Context, objectKey string, expiry
 	return res, nil
 }
 
-// PresignGetTXT genera una URL prefirmada de lectura del bucket de textos.
-func (o *ObjectStorage) PresignGetTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
-	u, err := o.presignClient.PresignedGetObject(ctx, o.bucketTXT, objectKey, expiry, nil)
+// PresignGetMD genera una URL prefirmada de lectura del bucket de markdown.
+func (o *ObjectStorage) PresignGetMD(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
+	u, err := o.presignClient.PresignedGetObject(ctx, o.bucketMD, objectKey, expiry, nil)
 	if err != nil {
-		return "", fmt.Errorf("presign GET TXT %s/%s: %w", o.bucketTXT, objectKey, err)
+		return "", fmt.Errorf("presign GET MD %s/%s: %w", o.bucketMD, objectKey, err)
 	}
 	res := u.String()
 	if o.publicEndpointU != nil && o.publicEndpoint != "" {
@@ -306,9 +306,9 @@ func (o *ObjectStorage) ListObjects(ctx context.Context) ([]ports.ObjectInfo, er
 	return o.listObjects(ctx, o.bucketRaw)
 }
 
-// ListObjectsTXT lista todos los objetos del bucket extracted-txt.
-func (o *ObjectStorage) ListObjectsTXT(ctx context.Context) ([]ports.ObjectInfo, error) {
-	return o.listObjects(ctx, o.bucketTXT)
+// ListObjectsMD lista todos los objetos del bucket extracted-md.
+func (o *ObjectStorage) ListObjectsMD(ctx context.Context) ([]ports.ObjectInfo, error) {
+	return o.listObjects(ctx, o.bucketMD)
 }
 
 func (o *ObjectStorage) listObjects(ctx context.Context, bucket string) ([]ports.ObjectInfo, error) {
