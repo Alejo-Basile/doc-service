@@ -188,7 +188,10 @@ func (m *mockStorage) StatTXT(ctx context.Context, objectKey string) (ports.Obje
 }
 
 func (m *mockStorage) ListObjectsTXT(ctx context.Context) ([]ports.ObjectInfo, error) {
-	return m.listObjectsTXT, nil
+	if m.listObjectsTXT != nil {
+		return m.listObjectsTXT, nil
+	}
+	return m.listObjects, nil
 }
 
 func (m *mockStorage) GetRange(ctx context.Context, objectKey string, start, end int64) ([]byte, error) {
