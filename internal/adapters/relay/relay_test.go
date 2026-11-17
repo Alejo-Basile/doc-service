@@ -13,6 +13,8 @@ import (
 	redidadapter "github.com/Alejo-Basile/doc-service/internal/adapters/redis"
 	"github.com/Alejo-Basile/doc-service/internal/domain"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
+	"github.com/Alejo-Basile/doc-service/internal/resilience"
+	"github.com/sony/gobreaker/v2"
 )
 
 func testAddrs(t *testing.T) (string, string, string) {
@@ -257,6 +259,102 @@ func TestRelay_RetryUsaJitterEnElBackoff(t *testing.T) {
 	}
 	if !slices.Equal(args, want) {
 		t.Errorf("límites del hook = %v, want %v", args, want)
+	}
+}
+
+// --- Tests de composición retry + breaker (SPEC §7.3) ---
+// El breaker envuelve la llamada individual y el retry envuelve al breaker:
+// ante un breaker Open el retry ve el rechazo fast-fail y aborta el loop
+// sin más intentos ni sleeps (sin retry storm, sin red).
+
+// breakerAbiertoParaTests arma la composición real: inner (siempre falla
+// con error transitorio) envuelto por el decorador de resilience con un
+// breaker que abre tras 2 fallos consecutivos y permanece Open 30s.
+func breakerAbiertoParaTests(inner *flakyQueue) ports.WorkQueue {
+	return resilience.NewWorkQueue(inner, resilience.NewBreakerWithSettings(gobreaker.Settings{
+		Name: "test-redis",
+		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			return counts.ConsecutiveFailures >= 2
+		},
+		Timeout: 30 * time.Second,
+	}))
+}
+
+// attemptCounter envuelve una cola contando cada invocación a Enqueue:
+// los intentos del retry, incluidos los rechazados por el breaker. Es el
+// seam que distingue "abortar al primer rechazo" de "insistir hasta
+// agotar MaxRetries contra un breaker Open" (SPEC §7.3).
+type attemptCounter struct {
+	inner    ports.WorkQueue
+	attempts int
+}
+
+func (c *attemptCounter) Enqueue(ctx context.Context, msg ports.WorkMessage) error {
+	c.attempts++
+	return c.inner.Enqueue(ctx, msg)
+}
+
+func (c *attemptCounter) Ping(ctx context.Context) error { return c.inner.Ping(ctx) }
+
+func TestRelay_Composicion_BreakerAbiertoAbortaSinRetryStorm(t *testing.T) {
+	inner := &flakyQueue{failN: 100}
+	counter := &attemptCounter{inner: breakerAbiertoParaTests(inner)}
+	r := NewWithConfig(counter, &fakeRelayRepo{}, 1, Config{MaxRetries: 10, BaseBackoff: time.Millisecond})
+
+	err := r.Handler()(context.Background(), changestream.Event{
+		DocumentID: "doc-br-1",
+		Status:     "UPLOADED",
+		ObjectKey:  "raw-pdfs/doc-br-1.pdf",
+	})
+	if err == nil {
+		t.Fatal("Handler error = nil, want error")
+	}
+	// El breaker abre tras 2 fallos consecutivos: los intentos 3..N son
+	// rechazados sin tocar inner. Si el retry abortara al primer rechazo
+	// (SPEC §7.3), serían 3 intentos en total; sin abortar, 11.
+	if counter.attempts != 3 {
+		t.Errorf("intentos de Enqueue = %d, want 3 (2 fallos + 1 rechazo que aborta el loop; MaxRetries+1 = 11)", counter.attempts)
+	}
+	if inner.calls != 2 {
+		t.Errorf("llamadas al inner = %d, want 2 (los rechazos del breaker no tocan inner)", inner.calls)
+	}
+	if !resilience.IsRejected(err) {
+		t.Errorf("error devuelto no es un rechazo del breaker: %v", err)
+	}
+}
+
+func TestRelay_Composicion_RechazoNoTocaLaRed(t *testing.T) {
+	inner := &flakyQueue{failN: 100}
+	counter := &attemptCounter{inner: breakerAbiertoParaTests(inner)}
+	r := NewWithConfig(counter, &fakeRelayRepo{}, 1, Config{MaxRetries: 10, BaseBackoff: time.Millisecond})
+
+	// Primera invocación: abre el breaker (2 fallos) y aborta al primer rechazo.
+	_ = r.Handler()(context.Background(), changestream.Event{
+		DocumentID: "doc-br-1",
+		Status:     "UPLOADED",
+		ObjectKey:  "raw-pdfs/doc-br-1.pdf",
+	})
+	frozenInner := inner.calls
+	frozenAttempts := counter.attempts
+
+	// Segunda invocación: rechazo inmediato, un solo intento y el inner
+	// queda congelado (cero red).
+	err := r.Handler()(context.Background(), changestream.Event{
+		DocumentID: "doc-br-2",
+		Status:     "UPLOADED",
+		ObjectKey:  "raw-pdfs/doc-br-2.pdf",
+	})
+	if err == nil {
+		t.Fatal("Handler error = nil, want rechazo del breaker")
+	}
+	if !resilience.IsRejected(err) {
+		t.Errorf("error devuelto no es un rechazo del breaker: %v", err)
+	}
+	if inner.calls != frozenInner {
+		t.Errorf("llamadas al inner tras rechazo = %d, want %d (congeladas: cero red)", inner.calls, frozenInner)
+	}
+	if counter.attempts != frozenAttempts+1 {
+		t.Errorf("intentos en la 2.a invocación = %d, want 1 (rechazo fast-fail aborta el loop)", counter.attempts-frozenAttempts)
 	}
 }
 

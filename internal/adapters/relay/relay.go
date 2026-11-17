@@ -15,6 +15,7 @@ import (
 	"github.com/Alejo-Basile/doc-service/internal/domain"
 	"github.com/Alejo-Basile/doc-service/internal/metrics"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
+	"github.com/Alejo-Basile/doc-service/internal/resilience"
 )
 
 // Relay conecta el Change Stream de Mongo con la cola Redis Streams.
@@ -181,6 +182,14 @@ func (r *Relay) enqueueWithRetry(ctx context.Context, msg ports.WorkMessage) err
 			return nil
 		} else {
 			lastErr = err
+		}
+
+		// Fast-fail (SPEC §7.3): el breaker envuelve la llamada individual,
+		// así que un rechazo significa dependencia ya declarada caída.
+		// Insistir contra un breaker Open es martillar en vano: abortar el
+		// loop sin más intentos ni sleeps.
+		if resilience.IsRejected(lastErr) {
+			return lastErr
 		}
 
 		if attempt == r.maxRetries {
