@@ -7,7 +7,7 @@
 ## Contexto
 
 El worker de extracción (extraction-worker, P3) procesa el PDF de `raw-pdfs`,
-genera el `.txt` en `extracted-txt` y debe marcar el documento como COMPLETED.
+genera el `.md` en `extracted-md` y debe marcar el documento como COMPLETED.
 Hay dos opciones:
 
 1. El worker llama a doc-service vía HTTP para transicionar.
@@ -23,7 +23,7 @@ Hay dos opciones:
    ```js
    updateOne(
      { _id: docID, status: "PROCESSING" },
-     { $set: { status: "COMPLETED", txt_ref: "...", updated_at: now } }
+     { $set: { status: "COMPLETED", md_ref: "...", updated_at: now } }
    )
    ```
    El filtro `status: "PROCESSING"` garantiza que solo el worker que tiene el
@@ -36,12 +36,12 @@ Hay dos opciones:
    sin filtro de status).
 
 3. **Verificación cruzada previa**: antes de escribir COMPLETED, el worker
-   verifica que el `.txt` existe en MinIO (HEAD). Si no existe, no escribe
+   verifica que el `.md` existe en MinIO (HEAD). Si no existe, no escribe
    COMPLETED.
 
 4. **Reconciliador como red de seguridad**: después de escribir COMPLETED,
-   el reconciliador verifica periódicamente que el `.txt` realmente existe.
-   Si un documento está COMPLETED pero el `.txt` no existe, el reconciliador
+   el reconciliador verifica periódicamente que el `.md` realmente existe.
+   Si un documento está COMPLETED pero el `.md` no existe, el reconciliador
    lo detecta y alerta (no lo transiciona automáticamente: eso es trabajo
    del operador).
 
@@ -68,7 +68,7 @@ Hay dos opciones:
 
 ### Mitigaciones
 - Usuario Mongo dedicado con mínimo privilegio.
-- Reconciliador detecta inconsistencias COMPLETED sin .txt.
+- Reconciliador detecta inconsistencias COMPLETED sin .md.
 - ADR documentado y revisado por el equipo.
 
 ## Referencias

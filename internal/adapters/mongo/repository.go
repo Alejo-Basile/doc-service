@@ -96,7 +96,7 @@ func (r *DocumentRepository) UpdateStatus(
 		"status":     to,
 		"updated_at": time.Now().UTC(),
 	}
-	// Merge de campos adicionales (object_key, txt_ref, failure_reason, etc.)
+	// Merge de campos adicionales (object_key, md_ref, failure_reason, etc.)
 	for k, v := range fields {
 		set[k] = v
 	}

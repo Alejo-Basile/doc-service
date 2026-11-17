@@ -141,7 +141,7 @@ type Result struct {
 	Reenqueued        int               `json:"reenqueued"`
 	StuckDetected     int               `json:"stuck_detected"`
 	OrphansPurged     int               `json:"orphans_purged"`
-	CompletedNoTxt    int               `json:"completed_no_txt"` // COMPLETED sin .txt en MinIO (S5-P2-03)
+	CompletedNoMd     int               `json:"completed_no_md"` // COMPLETED sin artefacto usable (md_ref o txt_ref legacy) en MinIO (S5-P2-03, D5)
 	Errors            int               `json:"errors"`
 	LockAcquired      bool              `json:"lock_acquired"`
 	CrossCheckReport  *CrossCheckReport `json:"cross_check,omitempty"` // S6-P2-01
@@ -160,13 +160,13 @@ type CrossCheckReport struct {
 	ByStatus       map[string]int64 `json:"by_status"`
 	// MinIO
 	RawBucketObjects int64 `json:"raw_bucket_objects"`
-	TXTBucketObjects int64 `json:"txt_bucket_objects"`
+	MDBucketObjects  int64 `json:"md_bucket_objects"`
 	// Redis
 	StreamLength int64 `json:"stream_length"`
 	// Discrepancias
 	OrphanRawObjects  []string `json:"orphan_raw_objects"`  // en MinIO sin documento
 	MissingRawObjects []string `json:"missing_raw_objects"` // documento sin objeto en MinIO
-	CompletedNoTxt    []string `json:"completed_no_txt"`    // COMPLETED sin .txt
+	CompletedNoMd     []string `json:"completed_no_md"`     // COMPLETED sin artefacto (md_ref o txt_ref legacy)
 	FailedNoReason    []string `json:"failed_no_reason"`    // FAILED sin failure_reason
 	// Seguridad
 	YoungUntouched int64 `json:"young_untouched"` // documentos < minSafetyAge no tocados
@@ -283,12 +283,12 @@ func (r *Reconciler) runOnce(ctx context.Context, dryRun bool) (*Result, error) 
 	}
 	result.OrphansPurged = orphans
 
-	// 5. Documentos COMPLETED sin .txt en MinIO (S5-P2-03).
-	completedNoTxt, err := r.sweepCompletedMissingTxt(ctx, now)
+	// 5. Documentos COMPLETED sin .md en MinIO (S5-P2-03).
+	completedNoMd, err := r.sweepCompletedMissingMd(ctx, now)
 	if err != nil {
 		slog.Warn("reconciler: sweep completed-no-txt falló (no crítico)", "error", err)
 	}
-	result.CompletedNoTxt = completedNoTxt
+	result.CompletedNoMd = completedNoMd
 
 	// 6. Reporte de verificación cruzada (S6-P2-01).
 	report, err := r.crossCheck(ctx, now)
@@ -374,19 +374,19 @@ func (r *Reconciler) deleteObject(ctx context.Context, actions *actionReport, dr
 	return nil
 }
 
-// deleteTXTObject purga un objeto del bucket extracted-txt o, en dry-run, solo
+// deleteMDObject purga un objeto del bucket extracted-md o, en dry-run, solo
 // lo planifica. Espeja a deleteObject para que el choke point de dry-run cubra
-// también las mutaciones sobre el bucket de textos (SPEC §6.5).
-func (r *Reconciler) deleteTXTObject(ctx context.Context, actions *actionReport, dryRun bool, objectKey string) error {
+// también las mutaciones sobre el bucket de markdown (SPEC §6.5).
+func (r *Reconciler) deleteMDObject(ctx context.Context, actions *actionReport, dryRun bool, objectKey string) error {
 	actions.planned++
 	if dryRun {
 		slog.Info("reconciler: acción planificada (dry-run)",
-			"action", "delete_txt_object",
+			"action", "delete_md_object",
 			"object_key", objectKey,
 		)
 		return nil
 	}
-	if err := r.storage.DeleteTXT(ctx, objectKey); err != nil {
+	if err := r.storage.DeleteMD(ctx, objectKey); err != nil {
 		return err
 	}
 	actions.executed++
@@ -628,13 +628,13 @@ func (r *Reconciler) sweepOrphans(ctx context.Context, now time.Time, dryRun boo
 	// cualquier documento (sin importar estado ni edad) con la referencia
 	// seteada protege su objeto.
 	validKeys := make(map[string]bool, len(docs))
-	validTxtKeys := make(map[string]bool, len(docs))
+	validMdKeys := make(map[string]bool, len(docs))
 	for _, doc := range docs {
 		if doc.ObjectKey != "" {
 			validKeys[doc.ObjectKey] = true
 		}
-		if doc.TxtRef != "" {
-			validTxtKeys[doc.TxtRef] = true
+		if doc.MdRef != "" {
+			validMdKeys[doc.MdRef] = true
 		}
 	}
 
@@ -647,14 +647,14 @@ func (r *Reconciler) sweepOrphans(ctx context.Context, now time.Time, dryRun boo
 		return purged, err
 	}
 
-	// Segundo pass: huérfanos del bucket extracted-txt (SPEC §6.5). Mismo
-	// umbral de edad y misma regla de referencia (doc.TxtRef).
-	purgedTXT, err := r.purgeOrphanTXT(ctx, validTxtKeys, threshold, dryRun, actions)
+	// Segundo pass: huérfanos del bucket extracted-md (SPEC §6.5). Mismo
+	// umbral de edad y misma regla de referencia (doc.MdRef).
+	purgedMD, err := r.purgeOrphanMD(ctx, validMdKeys, threshold, dryRun, actions)
 	if err != nil {
-		return purged + purgedTXT, err
+		return purged + purgedMD, err
 	}
 
-	return purged + purgedTXT, nil
+	return purged + purgedMD, nil
 }
 
 // purgeOrphanObjects implementa la purga efectiva. Se delega al adapter.
@@ -707,14 +707,14 @@ func (r *Reconciler) purgeOrphanObjects(ctx context.Context, validKeys map[strin
 	return purged, nil
 }
 
-// purgeOrphanTXT purga objetos del bucket extracted-txt sin documento que los
-// referencie (TxtRef) y más antiguos que el umbral. Espeja la semántica de
+// purgeOrphanMD purga objetos del bucket extracted-md sin documento que los
+// referencie (MdRef) y más antiguos que el umbral. Espeja la semántica de
 // purgeOrphanObjects (mismo umbral, idempotencia y choke point de dry-run),
-// pero sobre el bucket de textos (SPEC §6.5).
-func (r *Reconciler) purgeOrphanTXT(ctx context.Context, validKeys map[string]bool, threshold time.Time, dryRun bool, actions *actionReport) (int, error) {
-	objects, err := r.storage.ListObjectsTXT(ctx)
+// pero sobre el bucket de markdown (SPEC §6.5).
+func (r *Reconciler) purgeOrphanMD(ctx context.Context, validKeys map[string]bool, threshold time.Time, dryRun bool, actions *actionReport) (int, error) {
+	objects, err := r.storage.ListObjectsMD(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("list txt objects: %w", err)
+		return 0, fmt.Errorf("list md objects: %w", err)
 	}
 
 	purged := 0
@@ -723,7 +723,7 @@ func (r *Reconciler) purgeOrphanTXT(ctx context.Context, validKeys map[string]bo
 		if strings.HasSuffix(obj.Key, "/") {
 			continue
 		}
-		// No purgar si algún documento referencia el .txt.
+		// No purgar si algún documento referencia el .md.
 		if validKeys[obj.Key] {
 			continue
 		}
@@ -732,14 +732,14 @@ func (r *Reconciler) purgeOrphanTXT(ctx context.Context, validKeys map[string]bo
 			continue
 		}
 
-		if err := r.deleteTXTObject(ctx, actions, dryRun, obj.Key); err != nil {
-			slog.Error("reconciler: error purgando objeto huérfano txt",
+		if err := r.deleteMDObject(ctx, actions, dryRun, obj.Key); err != nil {
+			slog.Error("reconciler: error purgando objeto huérfano md",
 				"object_key", obj.Key, "error", err)
 			continue
 		}
 		purged++
 		if !dryRun {
-			slog.Info("reconciler: objeto huérfano txt purgado",
+			slog.Info("reconciler: objeto huérfano md purgado",
 				"object_key", obj.Key,
 				"last_modified", obj.LastModified,
 			)
@@ -997,10 +997,10 @@ func (r *Reconciler) failStuckCompensating(ctx context.Context, doc *domain.Docu
 	return nil
 }
 
-// sweepCompletedMissingTxt detecta documentos COMPLETED cuyo .txt no existe en MinIO (S5-P2-03).
+// sweepCompletedMissingMd detecta documentos COMPLETED cuyo .md no existe en MinIO (S5-P2-03).
 // Solo detecta y alerta: no transiciona automáticamente (eso es trabajo del operador).
 // Respeta el umbral de seguridad.
-func (r *Reconciler) sweepCompletedMissingTxt(ctx context.Context, now time.Time) (int, error) {
+func (r *Reconciler) sweepCompletedMissingMd(ctx context.Context, now time.Time) (int, error) {
 	docs, _, err := r.repo.List(ctx, ports.ListFilter{
 		Status: domain.StatusCompleted,
 		Limit:  200,
@@ -1015,25 +1015,32 @@ func (r *Reconciler) sweepCompletedMissingTxt(ctx context.Context, now time.Time
 		if now.Sub(doc.CreatedAt) < r.minSafetyAge {
 			continue
 		}
-		if doc.TxtRef == "" {
+		// Fallback legacy (D5): md_ref primero; si no existe, txt_ref (bucket legacy).
+		ref, legacy := doc.ExtractedRef()
+		if ref == "" {
 			count++
-			slog.Warn("reconciler: documento COMPLETED sin txt_ref",
+			slog.Warn("reconciler: documento COMPLETED sin artefacto (ni md_ref ni txt_ref)",
 				"document_id", doc.ID,
 			)
 			continue
 		}
-		// Verificar que el .txt exista en MinIO.
-		_, err := r.storage.StatTXT(ctx, doc.TxtRef)
+		// Verificar que el artefacto exista en MinIO (bucket según el tipo de ref).
+		var err error
+		if legacy {
+			_, err = r.storage.StatLegacyTXT(ctx, ref)
+		} else {
+			_, err = r.storage.StatMD(ctx, ref)
+		}
 		if err != nil {
 			if isNotFound(err) {
 				count++
-				slog.Warn("reconciler: documento COMPLETED pero .txt no existe en MinIO",
+				slog.Warn("reconciler: documento COMPLETED pero el artefacto no existe en MinIO",
 					"document_id", doc.ID,
-					"txt_ref", doc.TxtRef,
+					"ref", ref, "legacy", legacy,
 				)
 			} else {
-				slog.Error("reconciler: error verificando .txt",
-					"document_id", doc.ID, "txt_ref", doc.TxtRef, "error", err)
+				slog.Error("reconciler: error verificando artefacto",
+					"document_id", doc.ID, "ref", ref, "legacy", legacy, "error", err)
 			}
 		}
 	}
@@ -1058,7 +1065,7 @@ func (r *Reconciler) crossCheck(ctx context.Context, now time.Time) (*CrossCheck
 	// 2. Contar por estado y detectar discrepancias.
 	docKeys := make(map[string]*domain.Document)
 	validRawKeys := make(map[string]bool)
-	validTxtKeys := make(map[string]bool)
+	validMdKeys := make(map[string]bool)
 
 	for _, doc := range docs {
 		report.ByStatus[string(doc.Status)]++
@@ -1072,8 +1079,8 @@ func (r *Reconciler) crossCheck(ctx context.Context, now time.Time) (*CrossCheck
 			docKeys[doc.ObjectKey] = doc
 			validRawKeys[doc.ObjectKey] = true
 		}
-		if doc.TxtRef != "" {
-			validTxtKeys[doc.TxtRef] = true
+		if doc.MdRef != "" {
+			validMdKeys[doc.MdRef] = true
 		}
 
 		// FAILED sin failure_reason (S5-P2-02).
@@ -1081,14 +1088,21 @@ func (r *Reconciler) crossCheck(ctx context.Context, now time.Time) (*CrossCheck
 			report.FailedNoReason = append(report.FailedNoReason, doc.ID)
 		}
 
-		// COMPLETED sin .txt (S5-P2-03).
+		// COMPLETED sin artefacto verificable (S5-P2-03, fallback legacy D5).
 		if doc.Status == domain.StatusCompleted {
-			if doc.TxtRef == "" {
-				report.CompletedNoTxt = append(report.CompletedNoTxt, doc.ID)
+			ref, legacy := doc.ExtractedRef()
+			if ref == "" {
+				report.CompletedNoMd = append(report.CompletedNoMd, doc.ID)
 			} else if now.Sub(doc.CreatedAt) >= r.minSafetyAge {
 				// Solo verificar si pasó el umbral de seguridad.
-				if _, err := r.storage.StatTXT(ctx, doc.TxtRef); err != nil && isNotFound(err) {
-					report.CompletedNoTxt = append(report.CompletedNoTxt, doc.ID)
+				var err error
+				if legacy {
+					_, err = r.storage.StatLegacyTXT(ctx, ref)
+				} else {
+					_, err = r.storage.StatMD(ctx, ref)
+				}
+				if err != nil && isNotFound(err) {
+					report.CompletedNoMd = append(report.CompletedNoMd, doc.ID)
 				}
 			}
 		}
@@ -1124,23 +1138,23 @@ func (r *Reconciler) crossCheck(ctx context.Context, now time.Time) (*CrossCheck
 		report.RawBucketObjects = int64(rawObjects)
 	}
 
-	// 3b. Listar objetos del bucket extracted-txt.
-	type txtLister interface {
-		ListObjectsTXT(ctx context.Context) ([]ports.ObjectInfo, error)
+	// 3b. Listar objetos del bucket extracted-md.
+	type mdLister interface {
+		ListObjectsMD(ctx context.Context) ([]ports.ObjectInfo, error)
 	}
-	if l, ok := r.storage.(txtLister); ok {
-		objects, err := l.ListObjectsTXT(ctx)
+	if l, ok := r.storage.(mdLister); ok {
+		objects, err := l.ListObjectsMD(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("list txt objects: %w", err)
+			return nil, fmt.Errorf("list md objects: %w", err)
 		}
-		txtObjects := 0
+		mdObjects := 0
 		for _, obj := range objects {
 			if strings.HasSuffix(obj.Key, "/") {
 				continue
 			}
-			txtObjects++
+			mdObjects++
 		}
-		report.TXTBucketObjects = int64(txtObjects)
+		report.MDBucketObjects = int64(mdObjects)
 	}
 
 	// 4. Redis stream length.
@@ -1162,7 +1176,7 @@ func (r *Reconciler) crossCheck(ctx context.Context, now time.Time) (*CrossCheck
 		"stream_length", report.StreamLength,
 		"orphan_raw", len(report.OrphanRawObjects),
 		"missing_raw", len(report.MissingRawObjects),
-		"completed_no_txt", len(report.CompletedNoTxt),
+		"completed_no_md", len(report.CompletedNoMd),
 		"failed_no_reason", len(report.FailedNoReason),
 		"young_untouched", report.YoungUntouched,
 	)

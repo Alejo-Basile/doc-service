@@ -182,9 +182,13 @@ type StatusEntry struct {
 // NOTA: no hay campo `attempts`: el contador de reintentos es el delivery
 // count de Redis XPENDING (SPEC §5.4, decisión de diseño).
 type Document struct {
-	ID            string        `bson:"_id" json:"id"`
-	Status        Status        `bson:"status" json:"status"`
-	ObjectKey     string        `bson:"object_key,omitempty" json:"object_key,omitempty"`
+	ID        string `bson:"_id" json:"id"`
+	Status    Status `bson:"status" json:"status"`
+	ObjectKey string `bson:"object_key,omitempty" json:"object_key,omitempty"`
+	MdRef     string `bson:"md_ref,omitempty" json:"md_ref,omitempty"`
+	// TxtRef es la referencia legacy al artefacto .txt pre-md. Solo lectura de
+	// compatibilidad (D5): las escrituras nuevas usan exclusivamente MdRef.
+	// Ver docs/design/legacy-txt-fallback.md.
 	TxtRef        string        `bson:"txt_ref,omitempty" json:"txt_ref,omitempty"`
 	FailureReason string        `bson:"failure_reason,omitempty" json:"failure_reason,omitempty"`
 	CorrelationID string        `bson:"correlation_id" json:"correlation_id"`
@@ -247,4 +251,18 @@ func (d *Document) Transition(to Status, actor Actor, correlationID, reason stri
 // SetObjectKey fija la clave del objeto en MinIO derivada del document_id.
 func (d *Document) SetObjectKey(bucketPrefix string) {
 	d.ObjectKey = fmt.Sprintf("%s/%s.pdf", bucketPrefix, d.ID)
+}
+
+// ExtractedRef resuelve la referencia al artefacto extraído con fallback legacy
+// (D5): primero md_ref; solo si está vacío, txt_ref. legacy indica que la
+// referencia proviene de txt_ref (bucket legacy). Devuelve "", false si ninguna
+// referencia existe. Idempotente y sin efectos.
+func (d *Document) ExtractedRef() (ref string, legacy bool) {
+	if d.MdRef != "" {
+		return d.MdRef, false
+	}
+	if d.TxtRef != "" {
+		return d.TxtRef, true
+	}
+	return "", false
 }
