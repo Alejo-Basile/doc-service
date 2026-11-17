@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -194,6 +195,70 @@ func TestRelay_ObjectKeyDerivado(t *testing.T) {
 }
 
 // --- Tests unitarios de reintento/backoff (S4-P2-05) ---
+
+// --- Tests de jitter equal-jitter (SPEC §7.1) ---
+
+func TestRelay_Jittered_Bordes(t *testing.T) {
+	casos := []struct {
+		nombre string
+		d      time.Duration
+		randn  func(int64) int64
+		want   time.Duration
+	}{
+		{"rand 0: límite inferior d/2", 200 * time.Millisecond, func(int64) int64 { return 0 }, 100 * time.Millisecond},
+		{"rand max: límite superior d", 200 * time.Millisecond, func(n int64) int64 { return n }, 200 * time.Millisecond},
+	}
+	for _, tt := range casos {
+		t.Run(tt.nombre, func(t *testing.T) {
+			got := jittered(tt.d, tt.randn)
+			if got != tt.want {
+				t.Errorf("jittered(%v) = %v, want %v", tt.d, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRelay_Jittered_VariaConElRandom(t *testing.T) {
+	d := 200 * time.Millisecond
+	valores := []int64{0, int64(50 * time.Millisecond), int64(99 * time.Millisecond)}
+	vistos := map[time.Duration]bool{}
+	for _, v := range valores {
+		got := jittered(d, func(int64) int64 { return v })
+		if vistos[got] {
+			t.Fatalf("jittered(%v) produjo %v repetido con rand distinto", d, got)
+		}
+		vistos[got] = true
+	}
+}
+
+func TestRelay_RetryUsaJitterEnElBackoff(t *testing.T) {
+	// La cola siempre falla; el hook graba los límites que recibe (la mitad
+	// nominal de cada backoff): 125ms, 250ms y 500ms prueban que el nominal
+	// sigue duplicándose y que el helper alimenta el camino del sleep.
+	var args []int64
+	q := &flakyQueue{failN: 100}
+	r := NewWithConfig(q, &fakeRelayRepo{}, 1, Config{MaxRetries: 3, BaseBackoff: 250 * time.Millisecond})
+	r.randInt63n = func(n int64) int64 {
+		args = append(args, n)
+		return 0
+	}
+
+	err := r.Handler()(context.Background(), changestream.Event{DocumentID: "doc-j", Status: "UPLOADED"})
+	if err == nil {
+		t.Fatal("Handler error = nil, want error tras agotar reintentos")
+	}
+	if q.calls != 4 {
+		t.Errorf("llamadas = %d, want 4 (1 + 3 reintentos)", q.calls)
+	}
+	want := []int64{
+		int64(125 * time.Millisecond),
+		int64(250 * time.Millisecond),
+		int64(500 * time.Millisecond),
+	}
+	if !slices.Equal(args, want) {
+		t.Errorf("límites del hook = %v, want %v", args, want)
+	}
+}
 
 // flakyQueue falla las primeras `failN` llamadas a Enqueue y luego tiene éxito.
 type flakyQueue struct {

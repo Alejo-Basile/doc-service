@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"time"
 
 	"github.com/Alejo-Basile/doc-service/internal/adapters/changestream"
@@ -23,6 +24,8 @@ type Relay struct {
 	schemaVer   int
 	maxRetries  int
 	baseBackoff time.Duration
+	// randInt63n genera el jitter; inyectable para tests deterministas.
+	randInt63n func(int64) int64
 }
 
 // Config configura el comportamiento de reintento del Relay (S4-P2-05).
@@ -62,7 +65,17 @@ func NewWithConfig(queue ports.WorkQueue, repo ports.DocumentRepository, schemaV
 		schemaVer:   schemaVersion,
 		maxRetries:  cfg.MaxRetries,
 		baseBackoff: cfg.BaseBackoff,
+		randInt63n:  rand.Int63n,
 	}
+}
+
+// jittered aplica equal jitter (SPEC §7.1) al backoff nominal d:
+// duerme d/2 + rand[0, d/2], es decir en [d/2, d]. Conserva un espaciado
+// mínimo (sin sleeps casi nulos) mientras dispersa los picos de reintento
+// sincronizados entre instancias.
+func jittered(d time.Duration, randn func(int64) int64) time.Duration {
+	half := d / 2
+	return half + time.Duration(randn(int64(half)))
 }
 
 // Handler retorna una función Handler para el Watcher:
@@ -184,7 +197,7 @@ func (r *Relay) enqueueWithRetry(ctx context.Context, msg ports.WorkMessage) err
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(backoff):
+		case <-time.After(jittered(backoff, r.randInt63n)):
 		}
 		backoff *= 2
 	}
