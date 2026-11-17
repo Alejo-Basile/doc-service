@@ -65,6 +65,7 @@ func main() {
 		"minio_bucket_raw", cfg.MinIOBucketRaw,
 		"redis_stream_key", cfg.RedisStreamKey,
 		"max_pdf_bytes", cfg.MaxPDFBytes,
+		"reconcile_dry_run", cfg.DryRun,
 	)
 
 	// --- Fase de arranque: dependencias con fail-fast ---
@@ -166,6 +167,7 @@ func main() {
 		repo, storage, queue, lease, ports.SystemClock{},
 		cfg.ReconcileInterval, 30*time.Minute, cfg.MinSafetyAge,
 		reconciler.WithInternalToken(cfg.InternalToken),
+		reconciler.WithDryRun(cfg.DryRun),
 	)
 
 	// --- Servidor HTTP ---

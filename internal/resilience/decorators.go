@@ -148,6 +148,10 @@ func (s *objectStorage) Delete(ctx context.Context, objectKey string) error {
 	return s.b.Do(func() error { return s.inner.Delete(ctx, objectKey) })
 }
 
+func (s *objectStorage) DeleteTXT(ctx context.Context, objectKey string) error {
+	return s.b.Do(func() error { return s.inner.DeleteTXT(ctx, objectKey) })
+}
+
 func (s *objectStorage) PresignGet(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
 	var url string
 	err := s.b.Do(func() error {

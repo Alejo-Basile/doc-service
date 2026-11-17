@@ -74,8 +74,10 @@ type ObjectStorage interface {
 	StatTXT(ctx context.Context, objectKey string) (ObjectInfo, error)
 	// GetRange lee un rango de bytes del objeto (para validar %PDF-).
 	GetRange(ctx context.Context, objectKey string, start, end int64) ([]byte, error)
-	// Delete elimina un objeto.
+	// Delete elimina un objeto del bucket raw.
 	Delete(ctx context.Context, objectKey string) error
+	// DeleteTXT elimina un objeto del bucket extracted-txt (purga de huérfanos, SPEC §6.5).
+	DeleteTXT(ctx context.Context, objectKey string) error
 	// PresignGet genera una URL prefirmada de lectura.
 	PresignGet(ctx context.Context, objectKey string, expiry time.Duration) (string, error)
 	// PresignGetTXT genera una URL prefirmada de lectura del bucket extracted-txt.

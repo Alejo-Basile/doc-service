@@ -80,7 +80,7 @@ justo cuando menos presión hace falta (SPEC §7.3).
 | T2 | hecho | `0839c4f` | medium / slice_budget_reached → **declined** (omitido a decisión del usuario, 2026-11-16) |
 | T3 | hecho | `b614ef7` | medium / slice_budget_reached → **declined** (omitido a decisión del usuario, 2026-11-16) |
 
-Suite hermética en verde tras los 3 commits (`go test -race` sobre el filtro de CI). PR abierto a `main`.
+Suite hermética en verde tras los 3 commits (`go test -race` sobre el filtro de CI). PR #79 abierto a `main`: https://github.com/Alejo-Basile/doc-service/pull/79 (4 commits: `12ecbc0`, `0839c4f`, `b614ef7`, `da16d89`).
 
 ## Próximo paso
 T1 — jitter en el backoff del relay (RED → GREEN).

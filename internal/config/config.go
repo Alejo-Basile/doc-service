@@ -54,6 +54,9 @@ type Config struct {
 	// MinSafetyAge es la edad mínima antes de que el reconciliador toque un documento (S6-P2-02).
 	// Documentos más jóvenes que esto nunca son alterados bajo ninguna condición.
 	MinSafetyAge time.Duration
+	// DryRun activa el modo de solo planificación del reconciliador (SPEC §6.5):
+	// detecta y loguea las acciones destructivas, pero no muta nada.
+	DryRun bool
 }
 
 // default values documentados en SPEC §11.5.
@@ -96,6 +99,7 @@ func Load() (*Config, error) {
 		ReconcileInterval:   time.Duration(envInt("RECONCILE_INTERVAL_MIN", defaultReconcileMin)) * time.Minute,
 		DocUploadGrace:      time.Duration(envInt("DOC_UPLOAD_GRACE_MIN", defaultDocUploadGraceMin)) * time.Minute,
 		MinSafetyAge:        time.Duration(envInt("MIN_SAFETY_AGE_MIN", defaultMinSafetyAgeMin)) * time.Minute,
+		DryRun:              envBool("RECONCILE_DRY_RUN", false),
 	}
 
 	if err := cfg.Validate(); err != nil {

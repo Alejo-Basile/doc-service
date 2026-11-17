@@ -19,7 +19,7 @@ func setEnv(t *testing.T, vars map[string]string) {
 		"REDIS_ADDR", "REDIS_PASSWORD", "REDIS_STREAM_KEY",
 		"REDIS_SENTINEL_ADDRS", "REDIS_MASTER_NAME", "INTERNAL_TOKEN",
 		"MAX_PDF_BYTES", "RECONCILE_INTERVAL_MIN", "DOC_UPLOAD_GRACE_MIN",
-		"MIN_SAFETY_AGE_MIN",
+		"MIN_SAFETY_AGE_MIN", "RECONCILE_DRY_RUN",
 	}
 	for _, k := range claves {
 		os.Unsetenv(k)
@@ -298,6 +298,34 @@ func TestLoad_SentinelIgnoraRedisAddr(t *testing.T) {
 
 	if _, err := Load(); err != nil {
 		t.Fatalf("Load() no debía exigir REDIS_ADDR en modo Sentinel: %v", err)
+	}
+}
+
+// --- Dry-run del reconciliador (SPEC §6.5, T1) ---
+
+func TestLoad_DryRun_DefaultFalse(t *testing.T) {
+	setEnv(t, completeVars())
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.DryRun {
+		t.Error("DryRun = true por defecto, want false (el modo destructivo es el histórico)")
+	}
+}
+
+func TestLoad_DryRun_DesdeEnv(t *testing.T) {
+	vars := completeVars()
+	vars["RECONCILE_DRY_RUN"] = "true"
+	setEnv(t, vars)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.DryRun {
+		t.Error("DryRun = false, want true con RECONCILE_DRY_RUN=true")
 	}
 }
 
