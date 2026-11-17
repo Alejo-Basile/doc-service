@@ -9,6 +9,7 @@ require (
 	github.com/oklog/ulid/v2 v2.1.0
 	github.com/prometheus/client_golang v1.21.1
 	github.com/redis/go-redis/v9 v9.22.0
+	github.com/sony/gobreaker/v2 v2.4.0
 	go.mongodb.org/mongo-driver/v2 v2.8.2
 )
 
