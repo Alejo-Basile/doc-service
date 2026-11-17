@@ -5,6 +5,7 @@
 //   - Si el objeto NO existe en MinIO → UPLOAD_EXPIRED.
 //   - Si el objeto SÍ existe (webhook perdido) → UPLOADED (con validación %PDF-).
 //   - Documentos UPLOADED estancados cuyo objeto exista → reencolan a Redis Streams.
+//   - Documentos en estados intermedios trabados → reencolan o completan la SAGA hasta FAILED.
 //   - Objetos huérfanos en MinIO sin documento terminal → purga tras umbral.
 //   - Bloqueo distribuido (lease Redis con TTL) para evitar ejecución concurrente.
 //
@@ -266,12 +267,14 @@ func (r *Reconciler) runOnce(ctx context.Context, dryRun bool) (*Result, error) 
 	}
 	result.Reenqueued += reenqueued2
 
-	// 3. Documentos en estado intermedio con updated_at antiguo (solo detección).
-	stuck, err := r.sweepStuckIntermediate(ctx, now)
+	// 3. Documentos en estado intermedio con updated_at antiguo: reencolar si el
+	// objeto existe o completar la vía de fallo hasta FAILED (SPEC §6.5, T3).
+	stuck, stuckReenqueued, err := r.sweepStuckIntermediate(ctx, now, dryRun, actions)
 	if err != nil {
 		return nil, fmt.Errorf("sweep stuck: %w", err)
 	}
 	result.StuckDetected = stuck
+	result.Reenqueued += stuckReenqueued
 
 	// 4. Purga de objetos huérfanos en MinIO (S4-P2-02).
 	orphans, err := r.sweepOrphans(ctx, now, dryRun, actions)
@@ -795,10 +798,24 @@ func (r *Reconciler) objectExists(ctx context.Context, objectKey string) (bool, 
 	return true, nil
 }
 
-// sweepStuckIntermediate detecta documentos en estados intermedios con
-// updated_at antiguo. Solo detecta y loguea.
-func (r *Reconciler) sweepStuckIntermediate(ctx context.Context, now time.Time) (int, error) {
+// sweepStuckIntermediate recupera documentos en estados intermedios con
+// updated_at antiguo (SPEC §6.5, T3), usando solo aristas declaradas en la
+// matriz del dominio (SPEC §4):
+//   - PROCESSING/RETRYING con el objeto raw presente → reencolar (espeja el
+//     retry handler de internal/api/internal.go): PROCESSING→RETRYING + Enqueue;
+//     RETRYING solo Enqueue (RETRYING→PROCESSING pertenece al worker).
+//   - PROCESSING/RETRYING sin el objeto → completar la vía de fallo de la SAGA:
+//     →EXTRACTION_FAILED (OBJECT_MISSING) →COMPENSATING →FAILED.
+//   - COMPENSATING → FAILED (COMPENSATION_FAILED).
+//
+// QUEUED queda fuera de este sweep: sweepStuckQueued ya lo reencola sin
+// transicionar y acá solo se detecta (no se expande scope).
+//
+// Devuelve cuántos documentos trabados detectó y cuántos se reencolaron
+// (planificados en dry-run).
+func (r *Reconciler) sweepStuckIntermediate(ctx context.Context, now time.Time, dryRun bool, actions *actionReport) (int, int, error) {
 	stuckCount := 0
+	reenqueued := 0
 	cutoff := now.Add(-r.stuckAfter)
 
 	intermediateStatuses := []domain.Status{
@@ -814,23 +831,170 @@ func (r *Reconciler) sweepStuckIntermediate(ctx context.Context, now time.Time) 
 			Limit:  100,
 		})
 		if err != nil {
-			return stuckCount, fmt.Errorf("list %s: %w", status, err)
+			return stuckCount, reenqueued, fmt.Errorf("list %s: %w", status, err)
 		}
 
 		for _, doc := range docs {
-			if doc.UpdatedAt.Before(cutoff) {
-				stuckCount++
-				slog.Warn("reconciler: documento en estado intermedio colgado",
-					"document_id", doc.ID,
-					"status", doc.Status,
-					"updated_at", doc.UpdatedAt,
-					"stuck_since", r.stuckAfter,
-				)
+			if !doc.UpdatedAt.Before(cutoff) {
+				continue
+			}
+			stuckCount++
+			slog.Warn("reconciler: documento en estado intermedio colgado",
+				"document_id", doc.ID,
+				"status", doc.Status,
+				"updated_at", doc.UpdatedAt,
+				"stuck_since", r.stuckAfter,
+			)
+
+			switch doc.Status {
+			case domain.StatusQueued:
+				// Fuera de scope (T3): sweepStuckQueued lo reencola sin transición.
+				continue
+			case domain.StatusCompensating:
+				if err := r.failStuckCompensating(ctx, doc, dryRun, actions); err != nil {
+					slog.Error("reconciler: error recuperando COMPENSATING",
+						"document_id", doc.ID, "error", err)
+				}
+			case domain.StatusProcessing, domain.StatusRetrying:
+				enqueued, err := r.recoverStuckExtraction(ctx, now, doc, dryRun, actions)
+				if err != nil {
+					slog.Error("reconciler: error recuperando estado intermedio",
+						"document_id", doc.ID, "status", doc.Status, "error", err)
+					continue
+				}
+				if enqueued {
+					reenqueued++
+				}
 			}
 		}
 	}
 
-	return stuckCount, nil
+	return stuckCount, reenqueued, nil
+}
+
+// recoverStuckExtraction resuelve un PROCESSING/RETRYING trabado: si el objeto
+// raw existe se reencola; si no existe, se completa la vía de fallo de la SAGA.
+// Devuelve true solo cuando se reencoló (o se planificó el encolado en dry-run).
+func (r *Reconciler) recoverStuckExtraction(
+	ctx context.Context, now time.Time, doc *domain.Document, dryRun bool, actions *actionReport,
+) (bool, error) {
+	exists, err := r.objectExists(ctx, doc.ObjectKey)
+	if err != nil {
+		return false, fmt.Errorf("verificar objeto: %w", err)
+	}
+
+	if !exists {
+		return false, r.failMissingObject(ctx, doc, dryRun, actions)
+	}
+
+	// Sin queue no hay forma de reencolar: se deja el documento intacto para
+	// que un sweep posterior (con queue configurado) lo recupere.
+	if r.queue == nil {
+		slog.Warn("reconciler: estado intermedio trabado sin queue configurado, no se reencola",
+			"document_id", doc.ID, "status", doc.Status)
+		return false, nil
+	}
+
+	// PROCESSING → RETRYING antes del XADD. RETRYING solo se reencola: la
+	// transición a PROCESSING la hace el worker al reclamar el mensaje.
+	if doc.Status == domain.StatusProcessing {
+		ok, err := r.updateStatusWithHistory(ctx, actions, dryRun, doc.ID,
+			domain.StatusProcessing, domain.StatusRetrying,
+			domain.StatusEntry{
+				Status:        domain.StatusRetrying,
+				Actor:         domain.ActorReconciler,
+				CorrelationID: doc.CorrelationID,
+			},
+			nil,
+		)
+		if err != nil {
+			return false, fmt.Errorf("transicionar a RETRYING: %w", err)
+		}
+		if !ok {
+			return false, nil // el documento cambió de estado: no encolar
+		}
+	}
+
+	msg := ports.WorkMessage{
+		DocumentID:    doc.ID,
+		ObjectKey:     doc.ObjectKey,
+		CorrelationID: doc.CorrelationID,
+		EnqueuedAt:    now.Format(time.RFC3339),
+		SchemaVersion: doc.SchemaVersion,
+	}
+	if err := r.enqueue(ctx, actions, dryRun, msg); err != nil {
+		return false, fmt.Errorf("reencolar: %w", err)
+	}
+	if !dryRun {
+		slog.Info("reconciler: documento reencolado (estado intermedio trabado)",
+			"document_id", doc.ID, "status", doc.Status, "object_key", doc.ObjectKey)
+	}
+	return true, nil
+}
+
+// failMissingObject completa la vía de fallo de la SAGA para un documento
+// intermedio cuyo objeto raw no existe, con aristas declaradas: EXTRACTION_FAILED
+// (OBJECT_MISSING) → COMPENSATING → FAILED. Es el mismo camino que tomaría un
+// worker vivo ante un error de negocio (SPEC §4).
+func (r *Reconciler) failMissingObject(ctx context.Context, doc *domain.Document, dryRun bool, actions *actionReport) error {
+	steps := []struct {
+		from   domain.Status
+		to     domain.Status
+		reason string
+	}{
+		{doc.Status, domain.StatusExtractionFailed, domain.FailureReasonObjectMissing},
+		{domain.StatusExtractionFailed, domain.StatusCompensating, ""},
+		{domain.StatusCompensating, domain.StatusFailed, domain.FailureReasonObjectMissing},
+	}
+
+	for _, step := range steps {
+		ok, err := r.updateStatusWithHistory(ctx, actions, dryRun, doc.ID,
+			step.from, step.to,
+			domain.StatusEntry{
+				Status:        step.to,
+				Actor:         domain.ActorReconciler,
+				CorrelationID: doc.CorrelationID,
+				Reason:        step.reason,
+			},
+			nil,
+		)
+		if err != nil {
+			return fmt.Errorf("%s→%s: %w", step.from, step.to, err)
+		}
+		if !ok {
+			// El documento cambió de estado: no forzar el resto de la cascada.
+			return nil
+		}
+	}
+
+	if !dryRun {
+		slog.Info("reconciler: documento fallido (objeto ausente en estado intermedio)",
+			"document_id", doc.ID, "failure_reason", domain.FailureReasonObjectMissing)
+	}
+	return nil
+}
+
+// failStuckCompensating cierra un COMPENSATING trabado: COMPENSATING→FAILED
+// con COMPENSATION_FAILED (arista y constante existentes, SPEC §4).
+func (r *Reconciler) failStuckCompensating(ctx context.Context, doc *domain.Document, dryRun bool, actions *actionReport) error {
+	ok, err := r.updateStatusWithHistory(ctx, actions, dryRun, doc.ID,
+		domain.StatusCompensating, domain.StatusFailed,
+		domain.StatusEntry{
+			Status:        domain.StatusFailed,
+			Actor:         domain.ActorReconciler,
+			CorrelationID: doc.CorrelationID,
+			Reason:        domain.FailureReasonCompensateFail,
+		},
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	if ok && !dryRun {
+		slog.Info("reconciler: documento fallido (compensación trabada)",
+			"document_id", doc.ID, "failure_reason", domain.FailureReasonCompensateFail)
+	}
+	return nil
 }
 
 // sweepCompletedMissingTxt detecta documentos COMPLETED cuyo .txt no existe en MinIO (S5-P2-03).
