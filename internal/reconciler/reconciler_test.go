@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -94,6 +95,12 @@ func (m *mockRepo) UpdateStatusWithHistory(ctx context.Context, id string, from,
 	}
 	doc.Status = to
 	doc.UpdatedAt = time.Now().UTC()
+	// Espeja al adaptador Mongo: failure_reason se deriva de entry.Reason
+	// cuando el destino es un estado de fallo.
+	if entry.Reason != "" && (to == domain.StatusFailed ||
+		to == domain.StatusRejected || to == domain.StatusExtractionFailed) {
+		doc.FailureReason = entry.Reason
+	}
 	entry.At = time.Now().UTC()
 	doc.History = append(doc.History, entry)
 	return true, nil
@@ -110,6 +117,7 @@ type mockStorage struct {
 	listObjects    []ports.ObjectInfo
 	listObjectsTXT []ports.ObjectInfo
 	deleted        []string
+	deletedTXT     []string // purgas del bucket extracted-txt (T2, SPEC §6.5)
 }
 
 func newMockStorage() *mockStorage {
@@ -196,6 +204,12 @@ func (m *mockStorage) GetRange(ctx context.Context, objectKey string, start, end
 func (m *mockStorage) Delete(ctx context.Context, objectKey string) error {
 	m.deleted = append(m.deleted, objectKey)
 	delete(m.objects, objectKey)
+	return nil
+}
+
+func (m *mockStorage) DeleteTXT(ctx context.Context, objectKey string) error {
+	m.deletedTXT = append(m.deletedTXT, objectKey)
+	delete(m.txtObjects, objectKey)
 	return nil
 }
 
@@ -393,15 +407,16 @@ func TestRunOnce_NotExpired_Skipped(t *testing.T) {
 	}
 }
 
-func TestRunOnce_StuckIntermediate_Detected(t *testing.T) {
+func TestRunOnce_StuckIntermediate_QueuedSoloDetecta(t *testing.T) {
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	repo := newMockRepo()
 	storage := newMockStorage()
 
-	// Documento en PROCESSING con updated_at hace 2h (umbral: 30min).
+	// QUEUED queda fuera de T3 (su sweep dedicado lo reencola sin transicionar):
+	// el sweep de estados intermedios solo lo detecta y loguea.
 	doc := &domain.Document{
 		ID:        "doc-stuck",
-		Status:    domain.StatusProcessing,
+		Status:    domain.StatusQueued,
 		ObjectKey: "raw-pdfs/doc-stuck.pdf",
 		UpdatedAt: now.Add(-2 * time.Hour),
 	}
@@ -417,9 +432,12 @@ func TestRunOnce_StuckIntermediate_Detected(t *testing.T) {
 		t.Errorf("StuckDetected = %d, want 1", result.StuckDetected)
 	}
 
-	// v1 solo detecta: no debe transicionar.
+	// QUEUED no se muta desde este sweep.
 	if len(repo.updateCalls) != 0 {
-		t.Errorf("updateCalls = %d, want 0 (v1 solo detecta)", len(repo.updateCalls))
+		t.Errorf("updateCalls = %d, want 0 (QUEUED fuera de scope T3)", len(repo.updateCalls))
+	}
+	if doc.Status != domain.StatusQueued {
+		t.Errorf("estado final = %s, want QUEUED (sin cambios)", doc.Status)
 	}
 }
 
@@ -744,6 +762,254 @@ func TestRegisterRoutes_ReconcileRequiereToken(t *testing.T) {
 	}
 }
 
+// --- Modo dry-run (SPEC §6.5, T1) ---
+
+// TestRunOnce_DryRun_DetectaPeroNoMuta cubre el contrato central del dry-run:
+// la corrida detecta igual que en modo normal (contenedores del Result en
+// verde) pero no ejecuta NINGUNA mutación: 0 updates, 0 enqueues, 0 deletes.
+// El reporte debe distinguir acciones planificadas de ejecutadas.
+func TestRunOnce_DryRun_DetectaPeroNoMuta(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+
+	// 1) PENDING_UPLOAD vencido sin objeto → planifica UPLOAD_EXPIRED.
+	repo.docs["doc-expired"] = &domain.Document{
+		ID:        "doc-expired",
+		Status:    domain.StatusPendingUpload,
+		ObjectKey: "raw-pdfs/doc-expired.pdf",
+		ExpiresAt: now.Add(-time.Hour),
+		CreatedAt: now.Add(-2 * time.Hour),
+	}
+	// 2) PENDING_UPLOAD vencido con PDF válido → planifica UPLOADED.
+	repo.docs["doc-recover"] = &domain.Document{
+		ID:        "doc-recover",
+		Status:    domain.StatusPendingUpload,
+		ObjectKey: "raw-pdfs/doc-recover.pdf",
+		ExpiresAt: now.Add(-time.Hour),
+		CreatedAt: now.Add(-2 * time.Hour),
+	}
+	storage.objects["raw-pdfs/doc-recover.pdf"] = true
+	// 3) UPLOADED estancado con objeto → planifica QUEUED + Enqueue.
+	repo.docs["doc-uploaded"] = &domain.Document{
+		ID:        "doc-uploaded",
+		Status:    domain.StatusUploaded,
+		ObjectKey: "raw-pdfs/doc-uploaded.pdf",
+		CreatedAt: now.Add(-2 * time.Hour),
+		UpdatedAt: now.Add(-2 * time.Hour),
+	}
+	storage.objects["raw-pdfs/doc-uploaded.pdf"] = true
+	// 4) QUEUED estancado → planifica Enqueue (sin transición).
+	repo.docs["doc-queued"] = &domain.Document{
+		ID:        "doc-queued",
+		Status:    domain.StatusQueued,
+		ObjectKey: "raw-pdfs/doc-queued.pdf",
+		CreatedAt: now.Add(-2 * time.Hour),
+		UpdatedAt: now.Add(-2 * time.Hour),
+	}
+	// 5) Huérfano antiguo en MinIO → planifica Delete.
+	storage.listObjects = []ports.ObjectInfo{
+		{Key: "raw-pdfs/huerfano-viejo.pdf", LastModified: now.Add(-30 * 24 * time.Hour)},
+	}
+
+	r := New(repo, storage, queue, nil, &mockClock{now},
+		10*time.Minute, 30*time.Minute, 15*time.Minute, WithDryRun(true))
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	// Detección intacta: los contadores reportan lo que se habría hecho.
+	if result.ExpiredPending != 1 || result.RecoveredUploaded != 1 {
+		t.Errorf("detección PENDING_UPLOAD = (expired %d, recovered %d), want (1, 1)",
+			result.ExpiredPending, result.RecoveredUploaded)
+	}
+	if result.Reenqueued != 2 {
+		t.Errorf("Reenqueued = %d, want 2 (UPLOADED + QUEUED estancados)", result.Reenqueued)
+	}
+	if result.OrphansPurged != 1 {
+		t.Errorf("OrphansPurged = %d, want 1 (huérfano antiguo detectado)", result.OrphansPurged)
+	}
+
+	// Cero mutaciones.
+	if len(repo.updateCalls) != 0 {
+		t.Errorf("updateCalls = %+v, want 0 en dry-run", repo.updateCalls)
+	}
+	if len(queue.enqueued) != 0 {
+		t.Errorf("enqueued = %d, want 0 en dry-run", len(queue.enqueued))
+	}
+	if len(storage.deleted) != 0 {
+		t.Errorf("deleted = %v, want 0 en dry-run", storage.deleted)
+	}
+
+	// Reporte planificado vs ejecutado.
+	if !result.DryRun {
+		t.Error("DryRun = false en el reporte, want true")
+	}
+	if result.PlannedActions == 0 {
+		t.Error("PlannedActions = 0, want > 0 (el plan debe reportarse)")
+	}
+	if result.ExecutedActions != 0 {
+		t.Errorf("ExecutedActions = %d, want 0 en dry-run", result.ExecutedActions)
+	}
+
+	// Los documentos quedan exactamente como estaban.
+	if doc := repo.docs["doc-expired"]; doc.Status != domain.StatusPendingUpload {
+		t.Errorf("doc-expired status = %s, want PENDING_UPLOAD (intacto)", doc.Status)
+	}
+	if doc := repo.docs["doc-uploaded"]; doc.Status != domain.StatusUploaded {
+		t.Errorf("doc-uploaded status = %s, want UPLOADED (intacto)", doc.Status)
+	}
+}
+
+// TestRunOnce_ModoEjecucion_ReportaPlanificadoYEjecutado fija el otro lado del
+// contrato: sin dry-run, el reporte cuenta las acciones efectivamente ejecutadas.
+func TestRunOnce_ModoEjecucion_ReportaPlanificadoYEjecutado(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+
+	doc := &domain.Document{
+		ID:        "doc-uploaded",
+		Status:    domain.StatusUploaded,
+		ObjectKey: "raw-pdfs/doc-uploaded.pdf",
+		CreatedAt: now.Add(-2 * time.Hour),
+		UpdatedAt: now.Add(-2 * time.Hour),
+	}
+	repo.docs["doc-uploaded"] = doc
+	storage.objects[doc.ObjectKey] = true
+
+	r := New(repo, storage, queue, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if result.DryRun {
+		t.Error("DryRun = true sin configurarlo")
+	}
+	// Transición UPLOADED→QUEUED + un Enqueue.
+	if result.PlannedActions != 2 {
+		t.Errorf("PlannedActions = %d, want 2 (transición + enqueue)", result.PlannedActions)
+	}
+	if result.ExecutedActions != 2 {
+		t.Errorf("ExecutedActions = %d, want 2 (ambas acciones se ejecutaron)", result.ExecutedActions)
+	}
+	if doc.Status != domain.StatusQueued || len(queue.enqueued) != 1 {
+		t.Errorf("estado/encolado = (%s, %d), want (QUEUED, 1)", doc.Status, len(queue.enqueued))
+	}
+}
+
+// TestRegisterRoutes_ReconcileDryRunOverride verifica que ?dry_run=1 fuerza el
+// modo planificado aunque la config esté en modo ejecución, y que la respuesta
+// serializa el reporte (dry_run + contadores).
+func TestRegisterRoutes_ReconcileDryRunOverride(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const token = "internal-test-token"
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+	repo.docs["doc-expired"] = &domain.Document{
+		ID:        "doc-expired",
+		Status:    domain.StatusPendingUpload,
+		ObjectKey: "raw-pdfs/doc-expired.pdf",
+		ExpiresAt: now.Add(-time.Hour),
+		CreatedAt: now.Add(-2 * time.Hour),
+	}
+
+	// Config en modo ejecución (DryRun=false): el query param debe ganar.
+	r := New(repo, storage, queue, nil, &mockClock{now},
+		10*time.Minute, 30*time.Minute, 15*time.Minute, WithInternalToken(token))
+	engine := gin.New()
+	r.RegisterRoutes(engine)
+
+	req := httptest.NewRequest(http.MethodPost, "/internal/reconcile?dry_run=1", nil)
+	req.Header.Set("X-Internal-Token", token)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	if len(repo.updateCalls) != 0 {
+		t.Errorf("updateCalls = %+v, want 0 con ?dry_run=1", repo.updateCalls)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"dry_run":true`) {
+		t.Errorf("respuesta sin dry_run=true: %s", body)
+	}
+	if !strings.Contains(body, `"planned_actions"`) {
+		t.Errorf("respuesta sin planned_actions: %s", body)
+	}
+}
+
+// TestRegisterRoutes_ReconcileDryRunOverrideFalse verifica que ?dry_run=0
+// desactiva el dry-run configurado para esa invocación (override en ambos sentidos).
+func TestRegisterRoutes_ReconcileDryRunOverrideFalse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const token = "internal-test-token"
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	repo.docs["doc-expired"] = &domain.Document{
+		ID:        "doc-expired",
+		Status:    domain.StatusPendingUpload,
+		ObjectKey: "raw-pdfs/doc-expired.pdf",
+		ExpiresAt: now.Add(-time.Hour),
+		CreatedAt: now.Add(-2 * time.Hour),
+	}
+
+	r := New(repo, storage, nil, nil, &mockClock{now},
+		10*time.Minute, 30*time.Minute, 15*time.Minute,
+		WithInternalToken(token), WithDryRun(true))
+	engine := gin.New()
+	r.RegisterRoutes(engine)
+
+	req := httptest.NewRequest(http.MethodPost, "/internal/reconcile?dry_run=0", nil)
+	req.Header.Set("X-Internal-Token", token)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	if len(repo.updateCalls) != 1 {
+		t.Errorf("updateCalls = %+v, want 1 con ?dry_run=0", repo.updateCalls)
+	}
+	if repo.docs["doc-expired"].Status != domain.StatusUploadExpired {
+		t.Errorf("status = %s, want UPLOAD_EXPIRED (?dry_run=0 ejecuta)", repo.docs["doc-expired"].Status)
+	}
+}
+
+// TestRegisterRoutes_ReconcileDryRunInvalido verifica que un valor no booleano
+// de ?dry_run se rechaza con 400 en vez de caer silenciosamente al modo configurado.
+func TestRegisterRoutes_ReconcileDryRunInvalido(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const token = "internal-test-token"
+
+	repo := newMockRepo()
+	storage := newMockStorage()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	r := New(repo, storage, nil, nil, &mockClock{now},
+		10*time.Minute, 30*time.Minute, 15*time.Minute, WithInternalToken(token))
+	engine := gin.New()
+	r.RegisterRoutes(engine)
+
+	req := httptest.NewRequest(http.MethodPost, "/internal/reconcile?dry_run=quizas", nil)
+	req.Header.Set("X-Internal-Token", token)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body.String())
+	}
+}
+
 // --- Reencolado de UPLOADED estancados (S4-P2-01) ---
 
 func TestSweepStuckUploaded_ReencolaSiObjetoExiste(t *testing.T) {
@@ -935,6 +1201,125 @@ func TestSweepOrphans_SinObjetos_NoPurga(t *testing.T) {
 	}
 	if result.OrphansPurged != 0 {
 		t.Errorf("OrphansPurged = %d, want 0", result.OrphansPurged)
+	}
+}
+
+// --- Huérfanos en extracted-txt (T2, SPEC §6.5) ---
+
+// TestSweepOrphans_PurgaTxtHuerfano cubre el segundo pass sobre el bucket
+// extracted-txt: un objeto sin documento que lo referencie (TxtRef) y más
+// antiguo que el umbral se purga, mientras el txt referenciado y el huérfano
+// reciente quedan intactos. Espeja la semántica del pass de raw.
+func TestSweepOrphans_PurgaTxtHuerfano(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+
+	// Documento que referencia su .txt: no debe purgarse.
+	referenced := "extracted-txt/doc-1.txt"
+	repo.docs["doc-1"] = &domain.Document{
+		ID:        "doc-1",
+		Status:    domain.StatusCompleted,
+		ObjectKey: "raw-pdfs/doc-1.pdf",
+		TxtRef:    referenced,
+		CreatedAt: now.Add(-time.Hour),
+	}
+
+	storage.listObjectsTXT = []ports.ObjectInfo{
+		// Referenciado y antiguo → NO se borra.
+		{Key: referenced, LastModified: now.Add(-30 * 24 * time.Hour)},
+		// Huérfano antiguo (> 7 días) → SÍ se borra.
+		{Key: "extracted-txt/huerfano-viejo.txt", LastModified: now.Add(-30 * 24 * time.Hour)},
+		// Huérfano reciente (< 7 días) → NO se borra todavía.
+		{Key: "extracted-txt/huerfano-nuevo.txt", LastModified: now.Add(-time.Hour)},
+	}
+
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if result.OrphansPurged != 1 {
+		t.Fatalf("OrphansPurged = %d, want 1", result.OrphansPurged)
+	}
+	if len(storage.deletedTXT) != 1 || storage.deletedTXT[0] != "extracted-txt/huerfano-viejo.txt" {
+		t.Fatalf("deletedTXT = %v, want [extracted-txt/huerfano-viejo.txt]", storage.deletedTXT)
+	}
+	for _, k := range storage.deletedTXT {
+		if k == referenced {
+			t.Errorf("borró un txt referenciado por un documento: %s", k)
+		}
+	}
+	if len(storage.deleted) != 0 {
+		t.Errorf("deleted (raw) = %v, want vacío: el pass txt no debe tocar raw", storage.deleted)
+	}
+}
+
+// TestSweepOrphans_NoPurgaTxtReferenciado fija la garantía de seguridad: un
+// objeto de extracted-txt referenciado por cualquier documento (aunque sea
+// antiguo) jamás se borra.
+func TestSweepOrphans_NoPurgaTxtReferenciado(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+
+	referenced := "extracted-txt/doc-ref.txt"
+	repo.docs["doc-ref"] = &domain.Document{
+		ID:        "doc-ref",
+		Status:    domain.StatusCompleted,
+		ObjectKey: "raw-pdfs/doc-ref.pdf",
+		TxtRef:    referenced,
+		CreatedAt: now.Add(-time.Hour),
+	}
+	storage.listObjectsTXT = []ports.ObjectInfo{
+		{Key: referenced, LastModified: now.Add(-30 * 24 * time.Hour)},
+	}
+
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if result.OrphansPurged != 0 {
+		t.Errorf("OrphansPurged = %d, want 0 (txt referenciado)", result.OrphansPurged)
+	}
+	if len(storage.deletedTXT) != 0 {
+		t.Errorf("deletedTXT = %v, want vacío (txt referenciado)", storage.deletedTXT)
+	}
+}
+
+// TestSweepOrphans_DryRun_PlanificaTxtSinBorrar prueba que la purga de txt pasa
+// por el choke point de dry-run (deleteTXTObject): se planifica y cuenta, pero
+// no se ejecuta ningún borrado (SPEC §6.5, T1).
+func TestSweepOrphans_DryRun_PlanificaTxtSinBorrar(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+
+	storage.listObjectsTXT = []ports.ObjectInfo{
+		{Key: "extracted-txt/huerfano-dry.txt", LastModified: now.Add(-30 * 24 * time.Hour)},
+	}
+
+	r := New(repo, storage, nil, nil, &mockClock{now},
+		10*time.Minute, 30*time.Minute, 15*time.Minute, WithDryRun(true))
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if result.OrphansPurged != 1 {
+		t.Errorf("OrphansPurged = %d, want 1 (planificado)", result.OrphansPurged)
+	}
+	if len(storage.deletedTXT) != 0 {
+		t.Errorf("deletedTXT = %v, want 0 en dry-run", storage.deletedTXT)
+	}
+	if result.PlannedActions == 0 {
+		t.Error("PlannedActions = 0, want > 0 (el plan debe reportarse)")
+	}
+	if result.ExecutedActions != 0 {
+		t.Errorf("ExecutedActions = %d, want 0 en dry-run", result.ExecutedActions)
 	}
 }
 
@@ -1222,5 +1607,429 @@ func TestSweepStuckQueued_IgnoraSinObjectKey(t *testing.T) {
 	}
 	if len(q.enqueued) != 0 {
 		t.Fatalf("enqueued = %d", len(q.enqueued))
+	}
+}
+
+// --- Estados intermedios trabados: recuperación real (T3, SPEC §6.5) ---
+
+// TestRunOnce_StuckProcessing_ObjetoPresente_ReencolaComoRetrying cubre la
+// arista "fallo transitorio": PROCESSING estancado con el objeto raw presente
+// pasa a RETRYING y se reencola con el mensaje de SPEC §11.3 (T3).
+func TestRunOnce_StuckProcessing_ObjetoPresente_ReencolaComoRetrying(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+
+	doc := &domain.Document{
+		ID:            "doc-proc",
+		Status:        domain.StatusProcessing,
+		ObjectKey:     "raw-pdfs/doc-proc.pdf",
+		CorrelationID: "corr-proc",
+		SchemaVersion: 2,
+		CreatedAt:     now.Add(-2 * time.Hour),
+		UpdatedAt:     now.Add(-2 * time.Hour),
+	}
+	repo.docs[doc.ID] = doc
+	storage.objects[doc.ObjectKey] = true
+
+	r := New(repo, storage, queue, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if doc.Status != domain.StatusRetrying {
+		t.Fatalf("estado final = %s, want RETRYING", doc.Status)
+	}
+	if result.StuckDetected != 1 {
+		t.Errorf("StuckDetected = %d, want 1", result.StuckDetected)
+	}
+	if result.Reenqueued != 1 {
+		t.Errorf("Reenqueued = %d, want 1", result.Reenqueued)
+	}
+	if len(queue.enqueued) != 1 {
+		t.Fatalf("enqueued = %d, want 1", len(queue.enqueued))
+	}
+	msg := queue.enqueued[0]
+	if msg.DocumentID != doc.ID || msg.ObjectKey != doc.ObjectKey {
+		t.Errorf("mensaje = %+v, want document_id=%s object_key=%s", msg, doc.ID, doc.ObjectKey)
+	}
+	if msg.CorrelationID != "corr-proc" || msg.SchemaVersion != 2 || msg.EnqueuedAt == "" {
+		t.Errorf("mensaje = %+v, want correlation_id/schema_version/enqueued_at completos", msg)
+	}
+
+	// Transición auditada: PROCESSING→RETRYING por el reconciliador.
+	if len(doc.History) != 1 {
+		t.Fatalf("historial = %d entradas, want 1", len(doc.History))
+	}
+	entry := doc.History[0]
+	if entry.Status != domain.StatusRetrying || entry.Actor != domain.ActorReconciler {
+		t.Errorf("entrada = %+v, want reconciler/RETRYING", entry)
+	}
+	if entry.CorrelationID != "corr-proc" {
+		t.Errorf("correlation_id = %q, want corr-proc", entry.CorrelationID)
+	}
+	if len(repo.updateCalls) != 1 || repo.updateCalls[0].from != domain.StatusProcessing ||
+		repo.updateCalls[0].to != domain.StatusRetrying {
+		t.Errorf("updateCalls = %+v, want [PROCESSING→RETRYING]", repo.updateCalls)
+	}
+}
+
+// TestRunOnce_StuckRetrying_ObjetoPresente_SoloReencola fija la semántica del
+// retry handler: RETRYING no transiciona (RETRYING→PROCESSING es del worker),
+// solo se reencola (T3).
+func TestRunOnce_StuckRetrying_ObjetoPresente_SoloReencola(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+
+	doc := &domain.Document{
+		ID:            "doc-retry",
+		Status:        domain.StatusRetrying,
+		ObjectKey:     "raw-pdfs/doc-retry.pdf",
+		CorrelationID: "corr-retry",
+		SchemaVersion: 1,
+		CreatedAt:     now.Add(-2 * time.Hour),
+		UpdatedAt:     now.Add(-2 * time.Hour),
+	}
+	repo.docs[doc.ID] = doc
+	storage.objects[doc.ObjectKey] = true
+
+	r := New(repo, storage, queue, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if doc.Status != domain.StatusRetrying {
+		t.Errorf("estado final = %s, want RETRYING (sin transición)", doc.Status)
+	}
+	if len(repo.updateCalls) != 0 {
+		t.Errorf("updateCalls = %+v, want 0 (RETRYING solo reencola)", repo.updateCalls)
+	}
+	if len(doc.History) != 0 {
+		t.Errorf("historial = %+v, want vacío (sin transición)", doc.History)
+	}
+	if len(queue.enqueued) != 1 || result.Reenqueued != 1 {
+		t.Errorf("enqueued=%d Reenqueued=%d, want (1, 1)", len(queue.enqueued), result.Reenqueued)
+	}
+}
+
+// TestRunOnce_StuckIntermedio_ObjetoAusente_CompletaViaDeFallo cubre el caso
+// sin objeto raw: la SAGA se completa con aristas declaradas
+// (→EXTRACTION_FAILED(OBJECT_MISSING) →COMPENSATING →FAILED) y deja las tres
+// transiciones auditadas, sin inventar PROCESSING/RETRYING→FAILED (T3).
+func TestRunOnce_StuckIntermedio_ObjetoAusente_CompletaViaDeFallo(t *testing.T) {
+	froms := []domain.Status{domain.StatusProcessing, domain.StatusRetrying}
+	for _, from := range froms {
+		t.Run(string(from), func(t *testing.T) {
+			now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+			repo := newMockRepo()
+			storage := newMockStorage() // sin objetos: el raw no existe
+			queue := &mockQueue{}
+
+			doc := &domain.Document{
+				ID:            "doc-lost",
+				Status:        from,
+				ObjectKey:     "raw-pdfs/doc-lost.pdf",
+				CorrelationID: "corr-lost",
+				CreatedAt:     now.Add(-2 * time.Hour),
+				UpdatedAt:     now.Add(-2 * time.Hour),
+			}
+			repo.docs[doc.ID] = doc
+
+			r := New(repo, storage, queue, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+			result, err := r.RunOnce(context.Background())
+			if err != nil {
+				t.Fatalf("RunOnce error: %v", err)
+			}
+
+			if doc.Status != domain.StatusFailed {
+				t.Fatalf("estado final = %s, want FAILED", doc.Status)
+			}
+			if doc.FailureReason != domain.FailureReasonObjectMissing {
+				t.Errorf("failure_reason = %q, want %q", doc.FailureReason, domain.FailureReasonObjectMissing)
+			}
+			if len(queue.enqueued) != 0 || result.Reenqueued != 0 {
+				t.Errorf("enqueued=%d Reenqueued=%d, want (0, 0) sin objeto", len(queue.enqueued), result.Reenqueued)
+			}
+
+			// Historial completo de la vía de fallo, en orden y del reconciliador.
+			got := make([]domain.Status, 0, len(doc.History))
+			for _, e := range doc.History {
+				if e.Actor != domain.ActorReconciler {
+					t.Errorf("actor = %s, want reconciler", e.Actor)
+				}
+				if e.CorrelationID != "corr-lost" {
+					t.Errorf("correlation_id = %q, want corr-lost", e.CorrelationID)
+				}
+				got = append(got, e.Status)
+			}
+			want := []domain.Status{
+				domain.StatusExtractionFailed,
+				domain.StatusCompensating,
+				domain.StatusFailed,
+			}
+			if len(got) != len(want) {
+				t.Fatalf("historial = %v, want %v", got, want)
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("historial = %v, want %v", got, want)
+				}
+			}
+
+			// Cada salto fue condicional desde el estado esperado.
+			wantCalls := []updateCall{
+				{id: doc.ID, from: from, to: domain.StatusExtractionFailed},
+				{id: doc.ID, from: domain.StatusExtractionFailed, to: domain.StatusCompensating},
+				{id: doc.ID, from: domain.StatusCompensating, to: domain.StatusFailed},
+			}
+			if len(repo.updateCalls) != len(wantCalls) {
+				t.Fatalf("updateCalls = %+v, want %+v", repo.updateCalls, wantCalls)
+			}
+			for i := range wantCalls {
+				if repo.updateCalls[i] != wantCalls[i] {
+					t.Fatalf("updateCalls[%d] = %+v, want %+v", i, repo.updateCalls[i], wantCalls[i])
+				}
+			}
+		})
+	}
+}
+
+// TestRunOnce_StuckCompensating_TerminaFailedCompensationFailed cubre
+// COMPENSATING trabado: COMPENSATING→FAILED con COMPENSATION_FAILED (T3).
+func TestRunOnce_StuckCompensating_TerminaFailedCompensationFailed(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+
+	doc := &domain.Document{
+		ID:            "doc-comp",
+		Status:        domain.StatusCompensating,
+		ObjectKey:     "raw-pdfs/doc-comp.pdf",
+		CorrelationID: "corr-comp",
+		CreatedAt:     now.Add(-2 * time.Hour),
+		UpdatedAt:     now.Add(-2 * time.Hour),
+	}
+	repo.docs[doc.ID] = doc
+	storage.objects[doc.ObjectKey] = true
+
+	r := New(repo, storage, queue, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if doc.Status != domain.StatusFailed {
+		t.Fatalf("estado final = %s, want FAILED", doc.Status)
+	}
+	if doc.FailureReason != domain.FailureReasonCompensateFail {
+		t.Errorf("failure_reason = %q, want %q", doc.FailureReason, domain.FailureReasonCompensateFail)
+	}
+	if result.StuckDetected != 1 {
+		t.Errorf("StuckDetected = %d, want 1", result.StuckDetected)
+	}
+	if len(queue.enqueued) != 0 {
+		t.Errorf("enqueued = %d, want 0 (COMPENSATING no se reencola)", len(queue.enqueued))
+	}
+	if len(repo.updateCalls) != 1 || repo.updateCalls[0].from != domain.StatusCompensating ||
+		repo.updateCalls[0].to != domain.StatusFailed {
+		t.Errorf("updateCalls = %+v, want [COMPENSATING→FAILED]", repo.updateCalls)
+	}
+	if len(doc.History) != 1 || doc.History[0].Status != domain.StatusFailed ||
+		doc.History[0].Actor != domain.ActorReconciler {
+		t.Errorf("historial = %+v, want [reconciler/FAILED]", doc.History)
+	}
+}
+
+// TestRunOnce_DryRun_EstadosTrabados_PlanificaSinMutar cubre el choke point de
+// dry-run para las cuatro ramas de T3: planifica transiciones y encolados, pero
+// no ejecuta ninguna mutación (SPEC §6.5).
+func TestRunOnce_DryRun_EstadosTrabados_PlanificaSinMutar(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+
+	stale := now.Add(-2 * time.Hour)
+	// PROCESSING con objeto → RETRYING + enqueue (2 acciones planificadas).
+	repo.docs["doc-proc"] = &domain.Document{
+		ID: "doc-proc", Status: domain.StatusProcessing,
+		ObjectKey: "raw-pdfs/doc-proc.pdf", CreatedAt: stale, UpdatedAt: stale,
+	}
+	storage.objects["raw-pdfs/doc-proc.pdf"] = true
+	// RETRYING con objeto → solo enqueue (1).
+	repo.docs["doc-retry"] = &domain.Document{
+		ID: "doc-retry", Status: domain.StatusRetrying,
+		ObjectKey: "raw-pdfs/doc-retry.pdf", CreatedAt: stale, UpdatedAt: stale,
+	}
+	storage.objects["raw-pdfs/doc-retry.pdf"] = true
+	// PROCESSING sin objeto → 3 transiciones de la vía de fallo.
+	repo.docs["doc-lost"] = &domain.Document{
+		ID: "doc-lost", Status: domain.StatusProcessing,
+		ObjectKey: "raw-pdfs/doc-lost.pdf", CreatedAt: stale, UpdatedAt: stale,
+	}
+	// COMPENSATING → FAILED (1).
+	repo.docs["doc-comp"] = &domain.Document{
+		ID: "doc-comp", Status: domain.StatusCompensating,
+		ObjectKey: "raw-pdfs/doc-comp.pdf", CreatedAt: stale, UpdatedAt: stale,
+	}
+
+	r := New(repo, storage, queue, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute,
+		WithDryRun(true))
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if result.StuckDetected != 4 {
+		t.Errorf("StuckDetected = %d, want 4", result.StuckDetected)
+	}
+	// Plan: 2 (PROCESSING presente) + 1 (RETRYING) + 3 (vía de fallo) + 1 (COMPENSATING).
+	if result.PlannedActions != 7 {
+		t.Errorf("PlannedActions = %d, want 7", result.PlannedActions)
+	}
+	if result.ExecutedActions != 0 {
+		t.Errorf("ExecutedActions = %d, want 0 en dry-run", result.ExecutedActions)
+	}
+
+	if len(repo.updateCalls) != 0 {
+		t.Errorf("updateCalls = %+v, want 0 en dry-run", repo.updateCalls)
+	}
+	if len(queue.enqueued) != 0 {
+		t.Errorf("enqueued = %d, want 0 en dry-run", len(queue.enqueued))
+	}
+	wantStatus := map[string]domain.Status{
+		"doc-proc":  domain.StatusProcessing,
+		"doc-retry": domain.StatusRetrying,
+		"doc-lost":  domain.StatusProcessing,
+		"doc-comp":  domain.StatusCompensating,
+	}
+	for id, status := range wantStatus {
+		if got := repo.docs[id].Status; got != status {
+			t.Errorf("%s status = %s, want %s (intacto)", id, got, status)
+		}
+	}
+}
+
+// TestRunOnce_StuckIntermediate_Reciente_NoSeToca fija que el umbral protege a
+// los documentos frescos: ni transiciones ni encolados (T3).
+func TestRunOnce_StuckIntermediate_Reciente_NoSeToca(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+
+	doc := &domain.Document{
+		ID:        "doc-fresh",
+		Status:    domain.StatusProcessing,
+		ObjectKey: "raw-pdfs/doc-fresh.pdf",
+		CreatedAt: now.Add(-time.Hour),
+		UpdatedAt: now.Add(-5 * time.Minute), // < stuckAfter (30m)
+	}
+	repo.docs[doc.ID] = doc
+	storage.objects[doc.ObjectKey] = true
+
+	r := New(repo, storage, queue, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if result.StuckDetected != 0 {
+		t.Errorf("StuckDetected = %d, want 0", result.StuckDetected)
+	}
+	if doc.Status != domain.StatusProcessing {
+		t.Errorf("estado = %s, want PROCESSING (intacto)", doc.Status)
+	}
+	if len(repo.updateCalls) != 0 || len(queue.enqueued) != 0 {
+		t.Errorf("mutaciones = (updates %d, enqueues %d), want (0, 0)",
+			len(repo.updateCalls), len(queue.enqueued))
+	}
+}
+
+// TestRunOnce_StuckProcessing_DosCorridas_NoDuplican fija la idempotencia de la
+// rama respaldada por transición: la primera corrida mueve a RETRYING (lo que
+// bumpea updated_at) y la segunda no vuelve a transicionar ni a encolar (T3).
+func TestRunOnce_StuckProcessing_DosCorridas_NoDuplican(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+
+	doc := &domain.Document{
+		ID:        "doc-proc",
+		Status:    domain.StatusProcessing,
+		ObjectKey: "raw-pdfs/doc-proc.pdf",
+		CreatedAt: now.Add(-2 * time.Hour),
+		UpdatedAt: now.Add(-2 * time.Hour),
+	}
+	repo.docs[doc.ID] = doc
+	storage.objects[doc.ObjectKey] = true
+
+	r := New(repo, storage, queue, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	if _, err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("primera corrida: %v", err)
+	}
+	if doc.Status != domain.StatusRetrying || len(queue.enqueued) != 1 {
+		t.Fatalf("primera corrida: estado=%s enqueued=%d, want RETRYING/1", doc.Status, len(queue.enqueued))
+	}
+
+	if _, err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("segunda corrida: %v", err)
+	}
+	if doc.Status != domain.StatusRetrying {
+		t.Errorf("segunda corrida: estado = %s, want RETRYING", doc.Status)
+	}
+	if len(repo.updateCalls) != 1 {
+		t.Errorf("segunda corrida: updateCalls = %+v, want 1 (sin transición nueva)", repo.updateCalls)
+	}
+	if len(queue.enqueued) != 1 {
+		t.Errorf("segunda corrida: enqueued = %d, want 1 (sin duplicado)", len(queue.enqueued))
+	}
+}
+
+// TestRunOnce_StuckProcessing_ErrorDeInfraestructura_NoMarcaFailed fija la
+// garantía de seguridad espejada del sweep de PENDING_UPLOAD: un 404 de
+// infraestructura (NoSuchBucket) en el HEAD no es "objeto ausente", así que el
+// documento intermedio queda intacto para el próximo sweep (T3).
+func TestRunOnce_StuckProcessing_ErrorDeInfraestructura_NoMarcaFailed(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	queue := &mockQueue{}
+	storage.statErr = minio.ErrorResponse{
+		Code:       "NoSuchBucket",
+		Message:    "The specified bucket does not exist.",
+		StatusCode: http.StatusNotFound,
+	}
+
+	doc := &domain.Document{
+		ID:        "doc-infra",
+		Status:    domain.StatusProcessing,
+		ObjectKey: "raw-pdfs/doc-infra.pdf",
+		CreatedAt: now.Add(-2 * time.Hour),
+		UpdatedAt: now.Add(-2 * time.Hour),
+	}
+	repo.docs[doc.ID] = doc
+
+	r := New(repo, storage, queue, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	if _, err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+
+	if doc.Status != domain.StatusProcessing {
+		t.Errorf("estado = %s, want PROCESSING (intacto ante error de infraestructura)", doc.Status)
+	}
+	if doc.FailureReason != "" {
+		t.Errorf("failure_reason = %q, want vacío", doc.FailureReason)
+	}
+	if len(repo.updateCalls) != 0 || len(queue.enqueued) != 0 {
+		t.Errorf("mutaciones = (updates %d, enqueues %d), want (0, 0)",
+			len(repo.updateCalls), len(queue.enqueued))
 	}
 }

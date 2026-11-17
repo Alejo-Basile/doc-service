@@ -9,6 +9,39 @@ import (
 	"github.com/google/uuid"
 )
 
+// rateLimitHeadersWhitelist son los únicos headers de rate-limit que se
+// propagan desde el request entrante (inyectados por Traefik forwardAuth)
+// hacia la respuesta del backend.
+//
+// Why: Traefik forwardAuth, ante una respuesta 2xx del auth server, copia los
+// headers listados en authResponseHeaders sobre el REQUEST reenviado al backend,
+// NO sobre la respuesta al cliente. Por eso el backend debe ecoarlos para que
+// lleguen al cliente. El spoofing se previene porque Traefik (via
+// authResponseHeaders) elimina/reemplaza del request del cliente estos mismos
+// nombres antes de reenviarlo.
+var rateLimitHeadersWhitelist = []string{
+	"X-RateLimit-Limit",
+	"X-RateLimit-Remaining",
+	"X-RateLimit-Reset",
+	"X-RateLimit-Retry-After",
+	"X-RateLimit-Degraded",
+	"Retry-After",
+}
+
+// RateLimitHeadersMiddleware ecoa la whitelist de headers de rate-limit desde
+// el request entrante hacia la respuesta. Solo setea el header de respuesta si
+// el inbound es no-vacío. No inventa valores.
+func RateLimitHeadersMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		for _, name := range rateLimitHeadersWhitelist {
+			if v := c.GetHeader(name); v != "" {
+				c.Header(name, v)
+			}
+		}
+		c.Next()
+	}
+}
+
 // correlationHeader es el header HTTP estándar para correlation IDs.
 // Se acepta inbound (para seguir trazas entre servicios) o se genera uno nuevo.
 const correlationHeader = "X-Correlation-ID"

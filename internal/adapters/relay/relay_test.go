@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -12,6 +13,8 @@ import (
 	redidadapter "github.com/Alejo-Basile/doc-service/internal/adapters/redis"
 	"github.com/Alejo-Basile/doc-service/internal/domain"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
+	"github.com/Alejo-Basile/doc-service/internal/resilience"
+	"github.com/sony/gobreaker/v2"
 )
 
 func testAddrs(t *testing.T) (string, string, string) {
@@ -194,6 +197,166 @@ func TestRelay_ObjectKeyDerivado(t *testing.T) {
 }
 
 // --- Tests unitarios de reintento/backoff (S4-P2-05) ---
+
+// --- Tests de jitter equal-jitter (SPEC §7.1) ---
+
+func TestRelay_Jittered_Bordes(t *testing.T) {
+	casos := []struct {
+		nombre string
+		d      time.Duration
+		randn  func(int64) int64
+		want   time.Duration
+	}{
+		{"rand 0: límite inferior d/2", 200 * time.Millisecond, func(int64) int64 { return 0 }, 100 * time.Millisecond},
+		{"rand max: límite superior d", 200 * time.Millisecond, func(n int64) int64 { return n }, 200 * time.Millisecond},
+	}
+	for _, tt := range casos {
+		t.Run(tt.nombre, func(t *testing.T) {
+			got := jittered(tt.d, tt.randn)
+			if got != tt.want {
+				t.Errorf("jittered(%v) = %v, want %v", tt.d, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRelay_Jittered_VariaConElRandom(t *testing.T) {
+	d := 200 * time.Millisecond
+	valores := []int64{0, int64(50 * time.Millisecond), int64(99 * time.Millisecond)}
+	vistos := map[time.Duration]bool{}
+	for _, v := range valores {
+		got := jittered(d, func(int64) int64 { return v })
+		if vistos[got] {
+			t.Fatalf("jittered(%v) produjo %v repetido con rand distinto", d, got)
+		}
+		vistos[got] = true
+	}
+}
+
+func TestRelay_RetryUsaJitterEnElBackoff(t *testing.T) {
+	// La cola siempre falla; el hook graba los límites que recibe (la mitad
+	// nominal de cada backoff): 125ms, 250ms y 500ms prueban que el nominal
+	// sigue duplicándose y que el helper alimenta el camino del sleep.
+	var args []int64
+	q := &flakyQueue{failN: 100}
+	r := NewWithConfig(q, &fakeRelayRepo{}, 1, Config{MaxRetries: 3, BaseBackoff: 250 * time.Millisecond})
+	r.randInt63n = func(n int64) int64 {
+		args = append(args, n)
+		return 0
+	}
+
+	err := r.Handler()(context.Background(), changestream.Event{DocumentID: "doc-j", Status: "UPLOADED"})
+	if err == nil {
+		t.Fatal("Handler error = nil, want error tras agotar reintentos")
+	}
+	if q.calls != 4 {
+		t.Errorf("llamadas = %d, want 4 (1 + 3 reintentos)", q.calls)
+	}
+	want := []int64{
+		int64(125 * time.Millisecond),
+		int64(250 * time.Millisecond),
+		int64(500 * time.Millisecond),
+	}
+	if !slices.Equal(args, want) {
+		t.Errorf("límites del hook = %v, want %v", args, want)
+	}
+}
+
+// --- Tests de composición retry + breaker (SPEC §7.3) ---
+// El breaker envuelve la llamada individual y el retry envuelve al breaker:
+// ante un breaker Open el retry ve el rechazo fast-fail y aborta el loop
+// sin más intentos ni sleeps (sin retry storm, sin red).
+
+// breakerAbiertoParaTests arma la composición real: inner (siempre falla
+// con error transitorio) envuelto por el decorador de resilience con un
+// breaker que abre tras 2 fallos consecutivos y permanece Open 30s.
+func breakerAbiertoParaTests(inner *flakyQueue) ports.WorkQueue {
+	return resilience.NewWorkQueue(inner, resilience.NewBreakerWithSettings(gobreaker.Settings{
+		Name: "test-redis",
+		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			return counts.ConsecutiveFailures >= 2
+		},
+		Timeout: 30 * time.Second,
+	}))
+}
+
+// attemptCounter envuelve una cola contando cada invocación a Enqueue:
+// los intentos del retry, incluidos los rechazados por el breaker. Es el
+// seam que distingue "abortar al primer rechazo" de "insistir hasta
+// agotar MaxRetries contra un breaker Open" (SPEC §7.3).
+type attemptCounter struct {
+	inner    ports.WorkQueue
+	attempts int
+}
+
+func (c *attemptCounter) Enqueue(ctx context.Context, msg ports.WorkMessage) error {
+	c.attempts++
+	return c.inner.Enqueue(ctx, msg)
+}
+
+func (c *attemptCounter) Ping(ctx context.Context) error { return c.inner.Ping(ctx) }
+
+func TestRelay_Composicion_BreakerAbiertoAbortaSinRetryStorm(t *testing.T) {
+	inner := &flakyQueue{failN: 100}
+	counter := &attemptCounter{inner: breakerAbiertoParaTests(inner)}
+	r := NewWithConfig(counter, &fakeRelayRepo{}, 1, Config{MaxRetries: 10, BaseBackoff: time.Millisecond})
+
+	err := r.Handler()(context.Background(), changestream.Event{
+		DocumentID: "doc-br-1",
+		Status:     "UPLOADED",
+		ObjectKey:  "raw-pdfs/doc-br-1.pdf",
+	})
+	if err == nil {
+		t.Fatal("Handler error = nil, want error")
+	}
+	// El breaker abre tras 2 fallos consecutivos: los intentos 3..N son
+	// rechazados sin tocar inner. Si el retry abortara al primer rechazo
+	// (SPEC §7.3), serían 3 intentos en total; sin abortar, 11.
+	if counter.attempts != 3 {
+		t.Errorf("intentos de Enqueue = %d, want 3 (2 fallos + 1 rechazo que aborta el loop; MaxRetries+1 = 11)", counter.attempts)
+	}
+	if inner.calls != 2 {
+		t.Errorf("llamadas al inner = %d, want 2 (los rechazos del breaker no tocan inner)", inner.calls)
+	}
+	if !resilience.IsRejected(err) {
+		t.Errorf("error devuelto no es un rechazo del breaker: %v", err)
+	}
+}
+
+func TestRelay_Composicion_RechazoNoTocaLaRed(t *testing.T) {
+	inner := &flakyQueue{failN: 100}
+	counter := &attemptCounter{inner: breakerAbiertoParaTests(inner)}
+	r := NewWithConfig(counter, &fakeRelayRepo{}, 1, Config{MaxRetries: 10, BaseBackoff: time.Millisecond})
+
+	// Primera invocación: abre el breaker (2 fallos) y aborta al primer rechazo.
+	_ = r.Handler()(context.Background(), changestream.Event{
+		DocumentID: "doc-br-1",
+		Status:     "UPLOADED",
+		ObjectKey:  "raw-pdfs/doc-br-1.pdf",
+	})
+	frozenInner := inner.calls
+	frozenAttempts := counter.attempts
+
+	// Segunda invocación: rechazo inmediato, un solo intento y el inner
+	// queda congelado (cero red).
+	err := r.Handler()(context.Background(), changestream.Event{
+		DocumentID: "doc-br-2",
+		Status:     "UPLOADED",
+		ObjectKey:  "raw-pdfs/doc-br-2.pdf",
+	})
+	if err == nil {
+		t.Fatal("Handler error = nil, want rechazo del breaker")
+	}
+	if !resilience.IsRejected(err) {
+		t.Errorf("error devuelto no es un rechazo del breaker: %v", err)
+	}
+	if inner.calls != frozenInner {
+		t.Errorf("llamadas al inner tras rechazo = %d, want %d (congeladas: cero red)", inner.calls, frozenInner)
+	}
+	if counter.attempts != frozenAttempts+1 {
+		t.Errorf("intentos en la 2.a invocación = %d, want 1 (rechazo fast-fail aborta el loop)", counter.attempts-frozenAttempts)
+	}
+}
 
 // flakyQueue falla las primeras `failN` llamadas a Enqueue y luego tiene éxito.
 type flakyQueue struct {

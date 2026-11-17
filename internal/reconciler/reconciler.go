@@ -5,6 +5,7 @@
 //   - Si el objeto NO existe en MinIO → UPLOAD_EXPIRED.
 //   - Si el objeto SÍ existe (webhook perdido) → UPLOADED (con validación %PDF-).
 //   - Documentos UPLOADED estancados cuyo objeto exista → reencolan a Redis Streams.
+//   - Documentos en estados intermedios trabados → reencolan o completan la SAGA hasta FAILED.
 //   - Objetos huérfanos en MinIO sin documento terminal → purga tras umbral.
 //   - Bloqueo distribuido (lease Redis con TTL) para evitar ejecución concurrente.
 //
@@ -19,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,6 +42,7 @@ type Reconciler struct {
 	stuckAfter    time.Duration // umbral para UPLOADED estancados / reencolado
 	minSafetyAge  time.Duration // edad mínima: documentos más jóvenes nunca se tocan (S6-P2-02)
 	internalToken string        // token compartido para proteger el endpoint manual (SPEC §9)
+	dryRun        bool          // modo planificado: detecta y loguea, no muta nada (SPEC §6.5)
 }
 
 // Option configura un Reconciler en construcción (functional options).
@@ -49,6 +52,12 @@ type Option func(*Reconciler)
 // con el token compartido de los endpoints internos (SPEC §9).
 func WithInternalToken(token string) Option {
 	return func(r *Reconciler) { r.internalToken = token }
+}
+
+// WithDryRun activa el modo dry-run: todas las acciones destructivas se
+// planifican y loguean, pero ninguna se ejecuta (SPEC §6.5).
+func WithDryRun(enabled bool) Option {
+	return func(r *Reconciler) { r.dryRun = enabled }
 }
 
 // New crea un Reconciler con dependencias inyectadas.
@@ -92,7 +101,18 @@ func (r *Reconciler) RegisterRoutes(engine *gin.Engine) {
 	internal := engine.Group("/internal")
 	internal.Use(httpserver.InternalTokenMiddleware(r.internalToken))
 	internal.POST("/reconcile", func(c *gin.Context) {
-		result, err := r.RunOnce(c.Request.Context())
+		dryRun := r.dryRun
+		if raw, ok := c.GetQuery("dry_run"); ok {
+			v, err := strconv.ParseBool(raw)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": "parámetro dry_run inválido: usar true/false (o 1/0)",
+				})
+				return
+			}
+			dryRun = v // override puntual del modo configurado
+		}
+		result, err := r.runOnce(c.Request.Context(), dryRun)
 		if err != nil {
 			c.JSON(500, gin.H{"error": err.Error()})
 			return
@@ -125,6 +145,12 @@ type Result struct {
 	Errors            int               `json:"errors"`
 	LockAcquired      bool              `json:"lock_acquired"`
 	CrossCheckReport  *CrossCheckReport `json:"cross_check,omitempty"` // S6-P2-01
+	// DryRun indica que la corrida solo planificó. PlannedActions cuenta las
+	// acciones que el sweep propuso y ExecutedActions las que se aplicaron
+	// (en dry-run queda siempre en 0, SPEC §6.5, T1).
+	DryRun          bool `json:"dry_run"`
+	PlannedActions  int  `json:"planned_actions"`
+	ExecutedActions int  `json:"executed_actions"`
 }
 
 // CrossCheckReport resume la verificación cruzada MongoDB ↔ MinIO ↔ Redis (S6-P2-01).
@@ -154,6 +180,7 @@ func (r *Reconciler) Start(ctx context.Context) {
 	slog.Info("reconciler iniciado",
 		"interval", r.interval.String(),
 		"stuck_after", r.stuckAfter.String(),
+		"dry_run", r.dryRun,
 	)
 
 	ticker := time.NewTicker(r.interval)
@@ -189,7 +216,15 @@ func (r *Reconciler) Start(ctx context.Context) {
 // RunOnce ejecuta un sweep completo y devuelve el resultado.
 // Si hay lease configurado y no se puede adquirir, retorna resultado vacío sin error.
 func (r *Reconciler) RunOnce(ctx context.Context) (*Result, error) {
-	result := &Result{}
+	return r.runOnce(ctx, r.dryRun)
+}
+
+// runOnce implementa el sweep con el modo (dry-run o ejecución) resuelto por el
+// llamador: el loop periódico usa el configurado y el endpoint manual permite
+// override por invocación (SPEC §6.5).
+func (r *Reconciler) runOnce(ctx context.Context, dryRun bool) (*Result, error) {
+	result := &Result{DryRun: dryRun}
+	actions := &actionReport{}
 	now := r.clock.Now()
 
 	// Bloqueo distribuido (S4-P2-03): evitar ejecución concurrente entre réplicas.
@@ -211,7 +246,7 @@ func (r *Reconciler) RunOnce(ctx context.Context) (*Result, error) {
 	}
 
 	// 1. Documentos PENDING_UPLOAD con expires_at vencido.
-	expiredPending, err := r.sweepExpiredPending(ctx, now)
+	expiredPending, err := r.sweepExpiredPending(ctx, now, dryRun, actions)
 	if err != nil {
 		return nil, fmt.Errorf("sweep expired pending: %w", err)
 	}
@@ -219,28 +254,30 @@ func (r *Reconciler) RunOnce(ctx context.Context) (*Result, error) {
 	result.RecoveredUploaded = expiredPending.recovered
 
 	// 2. Documentos UPLOADED estancados → transición + reencolar (S4-P2-01/07).
-	reenqueued, err := r.sweepStuckUploaded(ctx, now)
+	reenqueued, err := r.sweepStuckUploaded(ctx, now, dryRun, actions)
 	if err != nil {
 		return nil, fmt.Errorf("sweep stuck uploaded: %w", err)
 	}
 	result.Reenqueued = reenqueued
 
 	// 2b. Documentos QUEUED estancados → reencolar sin cambiar estado (cierra ventana de crash).
-	reenqueued2, err := r.sweepStuckQueued(ctx, now)
+	reenqueued2, err := r.sweepStuckQueued(ctx, now, dryRun, actions)
 	if err != nil {
 		return nil, fmt.Errorf("sweep stuck queued: %w", err)
 	}
 	result.Reenqueued += reenqueued2
 
-	// 3. Documentos en estado intermedio con updated_at antiguo (solo detección).
-	stuck, err := r.sweepStuckIntermediate(ctx, now)
+	// 3. Documentos en estado intermedio con updated_at antiguo: reencolar si el
+	// objeto existe o completar la vía de fallo hasta FAILED (SPEC §6.5, T3).
+	stuck, stuckReenqueued, err := r.sweepStuckIntermediate(ctx, now, dryRun, actions)
 	if err != nil {
 		return nil, fmt.Errorf("sweep stuck: %w", err)
 	}
 	result.StuckDetected = stuck
+	result.Reenqueued += stuckReenqueued
 
 	// 4. Purga de objetos huérfanos en MinIO (S4-P2-02).
-	orphans, err := r.sweepOrphans(ctx, now)
+	orphans, err := r.sweepOrphans(ctx, now, dryRun, actions)
 	if err != nil {
 		slog.Warn("reconciler: sweep orphans falló (no crítico)", "error", err)
 	}
@@ -260,7 +297,100 @@ func (r *Reconciler) RunOnce(ctx context.Context) (*Result, error) {
 	}
 	result.CrossCheckReport = report
 
+	result.PlannedActions = actions.planned
+	result.ExecutedActions = actions.executed
+	if dryRun && actions.planned > 0 {
+		slog.Info("reconciler: dry-run completado (ninguna mutación ejecutada)",
+			"planned_actions", actions.planned,
+		)
+	}
+
 	return result, nil
+}
+
+// actionReport acumula las acciones planificadas por el sweep y cuántas se
+// ejecutaron de verdad (en dry-run todas quedan planificadas).
+type actionReport struct {
+	planned  int
+	executed int
+}
+
+// updateStatusWithHistory ejecuta la transición condicional (con historial) o,
+// en dry-run, solo la registra como acción planificada (SPEC §6.5).
+// Devuelve true en dry-run para que el plan incluya las acciones en cascada.
+func (r *Reconciler) updateStatusWithHistory(
+	ctx context.Context, actions *actionReport, dryRun bool,
+	id string, from, to domain.Status, entry domain.StatusEntry, extraSet map[string]any,
+) (bool, error) {
+	actions.planned++
+	if dryRun {
+		slog.Info("reconciler: acción planificada (dry-run)",
+			"action", "update_status",
+			"document_id", id,
+			"from", from,
+			"to", to,
+		)
+		return true, nil
+	}
+	ok, err := r.repo.UpdateStatusWithHistory(ctx, id, from, to, entry, extraSet)
+	if err == nil && ok {
+		actions.executed++
+	}
+	return ok, err
+}
+
+// enqueue encola el mensaje de trabajo o, en dry-run, solo lo planifica.
+func (r *Reconciler) enqueue(ctx context.Context, actions *actionReport, dryRun bool, msg ports.WorkMessage) error {
+	actions.planned++
+	if dryRun {
+		slog.Info("reconciler: acción planificada (dry-run)",
+			"action", "enqueue",
+			"document_id", msg.DocumentID,
+			"object_key", msg.ObjectKey,
+		)
+		return nil
+	}
+	if err := r.queue.Enqueue(ctx, msg); err != nil {
+		return err
+	}
+	actions.executed++
+	return nil
+}
+
+// deleteObject purga el objeto o, en dry-run, solo lo planifica.
+func (r *Reconciler) deleteObject(ctx context.Context, actions *actionReport, dryRun bool, objectKey string) error {
+	actions.planned++
+	if dryRun {
+		slog.Info("reconciler: acción planificada (dry-run)",
+			"action", "delete_object",
+			"object_key", objectKey,
+		)
+		return nil
+	}
+	if err := r.storage.Delete(ctx, objectKey); err != nil {
+		return err
+	}
+	actions.executed++
+	return nil
+}
+
+// deleteTXTObject purga un objeto del bucket extracted-txt o, en dry-run, solo
+// lo planifica. Espeja a deleteObject para que el choke point de dry-run cubra
+// también las mutaciones sobre el bucket de textos (SPEC §6.5).
+func (r *Reconciler) deleteTXTObject(ctx context.Context, actions *actionReport, dryRun bool, objectKey string) error {
+	actions.planned++
+	if dryRun {
+		slog.Info("reconciler: acción planificada (dry-run)",
+			"action", "delete_txt_object",
+			"object_key", objectKey,
+		)
+		return nil
+	}
+	if err := r.storage.DeleteTXT(ctx, objectKey); err != nil {
+		return err
+	}
+	actions.executed++
+	return nil
 }
 
 // sweepResult acumula contadores de un sweep parcial.
@@ -271,7 +401,7 @@ type sweepResult struct {
 
 // sweepExpiredPending busca documentos PENDING_UPLOAD vencidos y actúa.
 // Respeta el umbral de seguridad: documentos más jóvenes que minSafetyAge no se tocan.
-func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time) (*sweepResult, error) {
+func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time, dryRun bool, actions *actionReport) (*sweepResult, error) {
 	result := &sweepResult{}
 
 	docs, _, err := r.repo.List(ctx, ports.ListFilter{
@@ -300,7 +430,7 @@ func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time) (*s
 
 		if exists {
 			// Objeto existe pero el webhook no llegó: recuperar → UPLOADED.
-			recovered, err := r.validateAndRecover(ctx, doc)
+			recovered, err := r.validateAndRecover(ctx, doc, actions, dryRun)
 			if err != nil {
 				slog.Error("reconciler: error validando/recuperando",
 					"document_id", doc.ID, "error", err)
@@ -308,12 +438,14 @@ func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time) (*s
 			}
 			if recovered {
 				result.recovered++
-				slog.Info("reconciler: documento recuperado (webhook perdido)",
-					"document_id", doc.ID, "object_key", doc.ObjectKey)
+				if !dryRun {
+					slog.Info("reconciler: documento recuperado (webhook perdido)",
+						"document_id", doc.ID, "object_key", doc.ObjectKey)
+				}
 			}
 		} else {
 			// Objeto no existe → UPLOAD_EXPIRED.
-			ok, err := r.repo.UpdateStatusWithHistory(ctx, doc.ID,
+			ok, err := r.updateStatusWithHistory(ctx, actions, dryRun, doc.ID,
 				domain.StatusPendingUpload, domain.StatusUploadExpired,
 				domain.StatusEntry{
 					Status:        domain.StatusUploadExpired,
@@ -330,8 +462,10 @@ func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time) (*s
 			}
 			if ok {
 				result.expired++
-				slog.Info("reconciler: documento expirado (objeto no encontrado)",
-					"document_id", doc.ID)
+				if !dryRun {
+					slog.Info("reconciler: documento expirado (objeto no encontrado)",
+						"document_id", doc.ID)
+				}
 			}
 		}
 	}
@@ -341,7 +475,7 @@ func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time) (*s
 
 // sweepStuckUploaded busca documentos UPLOADED estancados cuyo objeto exista
 // y los reencola a Redis Streams (S4-P2-01/07).
-func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time) (int, error) {
+func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time, dryRun bool, actions *actionReport) (int, error) {
 	if r.queue == nil {
 		return 0, nil // sin queue configurado
 	}
@@ -376,7 +510,7 @@ func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time) (int
 		}
 		if !exists {
 			// Objeto no existe: marcar FAILED con causa normalizada.
-			_, _ = r.repo.UpdateStatusWithHistory(ctx, doc.ID,
+			_, _ = r.updateStatusWithHistory(ctx, actions, dryRun, doc.ID,
 				domain.StatusUploaded, domain.StatusFailed,
 				domain.StatusEntry{
 					Status:        domain.StatusFailed,
@@ -390,7 +524,7 @@ func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time) (int
 		}
 
 		// Invariante de orden: transicionar UPLOADED → QUEUED PRIMERO, luego XADD.
-		ok, err := r.repo.UpdateStatusWithHistory(ctx, doc.ID,
+		ok, err := r.updateStatusWithHistory(ctx, actions, dryRun, doc.ID,
 			domain.StatusUploaded, domain.StatusQueued,
 			domain.StatusEntry{
 				Status:        domain.StatusQueued,
@@ -417,14 +551,16 @@ func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time) (int
 			EnqueuedAt:    now.Format(time.RFC3339),
 			SchemaVersion: doc.SchemaVersion,
 		}
-		if err := r.queue.Enqueue(ctx, msg); err != nil {
+		if err := r.enqueue(ctx, actions, dryRun, msg); err != nil {
 			slog.Error("reconciler: error reencolando documento",
 				"document_id", doc.ID, "error", err)
 			continue
 		}
 		reenqueued++
-		slog.Info("reconciler: documento reencolado (UPLOADED estancado)",
-			"document_id", doc.ID, "object_key", doc.ObjectKey)
+		if !dryRun {
+			slog.Info("reconciler: documento reencolado (UPLOADED estancado)",
+				"document_id", doc.ID, "object_key", doc.ObjectKey)
+		}
 	}
 
 	return reenqueued, nil
@@ -432,7 +568,7 @@ func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time) (int
 
 // sweepStuckQueued reencola documentos QUEUED cuyo mensaje pudo haberse perdido
 // (crash entre transición y XADD, o ACK espurio). No cambia el estado.
-func (r *Reconciler) sweepStuckQueued(ctx context.Context, now time.Time) (int, error) {
+func (r *Reconciler) sweepStuckQueued(ctx context.Context, now time.Time, dryRun bool, actions *actionReport) (int, error) {
 	if r.queue == nil {
 		return 0, nil
 	}
@@ -464,7 +600,7 @@ func (r *Reconciler) sweepStuckQueued(ctx context.Context, now time.Time) (int, 
 			EnqueuedAt:    now.Format(time.RFC3339),
 			SchemaVersion: doc.SchemaVersion,
 		}
-		if err := r.queue.Enqueue(ctx, msg); err != nil {
+		if err := r.enqueue(ctx, actions, dryRun, msg); err != nil {
 			slog.Error("reconciler: error reencolando QUEUED",
 				"document_id", doc.ID, "error", err)
 			continue
@@ -477,7 +613,7 @@ func (r *Reconciler) sweepStuckQueued(ctx context.Context, now time.Time) (int, 
 // sweepOrphans purga objetos en MinIO que no tengan documento asociado
 // y que sean más antiguos que el umbral (S4-P2-02).
 // Nunca borra documentos de MongoDB (SPEC).
-func (r *Reconciler) sweepOrphans(ctx context.Context, now time.Time) (int, error) {
+func (r *Reconciler) sweepOrphans(ctx context.Context, now time.Time, dryRun bool, actions *actionReport) (int, error) {
 	// Umbral conservador: 7 días. Los objetos de documentos activos
 	// nunca alcanzan esta antigüedad porque los documentos tienen su propio TTL.
 	threshold := now.Add(-7 * 24 * time.Hour)
@@ -488,28 +624,41 @@ func (r *Reconciler) sweepOrphans(ctx context.Context, now time.Time) (int, erro
 		return 0, fmt.Errorf("list all docs: %w", err)
 	}
 
-	// Construir set de object_keys válidos.
+	// Construir los sets de claves válidas con el mismo predicado del pass raw:
+	// cualquier documento (sin importar estado ni edad) con la referencia
+	// seteada protege su objeto.
 	validKeys := make(map[string]bool, len(docs))
+	validTxtKeys := make(map[string]bool, len(docs))
 	for _, doc := range docs {
 		if doc.ObjectKey != "" {
 			validKeys[doc.ObjectKey] = true
 		}
+		if doc.TxtRef != "" {
+			validTxtKeys[doc.TxtRef] = true
+		}
 	}
 
-	// Listar objetos en MinIO y purgar huérfanos.
+	// Listar objetos en MinIO y purgar huérfanos del bucket raw.
 	// Nota: esto requiere un método ListObjects en ObjectStorage.
 	// Por ahora, la implementación del adapter MinIO debe proveerlo.
 	// Se retorna 0 si el storage no soporta listado.
-	purged, err := r.purgeOrphanObjects(ctx, validKeys, threshold)
+	purged, err := r.purgeOrphanObjects(ctx, validKeys, threshold, dryRun, actions)
 	if err != nil {
 		return purged, err
 	}
 
-	return purged, nil
+	// Segundo pass: huérfanos del bucket extracted-txt (SPEC §6.5). Mismo
+	// umbral de edad y misma regla de referencia (doc.TxtRef).
+	purgedTXT, err := r.purgeOrphanTXT(ctx, validTxtKeys, threshold, dryRun, actions)
+	if err != nil {
+		return purged + purgedTXT, err
+	}
+
+	return purged + purgedTXT, nil
 }
 
 // purgeOrphanObjects implementa la purga efectiva. Se delega al adapter.
-func (r *Reconciler) purgeOrphanObjects(ctx context.Context, validKeys map[string]bool, threshold time.Time) (int, error) {
+func (r *Reconciler) purgeOrphanObjects(ctx context.Context, validKeys map[string]bool, threshold time.Time, dryRun bool, actions *actionReport) (int, error) {
 	// Usar el adapter de MinIO si implementa ListObjects.
 	// Como el puerto ObjectStorage no lo tiene todavía, usamos una aserción.
 	type lister interface {
@@ -541,16 +690,60 @@ func (r *Reconciler) purgeOrphanObjects(ctx context.Context, validKeys map[strin
 			continue
 		}
 
-		if err := r.storage.Delete(ctx, obj.Key); err != nil {
+		if err := r.deleteObject(ctx, actions, dryRun, obj.Key); err != nil {
 			slog.Error("reconciler: error purgando objeto huérfano",
 				"object_key", obj.Key, "error", err)
 			continue
 		}
 		purged++
-		slog.Info("reconciler: objeto huérfano purgado",
-			"object_key", obj.Key,
-			"last_modified", obj.LastModified,
-		)
+		if !dryRun {
+			slog.Info("reconciler: objeto huérfano purgado",
+				"object_key", obj.Key,
+				"last_modified", obj.LastModified,
+			)
+		}
+	}
+
+	return purged, nil
+}
+
+// purgeOrphanTXT purga objetos del bucket extracted-txt sin documento que los
+// referencie (TxtRef) y más antiguos que el umbral. Espeja la semántica de
+// purgeOrphanObjects (mismo umbral, idempotencia y choke point de dry-run),
+// pero sobre el bucket de textos (SPEC §6.5).
+func (r *Reconciler) purgeOrphanTXT(ctx context.Context, validKeys map[string]bool, threshold time.Time, dryRun bool, actions *actionReport) (int, error) {
+	objects, err := r.storage.ListObjectsTXT(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("list txt objects: %w", err)
+	}
+
+	purged := 0
+	for _, obj := range objects {
+		// Ignorar entradas de prefijo (common prefixes) del listado.
+		if strings.HasSuffix(obj.Key, "/") {
+			continue
+		}
+		// No purgar si algún documento referencia el .txt.
+		if validKeys[obj.Key] {
+			continue
+		}
+		// No purgar si el objeto es más nuevo que el umbral.
+		if obj.LastModified.After(threshold) {
+			continue
+		}
+
+		if err := r.deleteTXTObject(ctx, actions, dryRun, obj.Key); err != nil {
+			slog.Error("reconciler: error purgando objeto huérfano txt",
+				"object_key", obj.Key, "error", err)
+			continue
+		}
+		purged++
+		if !dryRun {
+			slog.Info("reconciler: objeto huérfano txt purgado",
+				"object_key", obj.Key,
+				"last_modified", obj.LastModified,
+			)
+		}
 	}
 
 	return purged, nil
@@ -558,14 +751,14 @@ func (r *Reconciler) purgeOrphanObjects(ctx context.Context, validKeys map[strin
 
 // validateAndRecover verifica el PDF y transiciona PENDING_UPLOAD → UPLOADED.
 // Devuelve (true, nil) si se recuperó; (false, nil) si el PDF era inválido (REJECTED).
-func (r *Reconciler) validateAndRecover(ctx context.Context, doc *domain.Document) (bool, error) {
+func (r *Reconciler) validateAndRecover(ctx context.Context, doc *domain.Document, actions *actionReport, dryRun bool) (bool, error) {
 	data, err := r.storage.GetRange(ctx, doc.ObjectKey, 0, 5)
 	if err != nil {
 		return false, fmt.Errorf("get range: %w", err)
 	}
 
 	if len(data) < 5 || string(data[:5]) != "%PDF-" {
-		_, err := r.repo.UpdateStatusWithHistory(ctx, doc.ID,
+		_, err := r.updateStatusWithHistory(ctx, actions, dryRun, doc.ID,
 			domain.StatusPendingUpload, domain.StatusRejected,
 			domain.StatusEntry{
 				Status:        domain.StatusRejected,
@@ -578,7 +771,7 @@ func (r *Reconciler) validateAndRecover(ctx context.Context, doc *domain.Documen
 		return false, err
 	}
 
-	_, err = r.repo.UpdateStatusWithHistory(ctx, doc.ID,
+	_, err = r.updateStatusWithHistory(ctx, actions, dryRun, doc.ID,
 		domain.StatusPendingUpload, domain.StatusUploaded,
 		domain.StatusEntry{
 			Status:        domain.StatusUploaded,
@@ -605,10 +798,24 @@ func (r *Reconciler) objectExists(ctx context.Context, objectKey string) (bool, 
 	return true, nil
 }
 
-// sweepStuckIntermediate detecta documentos en estados intermedios con
-// updated_at antiguo. Solo detecta y loguea.
-func (r *Reconciler) sweepStuckIntermediate(ctx context.Context, now time.Time) (int, error) {
+// sweepStuckIntermediate recupera documentos en estados intermedios con
+// updated_at antiguo (SPEC §6.5, T3), usando solo aristas declaradas en la
+// matriz del dominio (SPEC §4):
+//   - PROCESSING/RETRYING con el objeto raw presente → reencolar (espeja el
+//     retry handler de internal/api/internal.go): PROCESSING→RETRYING + Enqueue;
+//     RETRYING solo Enqueue (RETRYING→PROCESSING pertenece al worker).
+//   - PROCESSING/RETRYING sin el objeto → completar la vía de fallo de la SAGA:
+//     →EXTRACTION_FAILED (OBJECT_MISSING) →COMPENSATING →FAILED.
+//   - COMPENSATING → FAILED (COMPENSATION_FAILED).
+//
+// QUEUED queda fuera de este sweep: sweepStuckQueued ya lo reencola sin
+// transicionar y acá solo se detecta (no se expande scope).
+//
+// Devuelve cuántos documentos trabados detectó y cuántos se reencolaron
+// (planificados en dry-run).
+func (r *Reconciler) sweepStuckIntermediate(ctx context.Context, now time.Time, dryRun bool, actions *actionReport) (int, int, error) {
 	stuckCount := 0
+	reenqueued := 0
 	cutoff := now.Add(-r.stuckAfter)
 
 	intermediateStatuses := []domain.Status{
@@ -624,23 +831,170 @@ func (r *Reconciler) sweepStuckIntermediate(ctx context.Context, now time.Time) 
 			Limit:  100,
 		})
 		if err != nil {
-			return stuckCount, fmt.Errorf("list %s: %w", status, err)
+			return stuckCount, reenqueued, fmt.Errorf("list %s: %w", status, err)
 		}
 
 		for _, doc := range docs {
-			if doc.UpdatedAt.Before(cutoff) {
-				stuckCount++
-				slog.Warn("reconciler: documento en estado intermedio colgado",
-					"document_id", doc.ID,
-					"status", doc.Status,
-					"updated_at", doc.UpdatedAt,
-					"stuck_since", r.stuckAfter,
-				)
+			if !doc.UpdatedAt.Before(cutoff) {
+				continue
+			}
+			stuckCount++
+			slog.Warn("reconciler: documento en estado intermedio colgado",
+				"document_id", doc.ID,
+				"status", doc.Status,
+				"updated_at", doc.UpdatedAt,
+				"stuck_since", r.stuckAfter,
+			)
+
+			switch doc.Status {
+			case domain.StatusQueued:
+				// Fuera de scope (T3): sweepStuckQueued lo reencola sin transición.
+				continue
+			case domain.StatusCompensating:
+				if err := r.failStuckCompensating(ctx, doc, dryRun, actions); err != nil {
+					slog.Error("reconciler: error recuperando COMPENSATING",
+						"document_id", doc.ID, "error", err)
+				}
+			case domain.StatusProcessing, domain.StatusRetrying:
+				enqueued, err := r.recoverStuckExtraction(ctx, now, doc, dryRun, actions)
+				if err != nil {
+					slog.Error("reconciler: error recuperando estado intermedio",
+						"document_id", doc.ID, "status", doc.Status, "error", err)
+					continue
+				}
+				if enqueued {
+					reenqueued++
+				}
 			}
 		}
 	}
 
-	return stuckCount, nil
+	return stuckCount, reenqueued, nil
+}
+
+// recoverStuckExtraction resuelve un PROCESSING/RETRYING trabado: si el objeto
+// raw existe se reencola; si no existe, se completa la vía de fallo de la SAGA.
+// Devuelve true solo cuando se reencoló (o se planificó el encolado en dry-run).
+func (r *Reconciler) recoverStuckExtraction(
+	ctx context.Context, now time.Time, doc *domain.Document, dryRun bool, actions *actionReport,
+) (bool, error) {
+	exists, err := r.objectExists(ctx, doc.ObjectKey)
+	if err != nil {
+		return false, fmt.Errorf("verificar objeto: %w", err)
+	}
+
+	if !exists {
+		return false, r.failMissingObject(ctx, doc, dryRun, actions)
+	}
+
+	// Sin queue no hay forma de reencolar: se deja el documento intacto para
+	// que un sweep posterior (con queue configurado) lo recupere.
+	if r.queue == nil {
+		slog.Warn("reconciler: estado intermedio trabado sin queue configurado, no se reencola",
+			"document_id", doc.ID, "status", doc.Status)
+		return false, nil
+	}
+
+	// PROCESSING → RETRYING antes del XADD. RETRYING solo se reencola: la
+	// transición a PROCESSING la hace el worker al reclamar el mensaje.
+	if doc.Status == domain.StatusProcessing {
+		ok, err := r.updateStatusWithHistory(ctx, actions, dryRun, doc.ID,
+			domain.StatusProcessing, domain.StatusRetrying,
+			domain.StatusEntry{
+				Status:        domain.StatusRetrying,
+				Actor:         domain.ActorReconciler,
+				CorrelationID: doc.CorrelationID,
+			},
+			nil,
+		)
+		if err != nil {
+			return false, fmt.Errorf("transicionar a RETRYING: %w", err)
+		}
+		if !ok {
+			return false, nil // el documento cambió de estado: no encolar
+		}
+	}
+
+	msg := ports.WorkMessage{
+		DocumentID:    doc.ID,
+		ObjectKey:     doc.ObjectKey,
+		CorrelationID: doc.CorrelationID,
+		EnqueuedAt:    now.Format(time.RFC3339),
+		SchemaVersion: doc.SchemaVersion,
+	}
+	if err := r.enqueue(ctx, actions, dryRun, msg); err != nil {
+		return false, fmt.Errorf("reencolar: %w", err)
+	}
+	if !dryRun {
+		slog.Info("reconciler: documento reencolado (estado intermedio trabado)",
+			"document_id", doc.ID, "status", doc.Status, "object_key", doc.ObjectKey)
+	}
+	return true, nil
+}
+
+// failMissingObject completa la vía de fallo de la SAGA para un documento
+// intermedio cuyo objeto raw no existe, con aristas declaradas: EXTRACTION_FAILED
+// (OBJECT_MISSING) → COMPENSATING → FAILED. Es el mismo camino que tomaría un
+// worker vivo ante un error de negocio (SPEC §4).
+func (r *Reconciler) failMissingObject(ctx context.Context, doc *domain.Document, dryRun bool, actions *actionReport) error {
+	steps := []struct {
+		from   domain.Status
+		to     domain.Status
+		reason string
+	}{
+		{doc.Status, domain.StatusExtractionFailed, domain.FailureReasonObjectMissing},
+		{domain.StatusExtractionFailed, domain.StatusCompensating, ""},
+		{domain.StatusCompensating, domain.StatusFailed, domain.FailureReasonObjectMissing},
+	}
+
+	for _, step := range steps {
+		ok, err := r.updateStatusWithHistory(ctx, actions, dryRun, doc.ID,
+			step.from, step.to,
+			domain.StatusEntry{
+				Status:        step.to,
+				Actor:         domain.ActorReconciler,
+				CorrelationID: doc.CorrelationID,
+				Reason:        step.reason,
+			},
+			nil,
+		)
+		if err != nil {
+			return fmt.Errorf("%s→%s: %w", step.from, step.to, err)
+		}
+		if !ok {
+			// El documento cambió de estado: no forzar el resto de la cascada.
+			return nil
+		}
+	}
+
+	if !dryRun {
+		slog.Info("reconciler: documento fallido (objeto ausente en estado intermedio)",
+			"document_id", doc.ID, "failure_reason", domain.FailureReasonObjectMissing)
+	}
+	return nil
+}
+
+// failStuckCompensating cierra un COMPENSATING trabado: COMPENSATING→FAILED
+// con COMPENSATION_FAILED (arista y constante existentes, SPEC §4).
+func (r *Reconciler) failStuckCompensating(ctx context.Context, doc *domain.Document, dryRun bool, actions *actionReport) error {
+	ok, err := r.updateStatusWithHistory(ctx, actions, dryRun, doc.ID,
+		domain.StatusCompensating, domain.StatusFailed,
+		domain.StatusEntry{
+			Status:        domain.StatusFailed,
+			Actor:         domain.ActorReconciler,
+			CorrelationID: doc.CorrelationID,
+			Reason:        domain.FailureReasonCompensateFail,
+		},
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	if ok && !dryRun {
+		slog.Info("reconciler: documento fallido (compensación trabada)",
+			"document_id", doc.ID, "failure_reason", domain.FailureReasonCompensateFail)
+	}
+	return nil
 }
 
 // sweepCompletedMissingTxt detecta documentos COMPLETED cuyo .txt no existe en MinIO (S5-P2-03).

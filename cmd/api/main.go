@@ -23,6 +23,7 @@ import (
 	"github.com/Alejo-Basile/doc-service/internal/pdfsvc"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
 	"github.com/Alejo-Basile/doc-service/internal/reconciler"
+	"github.com/Alejo-Basile/doc-service/internal/resilience"
 	httpserver "github.com/Alejo-Basile/doc-service/internal/transport/http"
 	"github.com/Alejo-Basile/doc-service/internal/webhook"
 )
@@ -64,6 +65,7 @@ func main() {
 		"minio_bucket_raw", cfg.MinIOBucketRaw,
 		"redis_stream_key", cfg.RedisStreamKey,
 		"max_pdf_bytes", cfg.MaxPDFBytes,
+		"reconcile_dry_run", cfg.DryRun,
 	)
 
 	// --- Fase de arranque: dependencias con fail-fast ---
@@ -85,7 +87,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	storage, err := minioadapter.New(minioadapter.Config{
+	rawStorage, err := minioadapter.New(minioadapter.Config{
 		Endpoint:       cfg.MinIOEndpoint,
 		PublicEndpoint: cfg.MinIOPublicEndpoint,
 		AccessKey:      cfg.MinIOAccessKey,
@@ -101,8 +103,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	// --- Adaptadores y puertos ---
-	repo := mongoadapter.NewDocumentRepository(mongoClient, "documents")
+	// --- Breakers por dependencia (SPEC §7.2) y decoradores de puertos ---
+	// Un breaker por dependencia compartido entre todos los consumidores:
+	// los handlers, el webhook, el reconciliador y el relay usan los
+	// puertos decorados sin cambios en su código.
+	mongoBreaker := resilience.NewBreaker("mongo")
+	minioBreaker := resilience.NewBreaker("minio")
+	redisBreaker := resilience.NewBreaker("redis")
+
+	repo := resilience.NewDocumentRepository(
+		mongoadapter.NewDocumentRepository(mongoClient, "documents"), mongoBreaker)
+	storage := resilience.NewObjectStorage(rawStorage, minioBreaker)
 
 	redisClientCfg := redisadapter.ClientConfig{
 		Addr:          cfg.RedisAddr,
@@ -116,12 +127,15 @@ func main() {
 	}
 	queueCfg := redisadapter.DefaultWorkQueueConfig()
 	queueCfg.StreamKey = cfg.RedisStreamKey
-	queue := redisadapter.NewWorkQueueFromClient(redisadapter.NewClient(redisClientCfg), queueCfg)
-	if err := queue.Ping(startupCtx); err != nil {
+	// El ping de arranque va por el adaptador crudo: es diagnóstico de
+	// conectividad, no tráfico de negocio (el breaker recién arranca).
+	queueRaw := redisadapter.NewWorkQueueFromClient(redisadapter.NewClient(redisClientCfg), queueCfg)
+	if err := queueRaw.Ping(startupCtx); err != nil {
 		slog.Error("no se pudo conectar a Redis", "error", err.Error())
 		_ = mongoClient.Close(context.Background())
 		os.Exit(1)
 	}
+	queue := resilience.NewWorkQueue(queueRaw, redisBreaker)
 	lease := redisadapter.NewLeaseFromClient(redisadapter.NewClient(redisClientCfg))
 
 	// Cliente EXCLUSIVO del watcher sin timeout de cliente (Timeout=0).
@@ -153,10 +167,20 @@ func main() {
 		repo, storage, queue, lease, ports.SystemClock{},
 		cfg.ReconcileInterval, 30*time.Minute, cfg.MinSafetyAge,
 		reconciler.WithInternalToken(cfg.InternalToken),
+		reconciler.WithDryRun(cfg.DryRun),
 	)
 
 	// --- Servidor HTTP ---
-	server := httpserver.NewServer(cfg.Debug)
+	// /readyz probes real connectivity of the critical dependencies (SPEC §11.7).
+	// Redis reuses the queue's client: no extra connection is opened.
+	// Los probes NUNCA pasan por el breaker (diagnóstico honesto): usan los
+	// adaptadores crudos.
+	healthProbes := []ports.HealthProbe{
+		mongoadapter.NewHealthProbe(mongoClient),
+		redisadapter.NewHealthProbe(queueRaw.Client()),
+		minioadapter.NewHealthProbe(rawStorage),
+	}
+	server := httpserver.NewServer(cfg.Debug, healthProbes...)
 	server.RegisterAPI(docsHandler, webhookHandler, internalHandler, rel)
 	httpSrv := server.NewHTTPServer(cfg.Addr())
 
@@ -248,7 +272,7 @@ func main() {
 	if err := watcherClient.Close(context.Background()); err != nil {
 		slog.Error("error cerrando MongoDB (cliente del watcher)", "error", err.Error())
 	}
-	if err := queue.Close(); err != nil {
+	if err := queueRaw.Close(); err != nil {
 		slog.Error("error cerrando Redis (queue)", "error", err.Error())
 	}
 	if err := lease.Close(); err != nil {

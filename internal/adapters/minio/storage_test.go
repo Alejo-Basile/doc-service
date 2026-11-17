@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"os"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Alejo-Basile/doc-service/internal/ports"
+	miniogo "github.com/minio/minio-go/v7"
 )
 
 // testMinIOConfig lee el endpoint de MinIO del entorno y salta el test si no
@@ -442,5 +444,39 @@ func TestPresignGet_Concurrente_SinRed(t *testing.T) {
 	close(errs)
 	for e := range errs {
 		t.Errorf("err: %v", e)
+	}
+}
+
+// TestDeleteTXT_EliminaDelBucketTXT verifica que DeleteTXT apunta al bucket
+// extracted-txt y no al raw (T2, SPEC §6.5). Requiere MinIO vivo: se salta
+// sin MINIO_TEST_ENDPOINT, igual que el resto de las pruebas externas.
+func TestDeleteTXT_EliminaDelBucketTXT(t *testing.T) {
+	s := newTestStorage(t, "")
+	ctx := context.Background()
+	key := fmt.Sprintf("t2-delete-txt-%d.txt", time.Now().UnixNano())
+
+	txtPayload := []byte("hola")
+	rawPayload := []byte("%PDF-")
+	if _, err := s.client.PutObject(ctx, s.bucketTXT, key, strings.NewReader(string(txtPayload)), int64(len(txtPayload)), miniogo.PutObjectOptions{}); err != nil {
+		t.Fatalf("PutObject txt: %v", err)
+	}
+	if _, err := s.client.PutObject(ctx, s.bucketRaw, key, strings.NewReader(string(rawPayload)), int64(len(rawPayload)), miniogo.PutObjectOptions{}); err != nil {
+		t.Fatalf("PutObject raw: %v", err)
+	}
+	defer func() {
+		_ = s.client.RemoveObject(ctx, s.bucketRaw, key, miniogo.RemoveObjectOptions{})
+		_ = s.client.RemoveObject(ctx, s.bucketTXT, key, miniogo.RemoveObjectOptions{})
+	}()
+
+	if err := s.DeleteTXT(ctx, key); err != nil {
+		t.Fatalf("DeleteTXT: %v", err)
+	}
+
+	if _, err := s.StatTXT(ctx, key); err == nil {
+		t.Errorf("el objeto %q sigue existiendo en extracted-txt", key)
+	}
+	// El bucket raw no debe verse afectado por DeleteTXT.
+	if _, err := s.Stat(ctx, key); err != nil {
+		t.Errorf("DeleteTXT borró el objeto homónimo del bucket raw: %v", err)
 	}
 }
