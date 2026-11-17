@@ -84,12 +84,12 @@ Reglas de la fase:
 
 ### Fase 2 — Documentación del repo
 
-- [ ] T2.1 `docs/design/mongo-schema.md`: ejemplo de documento → `"md_ref": "extracted-md/<id>.md"`
-- [ ] T2.2 `docs/adr/ADR-0006-worker-completed-directo.md`: `.txt`→`.md`, `extracted-txt`→`extracted-md`
-- [ ] T2.3 `docs/SPEC.md` (copia local): tabla de buckets, §6.5 huérfanos, montaje de buckets. ⚠ La fuente única de verdad es `infra/docs/SPEC.md` (repo `infra`): anotar que el cambio debe propagarse allí; **no** modificar el repo `infra` desde acá
-- [ ] T2.4 `docs/pasos-iniciales.md`: tabla de objetos §11 (`extracted-txt`/`<id>.txt` → `extracted-md`/`<id>.md`) y referencias de contrato (S1-P1-04/06, S3-P2-09); el plan histórico no se reescribe entero
-- [ ] T2.5 `README.md` / `AGENTS.md`: actualizar menciones a `extracted-txt`/`txt_ref` si las hay
-- [ ] T2.6 Verificación de coherencia: sin referencias residuales a `extracted-txt`, `txt_ref` o `StatTXT` fuera de lo histórico
+- [x] T2.1 `docs/design/mongo-schema.md`: ejemplo de documento → `"md_ref": "extracted-md/<id>.md"`
+- [x] T2.2 `docs/adr/ADR-0006-worker-completed-directo.md`: `.txt`→`.md`, `extracted-txt`→`extracted-md`
+- [x] T2.3 `docs/SPEC.md` (copia local): tabla de buckets, §6.5 huérfanos, montaje de buckets. ⚠ La fuente única de verdad es `infra/docs/SPEC.md` (repo `infra`): anotar que el cambio debe propagarse allí; **no** modificar el repo `infra` desde acá
+- [x] T2.4 `docs/pasos-iniciales.md`: tabla de objetos §11 (`extracted-txt`/`<id>.txt` → `extracted-md`/`<id>.md`) y referencias de contrato (S1-P1-04/06, S3-P2-09); el plan histórico no se reescribe entero
+- [x] T2.5 `README.md` / `AGENTS.md`: actualizar menciones a `extracted-txt`/`txt_ref` si las hay
+- [x] T2.6 Verificación de coherencia: sin referencias residuales a `extracted-txt`, `txt_ref` o `StatTXT` fuera de lo histórico
 
 ### Fase 3 — Migración y compatibilidad de datos existentes (decisión D5)
 
@@ -140,6 +140,14 @@ go test -race -count=1 $PKGS
 
 ## Registro de progreso
 
+- 2026-11-17: Fase 2 (docs) completada — T2.1–T2.6. Archivos: `docs/design/mongo-schema.md`,
+  `docs/adr/ADR-0006-worker-completed-directo.md`, `docs/SPEC.md`, `docs/pasos-iniciales.md`.
+  T2.5 sin cambios (README/AGENTS sin menciones). T2.6 OK: solo quedan referencias en filas
+  históricas del plan (`pasos-iniciales.md` L314/L353) y el log de `docs/ESTADO.md`. `docs/SPEC.md`
+  lleva nota de copia local con propagación pendiente a `infra/docs/SPEC.md` (no modificar el
+  repo `infra` desde acá). Verificación: `gofmt` OK, `go vet` OK, suite hermética 12/12 ok.
+  Ejecutado inline (el writer delegado falló por restricción de región del modelo del runtime
+  OpenCode, no por error de Gentle AI).
 - 2026-11-17: plan creado; Fase 1 implementada (delegada a un writer acotado + delta).
   Commit `35b9fa9` (19 archivos). Verificación: `go build` OK, `go vet` OK, `gofmt` OK,
   suite hermética 10/10 paquetes ok (spot check del padre con la suite completa: exit=0).

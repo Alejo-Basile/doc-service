@@ -3,6 +3,8 @@
 **Versión:** 2.1 (Refactor con patrón SAGA)
 **Estándar de referencia:** IEEE 1016
 
+> **Nota de copia local:** este archivo es la copia local de `infra/docs/SPEC.md` (repo `infra`), que es la fuente única de verdad. El renombre del artefacto de extracción a Markdown (extensión `.md`, bucket `extracted-md`, campo `md_ref`; el mapeo completo está en `cambiomd.md`) aplicado en esta copia está **pendiente de propagarse** al spec fuente en el repo `infra`. No modificar el repo `infra` desde este repositorio.
+
 > **Cambios en 2.1** (aplicados *antes* de congelar los contratos de `pasos-iniciales.md`):
 > 1. La meta de resiliencia se reformula: la garantía es **todo documento alcanza un estado terminal**, no "0 mensajes perdidos en Redis" (§1.3).
 > 2. El límite de tamaño del **PDF** se impone en el servidor de objetos (política `POST` prefirmada), no en el gateway (§3.1, §5.1, §9).
@@ -38,7 +40,7 @@ La migración separa esto en tres servicios independientes, cada uno en su propi
 |---|---|---|
 | API Gateway | Traefik v3 | Enrutamiento, TLS, rate limiting, punto único de entrada |
 | Document Management Service | Go (Gin) | CRUD de metadatos, ciclo de vida del documento, orquestador de la SAGA |
-| Extraction Worker Service | Rust (Actix/Tokio) | Consumo de la cola, extracción de texto, generación del `.txt` |
+| Extraction Worker Service | Rust (Actix/Tokio) | Consumo de la cola, extracción de texto, generación del `.md` |
 
 ### 1.3 Metas Técnicas
 
@@ -124,7 +126,7 @@ Dos buckets con políticas de acceso separadas (principio de mínimo privilegio,
 | Bucket | Escritores | Lectores | Retención sugerida |
 |---|---|---|---|
 | `raw-pdfs` | Cliente (vía URL prefirmada) | Extraction Worker | Lifecycle policy: eliminar tras N días o al completar el procesamiento |
-| `extracted-txt` | Extraction Worker | Document Service, Cliente (descarga) | Según requisitos de negocio |
+| `extracted-md` | Extraction Worker | Document Service, Cliente (descarga) | Según requisitos de negocio |
 
 ### 3.5 Redis (cache + mensajería)
 
@@ -311,7 +313,7 @@ El flujo completo toca **tres sistemas de persistencia distintos** (MinIO, Redis
 1. El PDF se sube a MinIO pero nunca se dispara el procesamiento.
 2. El worker se cae a mitad de la extracción (mensaje "perdido" en un PEL).
 3. La extracción falla de forma permanente (PDF corrupto, escaneado sin texto, etc.).
-4. El `.txt` se sube a MinIO pero la escritura en MongoDB falla.
+4. El `.md` se sube a MinIO pero la escritura en MongoDB falla.
 5. Quedan objetos huérfanos en MinIO sin metadata asociada (fuga de almacenamiento).
 6. El webhook se pierde y el TTL de Mongo borra el registro aunque el objeto **sí** esté subido (pérdida silenciosa; se corrige con el `HEAD` del reconciliador, §4).
 7. Un PDF hostil (demasiadas páginas, zip-bomb, fuentes malformadas) consume CPU/RAM o cuelga la extracción (se contiene con timeout duro y topes, §3.3).
@@ -336,15 +338,15 @@ El flujo completo toca **tres sistemas de persistencia distintos** (MinIO, Redis
 | 2 | Cliente → MinIO | Sube el PDF con `POST` prefirmado y política (`content-length-range`) | Si MinIO rechaza por tamaño o tipo, el objeto nunca existe → nada que compensar; el registro se resuelve por el paso 1 |
 | 3 | MinIO → Document Service | Webhook `ObjectCreated` (at-least-once) → `status: UPLOADED` + Change Stream → `XADD` | Si el evento se pierde o el `XADD` falla tras reintentos, el job de reconciliación (6.5) lo recupera: `HEAD` del objeto para los `PENDING_UPLOAD` vencidos y reencolado para los `UPLOADED` sin procesar |
 | 4 | Extraction Worker | Descarga PDF, valida `%PDF-`, extrae texto (con Retry + Circuit Breaker) | Si los bytes no son un PDF → `REJECTED` sin reintentos. Si se agotan los reintentos → `XADD` a DLQ (atómico), `status: EXTRACTION_FAILED` |
-| 5 | Extraction Worker | Sube `.txt` a MinIO y escribe `COMPLETED` en Mongo con **transición condicional** (`PROCESSING → COMPLETED`) | Si el `update` falla tras reintentos → se **elimina** el `.txt` de MinIO (compensación real) y `status: FAILED` |
+| 5 | Extraction Worker | Sube `.md` a MinIO y escribe `COMPLETED` en Mongo con **transición condicional** (`PROCESSING → COMPLETED`) | Si el `update` falla tras reintentos → se **elimina** el `.md` de MinIO (compensación real) y `status: FAILED` |
 | 6 | Job de reconciliación | Verifica consistencia periódica | Ver 6.5 |
 
 Todas las operaciones de escritura del worker son **idempotentes**: la clave del objeto en MinIO y el `_id` en Mongo son siempre `document_id`, así que reintentar un paso nunca duplica datos, solo sobrescribe.
 
-🔧 **Acoplamiento aceptado y explícito: el worker escribe estado en Mongo (ADR-0006).** El worker no solo produce el `.txt`; también cierra el ciclo de vida del documento en la base. Antes de aceptarlo, se registra y **se acota** — no queda como un permiso amplio que nadie revisó:
+🔧 **Acoplamiento aceptado y explícito: el worker escribe estado en Mongo (ADR-0006).** El worker no solo produce el `.md`; también cierra el ciclo de vida del documento en la base. Antes de aceptarlo, se registra y **se acota** — no queda como un permiso amplio que nadie revisó:
 
 - **Rol de Mongo propio y limitado.** El worker usa un usuario de aplicación distinto al del Document Service, con permiso **únicamente** de `update` sobre la colección `documents`: sin `insert`, sin `drop`, sin privilegios de administración. El Document Service conserva el control del ciclo de vida y de todos los estados no terminales.
-- **Transición condicional atómica, no escritura libre.** El cierre es `updateOne({_id, status: "PROCESSING"}, {$set: {status: "COMPLETED", txt_ref, completed_at}})`. Si el documento no está en `PROCESSING` —porque el reconciliador ya lo movió, o porque otro worker lo terminó antes— el `update` no matchea, el worker lo detecta y no pisa el estado ajeno. Es la misma regla del resto de la SAGA, no una excepción.
+- **Transición condicional atómica, no escritura libre.** El cierre es `updateOne({_id, status: "PROCESSING"}, {$set: {status: "COMPLETED", md_ref, completed_at}})`. Si el documento no está en `PROCESSING` —porque el reconciliador ya lo movió, o porque otro worker lo terminó antes— el `update` no matchea, el worker lo detecta y no pisa el estado ajeno. Es la misma regla del resto de la SAGA, no una excepción.
 - **Por qué se acepta:** evita un salto asíncrono extra de ida y vuelta (el worker publica el resultado, el Document Service lo confirma y le responde) para escribir un único campo.
 - **Qué se paga:** hay dos escritores sobre el mismo agregado, así que el estado solo es correcto si **todas** las escrituras son condicionales e idempotentes. El día que haga falta una transacción que abarque Mongo, MinIO y Redis, este acoplamiento es lo primero que hay que revisar.
 
@@ -373,7 +375,7 @@ sequenceDiagram
     EW->>M: GET rango 0-4 + GET pdf
     EW->>EW: extract_text() [Retry + Circuit Breaker + timeout duro]
     alt Extracción exitosa
-        EW->>M: PUT texto.txt
+        EW->>M: PUT texto.md
         EW->>DB: update condicional PROCESSING -> COMPLETED
         EW->>R: XACK
     else No es un PDF
@@ -392,7 +394,7 @@ Ningún diseño de SAGA cubre el 100% de los casos de forma puramente reactiva (
 
 - **Primero, los `PENDING_UPLOAD` vencidos** (§4): por cada uno hace `HEAD` del objeto en MinIO. Si el objeto existe, lo **promociona a `UPLOADED`** y limpia o extiende `expires_at`; si no existe, lo marca `UPLOAD_EXPIRED`. El job nunca borra un registro por su cuenta y nunca deja vencer uno sin mirar: el TTL de Mongo actúa después, sobre un estado ya decidido. Esta es la compensación de la ventana en la que "el cliente sí subió el PDF y el webhook se perdió", que es la única forma de que ese documento se pierda en silencio.
 - Busca documentos en estados intermedios (`UPLOADED`, `PROCESSING`) con `updated_at` mayor a un umbral (ej. 15 min) → los reencola (preguntando siempre primero si el objeto existe en MinIO) o los marca `FAILED`.
-- Busca objetos en `raw-pdfs`/`extracted-txt` sin registro `COMPLETED`/`FAILED`/`REJECTED` correspondiente en Mongo más allá del umbral → los elimina (limpieza de huérfanos, controla el costo de almacenamiento).
+- Busca objetos en `raw-pdfs`/`extracted-md` sin registro `COMPLETED`/`FAILED`/`REJECTED` correspondiente en Mongo más allá del umbral → los elimina (limpieza de huérfanos, controla el costo de almacenamiento).
 - Este job **es** la compensación asíncrona para los casos que no pueden resolverse en el momento del fallo. Por eso sus umbrales son generosos, sus acciones son idempotentes y se ejecuta con `dry-run` antes de destruir nada.
 
 ---
@@ -514,7 +516,7 @@ Se recomienda la **Opción B**: es la que más control da, reutiliza Redis (ya e
 
 ### Fase 1 — Infraestructura base (Semana 1-2)
 1. Desplegar Traefik como entrypoint único, ACME configurado, con el host de API y el **host público dedicado de S3** (`s3.dominio`) y sus certificados.
-2. Desplegar MinIO, crear buckets `raw-pdfs` y `extracted-txt` con políticas separadas, y definir la **política `POST`** que gobierna el tamaño del PDF.
+2. Desplegar MinIO, crear buckets `raw-pdfs` y `extracted-md` con políticas separadas, y definir la **política `POST`** que gobierna el tamaño del PDF.
 3. Desplegar Redis con AOF habilitado y Sentinel para la instancia de Streams; definir separación lógica rate-limit/streams y verificar que los clientes de Go y Rust son Sentinel-aware.
 4. Configurar MongoDB como Replica Set, con `expires_at` calculado como ventana de subida + gracia para que el TTL no decida el expirado (§4).
 

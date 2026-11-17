@@ -373,9 +373,9 @@ con observabilidad suficiente para diagnosticar produccion antes de que haya tra
 | `S1-P1-01` | Traefik v3 como entrypoint unico | Config estatica con `entryPoints`, proveedor `docker` y proveedor de archivos, certificado ACME. **Empezar con el endpoint de staging de Let's Encrypt** para no agotar la cuota de emision. Emite certificado para el host de API y para el **host publico de S3** (`S0-P1-07`) | Un dominio de pruebas resuelve por HTTPS con certificado valido, `curl -I` por `http` devuelve 301 a `https`, y `https://s3.<dominio>` responde con su propio certificado | `S0-P1-03`, `S0-P1-07` | P0 |
 | `S1-P1-02` | Middleware `buffering` con limite de tamano **solo en endpoints JSON** | `maxRequestBodyBytes` chico (referencia: 1 MB) aplicado a las rutas JSON. **El PDF no pasa por el gateway** (subida directa a MinIO), asi que un limite grande aqui no protege nada: el limite del PDF vive en la `content-length-range` de la politica `POST` prefirmada, que genera P2 en `S3-P2-02` | (a) Un POST de 2 MB a `/api/v2/documents` da **413 en Traefik** sin llegar al servicio, verificado en el access log. (b) Una subida de 30 MB directo a MinIO con la policy da **EntityTooLarge**. La policy la genera P2 y este test lo corre P1 en `S3`, cuando la policy exista: hasta entonces la tarea queda `EN CURSO` | `S1-P1-01` | P0 |
 | `S1-P1-03` | TLS y mTLS interno (**opcional, se ejecuta en S2**) | CA interna; un certificado por servicio; Traefik valida el certificado del cliente solo en rutas internas. **Es opcional y no bloquea ninguna puerta:** si no entra, la cobertura minima la dan el aislamiento de red y el secreto compartido del webhook (deuda declarada en 19.3) | Una llamada a una ruta interna sin certificado se rechaza; con el certificado correcto, pasa. Si se decide no hacerlo, queda registrado como deuda con owner y fecha | `S1-P1-01` | P2 |
-| `S1-P1-04` | MinIO: buckets y politicas separadas | `raw-pdfs` (escritura via URL prefirmada, lectura solo worker) y `extracted-txt` (escritura solo worker, lectura doc-service y descarga) | `mc admin policy info` muestra que ninguna identidad tiene mas permisos que los documentados | `S0-P1-05` | P0 |
+| `S1-P1-04` | MinIO: buckets y politicas separadas | `raw-pdfs` (escritura via URL prefirmada, lectura solo worker) y `extracted-md` (escritura solo worker, lectura doc-service y descarga) | `mc admin policy info` muestra que ninguna identidad tiene mas permisos que los documentados | `S0-P1-05` | P0 |
 | `S1-P1-05` | Identidades por servicio (minimo privilegio) | Un usuario por servicio y por bucket. **Nunca** la cuenta root de MinIO en una aplicacion | Existe una matriz `servicio x bucket x permisos` versionada, y un test que intenta una operacion prohibida y recibe `AccessDenied` | `S1-P1-04` | P0 |
-| `S1-P1-06` | Lifecycle en los buckets (**se ejecuta en S2**) | `raw-pdfs`: eliminar tras N dias o al completar el procesamiento. `extracted-txt`: segun requisito de negocio | La regla existe y una prueba manual del borrado por lifecycle se ejecuta en el entorno de pruebas | `S1-P1-04` | P1 |
+| `S1-P1-06` | Lifecycle en los buckets (**se ejecuta en S2**) | `raw-pdfs`: eliminar tras N dias o al completar el procesamiento. `extracted-md`: segun requisito de negocio | La regla existe y una prueba manual del borrado por lifecycle se ejecuta en el entorno de pruebas | `S1-P1-04` | P1 |
 | `S1-P1-07` | Redis: AOF, ACL y politicas de memoria diferenciadas | Instancia de Streams: `appendonly yes`, `appendfsync everysec` y **`maxmemory-policy noeviction`** (evita perder trabajos). Instancia de rate limiting: `allkeys-lru`. Usuarios ACL distintos | Con `appendonly yes`, un `XADD` sobrevive a un `docker restart` de Redis | `S0-P1-03` | P0 |
 | `S1-P1-08` | Topologia de Streams en staging (**se ejecuta en S2**) | Sentinel con 3 nodos (1 primario y 2 replicas) para la instancia de Streams | Se mata el primario y la escritura de mensajes continua con menos de 30 s de interrupcion | `S1-P1-07` | P1 |
 | `S1-P1-09` | MongoDB como Replica Set | Eveno `rs0` de un solo nodo en dev, idealmente 3 nodos en staging, con `rs.initiate()`. **Change Streams y transacciones multi-documento lo requieren** | `db.hello()` reporta `setName: rs0`, y un `watch()` sobre `documents` emite un evento al hacer un `update` | `S0-P1-03` | P0 |
@@ -490,7 +490,7 @@ persistir el estado y encolar el trabajo, y de converger cualquier documento a u
 | `S3-P2-06` | Autenticacion del webhook | Token compartido (en el secreto), comparacion en tiempo constante y validacion de timestamp para reducir replay. Verificar el mecanismo soportado por la version de MinIO desplegada | Un webhook sin token se rechaza con 401 y no modifica estado | `S3-P2-05` | P0 |
 | `S3-P2-07` | Handler idempotente del webhook | Dos eventos `ObjectCreated` del mismo objeto producen un unico `XADD` (deduplicacion en el handler, mas la del relay) | Doble entrega simultanea produce un solo mensaje en la cola | `S2-P2-03` | P0 |
 | `S3-P2-08` | Robustez ante evento con objeto ya borrado | Si el evento llega y el objeto ya no existe, el documento no debe quedar en `UPLOADED` para siempre | Se borra el objeto antes del webhook y el documento termina en estado terminal por reconciliacion | `S3-P2-07` | P1 |
-| `S3-P2-09` | Descarga del resultado | `GET /documents/{id}/download` devuelve URL prefirmada de lectura de `extracted-txt` con expiracion corta, y solo si el estado es `COMPLETED` | Pedir la descarga de un documento `FAILED` devuelve 409 con error descriptivo | `S3-P2-02` | P0 |
+| `S3-P2-09` | Descarga del resultado | `GET /documents/{id}/download` devuelve URL prefirmada de lectura de `extracted-md` con expiracion corta, y solo si el estado es `COMPLETED` | Pedir la descarga de un documento `FAILED` devuelve 409 con error descriptivo | `S3-P2-02` | P0 |
 | `S3-P2-10` | Paginacion estable | Cursor por `(created_at, _id)` en vez de offset, para que los inserts no salten registros | Con 1000 documentos e inserciones concurrentes, la paginacion no repite ni salta | `S3-P2-01` | P1 |
 | `S4-P2-01` | Reconciliacion: reencolar | Documentos en `UPLOADED` con `updated_at` antiguo: reencolar **solo si el objeto existe en MinIO**; si no, marcar `FAILED` con causa `object_missing` | Un documento `UPLOADED` cuyo objeto si existe se reencola exactamente una vez | `S2-P2-06` | P0 |
 | `S4-P2-02` | Reconciliacion: limpiar huerfanos | Objetos en los buckets sin documento terminal correspondiente y mas antiguos que el umbral se eliminan, registrando `document_id` y motivo | Un objeto huerfano se elimina en menos de 10 min y queda registrado en el log | `S2-P2-06` | P0 |
@@ -826,7 +826,7 @@ Reglas invariables:
 | Metodo | Ruta | Exito | Errores | Notas |
 |---|---|---|---|---|
 | `POST` | `/api/v2/documents` | `201` con `document_id`, `upload_url` (host de S3), `method: "POST"`, `form_fields`, `required_headers`, `expires_in` | `400` validacion, `409` conflicto de idempotencia, `429` rate limit | Idempotente por `Idempotency-Key`; el limite de tamano viaja en la policy, no en este request |
-| `GET` | `/api/v2/documents/{id}` | `200` con estado, `txt_ref` si existe y `status_history` | `404` no existe, `429` | Cacheable unos segundos |
+| `GET` | `/api/v2/documents/{id}` | `200` con estado, `md_ref` si existe y `status_history` | `404` no existe, `429` | Cacheable unos segundos |
 | `GET` | `/api/v2/documents` | `200` con pagina de documentos y cursor | `400` cursor invalido | Paginacion por cursor, filtro por `status` |
 | `GET` | `/api/v2/documents/{id}/download` | `200` con `download_url` prefirmada de expiracion corta | `404`, `409` si no esta `COMPLETED` | Nunca se hace proxy del binario |
 | `POST` | `/internal/storage/events` | `204` | `401` sin token | Webhook de MinIO, no publico |
@@ -900,7 +900,7 @@ Reglas del contrato:
 | Bucket | Clave de objeto | Identidad que escribe | Identidad que lee |
 |---|---|---|---|
 | `raw-pdfs` | `<document_id>.pdf` | Cliente, via URL prefirmada emitida por doc-service | `extraction-worker` |
-| `extracted-txt` | `<document_id>.txt` | `extraction-worker` | `doc-service` (valida existencia) y cliente (descarga prefirmada) |
+| `extracted-md` | `<document_id>.md` | `extraction-worker` | `doc-service` (valida existencia) y cliente (descarga prefirmada) |
 
 Nota: como la URL prefirmada se firma con la identidad de quien la solicita, la escritura del cliente
 queda atribuida al doc-service. Por eso el permiso `PutObject` sobre `raw-pdfs/*` se concede solo a
@@ -1334,7 +1334,7 @@ Conocidas, previsibles y evitables. Cada una tiene su tarea asociada.
 | Ver los permisos de una politica | `mc admin policy info myminio <policy>` |
 | Ver los destinos de notificacion | `mc admin bucket remote list myminio` y `mc event list myminio/raw-pdfs` |
 | Ver las reglas de lifecycle | `mc ilm rule list myminio/raw-pdfs` |
-| Probar una escritura prohibida | `mc cp local.pdf myminio/extracted-txt/x.pdf` (debe fallar con `AccessDenied`) |
+| Probar una escritura prohibida | `mc cp local.pdf myminio/extracted-md/x.md` (debe fallar con `AccessDenied`) |
 
 ### 18.3 MongoDB: que necesito saber
 
