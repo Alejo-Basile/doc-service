@@ -139,6 +139,14 @@ func (m *mockStorage) PresignGetMD(ctx context.Context, objectKey string, expiry
 	return "", nil
 }
 
+func (m *mockStorage) StatLegacyTXT(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
+	return ports.ObjectInfo{Key: objectKey}, nil
+}
+
+func (m *mockStorage) PresignGetLegacyTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
+	return "", nil
+}
+
 func (m *mockStorage) ListObjects(ctx context.Context) ([]ports.ObjectInfo, error) {
 	return nil, nil
 }

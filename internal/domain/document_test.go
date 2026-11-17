@@ -299,3 +299,37 @@ func TestStatus_IsValid(t *testing.T) {
 		t.Error("IsValid(NOPE) debe ser false")
 	}
 }
+
+// --- ExtractedRef: resolución con fallback legacy (D5, cambiomd Fase 3) ---
+
+func TestDocument_ExtractedRef_SoloMd(t *testing.T) {
+	d := &Document{MdRef: "extracted-md/a.md"}
+	ref, legacy := d.ExtractedRef()
+	if ref != "extracted-md/a.md" || legacy {
+		t.Errorf("ExtractedRef() = (%q, %v), want (extracted-md/a.md, false)", ref, legacy)
+	}
+}
+
+func TestDocument_ExtractedRef_SoloTxtLegacy(t *testing.T) {
+	d := &Document{TxtRef: "extracted-txt/a.txt"}
+	ref, legacy := d.ExtractedRef()
+	if ref != "extracted-txt/a.txt" || !legacy {
+		t.Errorf("ExtractedRef() = (%q, %v), want (extracted-txt/a.txt, true)", ref, legacy)
+	}
+}
+
+func TestDocument_ExtractedRef_PrefiereMd(t *testing.T) {
+	d := &Document{MdRef: "extracted-md/a.md", TxtRef: "extracted-txt/a.txt"}
+	ref, legacy := d.ExtractedRef()
+	if ref != "extracted-md/a.md" || legacy {
+		t.Errorf("ExtractedRef() = (%q, %v), want (extracted-md/a.md, false) — md_ref tiene prioridad", ref, legacy)
+	}
+}
+
+func TestDocument_ExtractedRef_SinReferencias(t *testing.T) {
+	d := &Document{}
+	ref, legacy := d.ExtractedRef()
+	if ref != "" || legacy {
+		t.Errorf("ExtractedRef() = (%q, %v), want (\"\", false)", ref, legacy)
+	}
+}

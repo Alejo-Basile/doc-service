@@ -108,9 +108,10 @@ func (m *mockRepo) UpdateStatusWithHistory(ctx context.Context, id string, from,
 
 // mockStorage implementa ports.ObjectStorage (y el listado opcional).
 type mockStorage struct {
-	objects   map[string]bool // key → exists
-	mdObjects map[string]bool
-	pdfData   []byte
+	objects    map[string]bool // key → exists
+	mdObjects  map[string]bool
+	txtObjects map[string]bool // objetos del bucket legacy extracted-txt (D5)
+	pdfData    []byte
 	// statErr permite simular errores de infraestructura (p. ej. NoSuchBucket).
 	statErr error
 	// listObjects soporta la aserción `lister` de purgeOrphanObjects (S4-P2-02).
@@ -185,6 +186,20 @@ func (m *mockStorage) StatMD(ctx context.Context, objectKey string) (ports.Objec
 		return ports.ObjectInfo{Key: objectKey}, nil
 	}
 	return ports.ObjectInfo{}, errNotFound
+}
+
+func (m *mockStorage) StatLegacyTXT(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
+	if m.statErr != nil {
+		return ports.ObjectInfo{}, m.statErr
+	}
+	if m.txtObjects != nil && m.txtObjects[objectKey] {
+		return ports.ObjectInfo{Key: objectKey}, nil
+	}
+	return ports.ObjectInfo{}, errNotFound
+}
+
+func (m *mockStorage) PresignGetLegacyTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
+	return "", nil
 }
 
 func (m *mockStorage) ListObjectsMD(ctx context.Context) ([]ports.ObjectInfo, error) {
@@ -2028,5 +2043,86 @@ func TestRunOnce_StuckProcessing_ErrorDeInfraestructura_NoMarcaFailed(t *testing
 	if len(repo.updateCalls) != 0 || len(queue.enqueued) != 0 {
 		t.Errorf("mutaciones = (updates %d, enqueues %d), want (0, 0)",
 			len(repo.updateCalls), len(queue.enqueued))
+	}
+}
+
+// --- Fallback legacy txt_ref en artefacto COMPLETED (D5, cambiomd Fase 3) ---
+
+// TestRunOnce_CompletedConTxtRefLegacy_NoAlerta: un COMPLETED solo con txt_ref
+// cuyo .txt existe en el bucket legacy NO debe contarse como faltante.
+func TestRunOnce_CompletedConTxtRefLegacy_NoAlerta(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+
+	repo.docs["doc-legacy"] = &domain.Document{
+		ID:        "doc-legacy",
+		Status:    domain.StatusCompleted,
+		ObjectKey: "raw-pdfs/doc-legacy.pdf",
+		TxtRef:    "extracted-txt/doc-legacy.txt",
+		CreatedAt: now.Add(-time.Hour),
+	}
+	storage.txtObjects = map[string]bool{"extracted-txt/doc-legacy.txt": true}
+
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+	if result.CompletedNoMd != 0 {
+		t.Errorf("CompletedNoMd = %d, want 0 (txt_ref legacy cubre el artefacto)", result.CompletedNoMd)
+	}
+}
+
+// TestRunOnce_CompletedTxtRefLegacyFaltante_Detectado: el .txt legacy ausente sí alerta.
+func TestRunOnce_CompletedTxtRefLegacyFaltante_Detectado(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+
+	repo.docs["doc-legacy-missing"] = &domain.Document{
+		ID:        "doc-legacy-missing",
+		Status:    domain.StatusCompleted,
+		ObjectKey: "raw-pdfs/doc-legacy-missing.pdf",
+		TxtRef:    "extracted-txt/doc-legacy-missing.txt",
+		CreatedAt: now.Add(-time.Hour),
+	}
+	storage.txtObjects = map[string]bool{} // el .txt no existe
+
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+	if result.CompletedNoMd != 1 {
+		t.Errorf("CompletedNoMd = %d, want 1 (txt_ref legacy sin objeto)", result.CompletedNoMd)
+	}
+}
+
+// TestRunOnce_CompletedMdRefFaltanteSigueDetectando: con md_ref presente, su
+// ausencia en MinIO sigue alertando (md tiene prioridad; no cae al legacy).
+func TestRunOnce_CompletedMdRefFaltanteSigueDetectando(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+
+	repo.docs["doc-md-missing"] = &domain.Document{
+		ID:        "doc-md-missing",
+		Status:    domain.StatusCompleted,
+		ObjectKey: "raw-pdfs/doc-md-missing.pdf",
+		MdRef:     "extracted-md/doc-md-missing.md",
+		TxtRef:    "extracted-txt/doc-md-missing.txt", // legacy existe…
+		CreatedAt: now.Add(-time.Hour),
+	}
+	storage.mdObjects = map[string]bool{} // …pero md_ref manda
+	storage.txtObjects = map[string]bool{"extracted-txt/doc-md-missing.txt": true}
+
+	r := New(repo, storage, nil, nil, &mockClock{now}, 10*time.Minute, 30*time.Minute, 15*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+	if result.CompletedNoMd != 1 {
+		t.Errorf("CompletedNoMd = %d, want 1 (md_ref presente pero objeto ausente)", result.CompletedNoMd)
 	}
 }

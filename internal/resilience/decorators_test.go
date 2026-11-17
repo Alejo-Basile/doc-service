@@ -81,6 +81,11 @@ func (s *stubStorage) StatMD(_ context.Context, _ string) (ports.ObjectInfo, err
 	return s.info, s.err
 }
 
+func (s *stubStorage) StatLegacyTXT(_ context.Context, _ string) (ports.ObjectInfo, error) {
+	s.calls = append(s.calls, "StatLegacyTXT")
+	return s.info, s.err
+}
+
 func (s *stubStorage) GetRange(_ context.Context, _ string, _, _ int64) ([]byte, error) {
 	s.calls = append(s.calls, "GetRange")
 	return s.data, s.err
@@ -103,6 +108,11 @@ func (s *stubStorage) PresignGet(_ context.Context, _ string, _ time.Duration) (
 
 func (s *stubStorage) PresignGetMD(_ context.Context, _ string, _ time.Duration) (string, error) {
 	s.calls = append(s.calls, "PresignGetMD")
+	return s.url, s.err
+}
+
+func (s *stubStorage) PresignGetLegacyTXT(_ context.Context, _ string, _ time.Duration) (string, error) {
+	s.calls = append(s.calls, "PresignGetLegacyTXT")
 	return s.url, s.err
 }
 
@@ -191,6 +201,9 @@ func TestDecorators_ForwardResultsAndErrors(t *testing.T) {
 		if got, err := decorated.StatMD(ctx, "extracted-md/doc-1.md"); err != nil || got != info {
 			t.Errorf("StatMD: got (%v, %v), want (%v, nil)", got, err, info)
 		}
+		if got, err := decorated.StatLegacyTXT(ctx, "extracted-txt/doc-1.txt"); err != nil || got != info {
+			t.Errorf("StatLegacyTXT: got (%v, %v), want (%v, nil)", got, err, info)
+		}
 		if got, err := decorated.GetRange(ctx, "raw-pdfs/doc-1.pdf", 0, 8); err != nil || !bytes.Equal(got, data) {
 			t.Errorf("GetRange: got (%q, %v), want (%q, nil)", got, err, data)
 		}
@@ -206,6 +219,9 @@ func TestDecorators_ForwardResultsAndErrors(t *testing.T) {
 		if got, err := decorated.PresignGetMD(ctx, "extracted-md/doc-1.md", time.Minute); err != nil || got != "https://s3/get" {
 			t.Errorf("PresignGetMD: got (%q, %v), want (%q, nil)", got, err, "https://s3/get")
 		}
+		if got, err := decorated.PresignGetLegacyTXT(ctx, "extracted-txt/doc-1.txt", time.Minute); err != nil || got != "https://s3/get" {
+			t.Errorf("PresignGetLegacyTXT: got (%q, %v), want (%q, nil)", got, err, "https://s3/get")
+		}
 		if got, err := decorated.ListObjects(ctx); err != nil || !sameInfo(got, list) {
 			t.Errorf("ListObjects: got (%v, %v), want (mismo slice, nil)", got, err)
 		}
@@ -213,7 +229,7 @@ func TestDecorators_ForwardResultsAndErrors(t *testing.T) {
 			t.Errorf("ListObjectsMD: got (%v, %v), want (mismo slice, nil)", got, err)
 		}
 
-		wantCalls := []string{"PresignPost", "Stat", "StatMD", "GetRange", "Delete", "DeleteMD", "PresignGet", "PresignGetMD", "ListObjects", "ListObjectsMD"}
+		wantCalls := []string{"PresignPost", "Stat", "StatMD", "StatLegacyTXT", "GetRange", "Delete", "DeleteMD", "PresignGet", "PresignGetMD", "PresignGetLegacyTXT", "ListObjects", "ListObjectsMD"}
 		if !equalStrings(inner.calls, wantCalls) {
 			t.Errorf("métodos invocados: %v, want %v", inner.calls, wantCalls)
 		}
@@ -285,11 +301,13 @@ func TestDecorators_AllMethodsRouteThroughBreaker(t *testing.T) {
 			}},
 			{"Stat", func() error { _, err := decorated.Stat(ctx, "k"); return err }},
 			{"StatMD", func() error { _, err := decorated.StatMD(ctx, "k"); return err }},
+			{"StatLegacyTXT", func() error { _, err := decorated.StatLegacyTXT(ctx, "k"); return err }},
 			{"GetRange", func() error { _, err := decorated.GetRange(ctx, "k", 0, 1); return err }},
 			{"Delete", func() error { return decorated.Delete(ctx, "k") }},
 			{"DeleteMD", func() error { return decorated.DeleteMD(ctx, "k") }},
 			{"PresignGet", func() error { _, err := decorated.PresignGet(ctx, "k", time.Minute); return err }},
 			{"PresignGetMD", func() error { _, err := decorated.PresignGetMD(ctx, "k", time.Minute); return err }},
+			{"PresignGetLegacyTXT", func() error { _, err := decorated.PresignGetLegacyTXT(ctx, "k", time.Minute); return err }},
 			{"ListObjects", func() error { _, err := decorated.ListObjects(ctx); return err }},
 			{"ListObjectsMD", func() error { _, err := decorated.ListObjectsMD(ctx); return err }},
 		}

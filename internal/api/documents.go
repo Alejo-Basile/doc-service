@@ -198,6 +198,7 @@ func (h *DocumentHandler) GetDocument(c *gin.Context) {
 		"status":         string(doc.Status),
 		"object_key":     doc.ObjectKey,
 		"md_ref":         doc.MdRef,
+		"txt_ref":        doc.TxtRef,
 		"correlation_id": doc.CorrelationID,
 		"schema_version": doc.SchemaVersion,
 		"failure_reason": doc.FailureReason,
@@ -236,24 +237,31 @@ func (h *DocumentHandler) DownloadDocument(c *gin.Context) {
 		return
 	}
 
-	// md_ref es la clave del objeto en extracted-md.
-	if doc.MdRef == "" {
+	// Resolución con fallback legacy (D5): md_ref primero; si no existe, txt_ref.
+	// Cada referencia usa su bucket correspondiente.
+	ref, legacy := doc.ExtractedRef()
+	if ref == "" {
 		respondProblem(c, http.StatusConflict, "conflict",
 			"Resultado no disponible",
-			"el documento está COMPLETED pero no tiene md_ref")
+			"el documento está COMPLETED pero no tiene md_ref ni txt_ref")
 		return
 	}
 
 	// URL prefirmada de lectura con expiración corta (5 min).
-	downloadURL, err := h.storage.PresignGetMD(c.Request.Context(), doc.MdRef, 5*time.Minute)
+	var downloadURL string
+	if legacy {
+		downloadURL, err = h.storage.PresignGetLegacyTXT(c.Request.Context(), ref, 5*time.Minute)
+	} else {
+		downloadURL, err = h.storage.PresignGetMD(c.Request.Context(), ref, 5*time.Minute)
+	}
 	if err != nil {
-		slog.Error("download: presign GET MD", "error", err, "document_id", id, "md_ref", doc.MdRef)
+		slog.Error("download: presign GET", "error", err, "document_id", id, "ref", ref, "legacy", legacy)
 		respondProblem(c, http.StatusInternalServerError, "internal", "Error generando URL de descarga", "")
 		return
 	}
 
 	slog.Info("download URL generada",
-		"document_id", id, "md_ref", doc.MdRef,
+		"document_id", id, "ref", ref, "legacy", legacy,
 	)
 
 	c.JSON(http.StatusOK, gin.H{

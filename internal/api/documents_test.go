@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -151,6 +152,14 @@ func (m *mockStorage) PresignGet(ctx context.Context, objectKey string, expiry t
 
 func (m *mockStorage) PresignGetMD(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
 	return "https://s3.example.com/extracted-md/" + objectKey, nil
+}
+
+func (m *mockStorage) StatLegacyTXT(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
+	return ports.ObjectInfo{}, nil
+}
+
+func (m *mockStorage) PresignGetLegacyTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
+	return "https://s3.example.com/extracted-txt/" + objectKey, nil
 }
 
 func (m *mockStorage) ListObjects(ctx context.Context) ([]ports.ObjectInfo, error) {
@@ -617,5 +626,78 @@ func TestListDocuments_StatusInvalido_BadRequest(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status esperado 400, got %d", w.Code)
+	}
+}
+
+// --- Fallback legacy txt_ref (D5, cambiomd Fase 3) ---
+
+func TestDownloadDocument_FallbackTxtRef(t *testing.T) {
+	engine, repo := setupTestServer(t)
+
+	doc := domain.NewDocument("corr-fb-1", time.Now().UTC().Add(30*time.Minute))
+	doc.Status = domain.StatusCompleted
+	doc.TxtRef = "extracted-txt/doc-fb-1.txt" // solo legacy: sin md_ref
+	_ = repo.Insert(context.Background(), doc)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/documents/"+doc.ID+"/download", nil)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status esperado 200, got %d; body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("JSON inválido: %v", err)
+	}
+	url, _ := resp["download_url"].(string)
+	if !strings.Contains(url, "/extracted-txt/") {
+		t.Errorf("download_url = %q, want bucket legacy /extracted-txt/", url)
+	}
+}
+
+func TestDownloadDocument_PrefiereMdRef(t *testing.T) {
+	engine, repo := setupTestServer(t)
+
+	doc := domain.NewDocument("corr-fb-2", time.Now().UTC().Add(30*time.Minute))
+	doc.Status = domain.StatusCompleted
+	doc.MdRef = "extracted-md/doc-fb-2.md"
+	doc.TxtRef = "extracted-txt/doc-fb-2.txt" // ambos: md_ref tiene prioridad
+	_ = repo.Insert(context.Background(), doc)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/documents/"+doc.ID+"/download", nil)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status esperado 200, got %d; body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("JSON inválido: %v", err)
+	}
+	url, _ := resp["download_url"].(string)
+	if !strings.Contains(url, "/extracted-md/") {
+		t.Errorf("download_url = %q, want bucket /extracted-md/ (md_ref tiene prioridad)", url)
+	}
+	if strings.Contains(url, "/extracted-txt/") {
+		t.Errorf("download_url = %q, no debe caer al bucket legacy con md_ref presente", url)
+	}
+}
+
+func TestDownloadDocument_SinReferencias_Conflict(t *testing.T) {
+	engine, repo := setupTestServer(t)
+
+	doc := domain.NewDocument("corr-fb-3", time.Now().UTC().Add(30*time.Minute))
+	doc.Status = domain.StatusCompleted
+	// ni md_ref ni txt_ref
+	_ = repo.Insert(context.Background(), doc)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/documents/"+doc.ID+"/download", nil)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status esperado 409, got %d; body=%s", w.Code, w.Body.String())
 	}
 }

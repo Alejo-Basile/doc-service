@@ -30,6 +30,9 @@ type Config struct {
 	BucketRaw string
 	// BucketMD es el bucket de markdown extraído.
 	BucketMD string
+	// BucketLegacyTXT es el bucket legacy de textos extraídos (pre-md). Solo
+	// lectura de compatibilidad D5: no se escribe ni se borra nunca.
+	BucketLegacyTXT string
 	// Region es la región SigV4 usada para firmar; vacía usa defaultRegion.
 	Region string
 }
@@ -46,6 +49,7 @@ type ObjectStorage struct {
 	publicEndpointU *url.URL
 	bucketRaw       string
 	bucketMD        string
+	bucketLegacyTXT string
 }
 
 // New crea un ObjectStorage conectado a MinIO.
@@ -93,6 +97,7 @@ func New(cfg Config) (*ObjectStorage, error) {
 		publicEndpointU: pubU,
 		bucketRaw:       cfg.BucketRaw,
 		bucketMD:        cfg.BucketMD,
+		bucketLegacyTXT: cfg.BucketLegacyTXT,
 	}, nil
 }
 
@@ -200,6 +205,23 @@ func (o *ObjectStorage) StatMD(ctx context.Context, objectKey string) (ports.Obj
 	}, nil
 }
 
+// StatLegacyTXT verifica la existencia de un objeto (HEAD) en el bucket legacy
+// de textos (compatibilidad de lectura D5). No hay delete/list sobre el bucket
+// legacy a propósito: los objetos TXT históricos jamás se modifican ni eliminan.
+func (o *ObjectStorage) StatLegacyTXT(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
+	info, err := o.client.StatObject(ctx, o.bucketLegacyTXT, objectKey, miniogo.StatObjectOptions{})
+	if err != nil {
+		return ports.ObjectInfo{}, fmt.Errorf("stat %s/%s: %w", o.bucketLegacyTXT, objectKey, err)
+	}
+
+	return ports.ObjectInfo{
+		Key:          objectKey,
+		Size:         info.Size,
+		ContentType:  info.ContentType,
+		LastModified: info.LastModified,
+	}, nil
+}
+
 // GetRange lee un rango de bytes del objeto (para validar %PDF-).
 // start y end son inclusivos (RFC 7233). Usa el bucket raw.
 func (o *ObjectStorage) GetRange(ctx context.Context, objectKey string, start, end int64) ([]byte, error) {
@@ -259,6 +281,25 @@ func (o *ObjectStorage) PresignGetMD(ctx context.Context, objectKey string, expi
 	u, err := o.presignClient.PresignedGetObject(ctx, o.bucketMD, objectKey, expiry, nil)
 	if err != nil {
 		return "", fmt.Errorf("presign GET MD %s/%s: %w", o.bucketMD, objectKey, err)
+	}
+	res := u.String()
+	if o.publicEndpointU != nil && o.publicEndpoint != "" {
+		up, perr := url.Parse(res)
+		if perr == nil {
+			up.Scheme = o.publicEndpointU.Scheme
+			up.Host = o.publicEndpointU.Host
+			res = up.String()
+		}
+	}
+	return res, nil
+}
+
+// PresignGetLegacyTXT genera una URL prefirmada de lectura del bucket legacy de
+// textos (fallback de descarga pre-md, D5).
+func (o *ObjectStorage) PresignGetLegacyTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
+	u, err := o.presignClient.PresignedGetObject(ctx, o.bucketLegacyTXT, objectKey, expiry, nil)
+	if err != nil {
+		return "", fmt.Errorf("presign GET LEGACY TXT %s/%s: %w", o.bucketLegacyTXT, objectKey, err)
 	}
 	res := u.String()
 	if o.publicEndpointU != nil && o.publicEndpoint != "" {

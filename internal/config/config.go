@@ -29,7 +29,10 @@ type Config struct {
 	MinIOSecretKey      string
 	MinIOBucketRaw      string
 	MinIOBucketMD       string
-	MinIOWebhookSecret  string
+	// MinIOLegacyBucketTXT es el bucket legacy de textos extraídos (pre-md).
+	// Solo lectura de compatibilidad D5 (read-fallback txt_ref).
+	MinIOLegacyBucketTXT string
+	MinIOWebhookSecret   string
 	// MinIORegion es la región SigV4 usada para firmar URLs prefirmadas.
 	MinIORegion string
 
@@ -65,6 +68,7 @@ const (
 	defaultMongoDatabase     = "documents"
 	defaultMinIOBucketRaw    = "raw-pdfs"
 	defaultMinIOBucketMD     = "extracted-md"
+	defaultMinIOLegacyBucket = "extracted-txt"
 	defaultMinIORegion       = "us-east-1"
 	defaultRedisStreamKey    = "stream:pdf-processing"
 	defaultMaxPDFBytes       = 26214400 // 25 MB (SPEC §5.1)
@@ -77,29 +81,30 @@ const (
 // Devuelve un error que lista TODAS las variables obligatorias faltantes.
 func Load() (*Config, error) {
 	cfg := &Config{
-		HTTPPort:            envInt("HTTP_PORT", defaultHTTPPort),
-		Debug:               envBool("DEBUG", false),
-		MongoURI:            strings.TrimSpace(os.Getenv("MONGO_URI")),
-		MongoDatabase:       envStr("MONGO_DATABASE", defaultMongoDatabase),
-		MinIOEndpoint:       strings.TrimSpace(os.Getenv("MINIO_ENDPOINT")),
-		MinIOPublicEndpoint: strings.TrimSpace(os.Getenv("MINIO_PUBLIC_ENDPOINT")),
-		MinIOAccessKey:      strings.TrimSpace(os.Getenv("MINIO_ACCESS_KEY")),
-		MinIOSecretKey:      strings.TrimSpace(os.Getenv("MINIO_SECRET_KEY")),
-		MinIOBucketRaw:      envStr("MINIO_BUCKET_RAW", defaultMinIOBucketRaw),
-		MinIOBucketMD:       envStr("MINIO_BUCKET_MD", defaultMinIOBucketMD),
-		MinIOWebhookSecret:  strings.TrimSpace(os.Getenv("MINIO_WEBHOOK_SECRET")),
-		MinIORegion:         envStr("MINIO_REGION", defaultMinIORegion),
-		RedisAddr:           strings.TrimSpace(os.Getenv("REDIS_ADDR")),
-		RedisPassword:       strings.TrimSpace(os.Getenv("REDIS_PASSWORD")),
-		RedisStreamKey:      envStr("REDIS_STREAM_KEY", defaultRedisStreamKey),
-		RedisSentinelAddrs:  envList("REDIS_SENTINEL_ADDRS"),
-		RedisMasterName:     strings.TrimSpace(os.Getenv("REDIS_MASTER_NAME")),
-		InternalToken:       strings.TrimSpace(os.Getenv("INTERNAL_TOKEN")),
-		MaxPDFBytes:         envInt64("MAX_PDF_BYTES", defaultMaxPDFBytes),
-		ReconcileInterval:   time.Duration(envInt("RECONCILE_INTERVAL_MIN", defaultReconcileMin)) * time.Minute,
-		DocUploadGrace:      time.Duration(envInt("DOC_UPLOAD_GRACE_MIN", defaultDocUploadGraceMin)) * time.Minute,
-		MinSafetyAge:        time.Duration(envInt("MIN_SAFETY_AGE_MIN", defaultMinSafetyAgeMin)) * time.Minute,
-		DryRun:              envBool("RECONCILE_DRY_RUN", false),
+		HTTPPort:             envInt("HTTP_PORT", defaultHTTPPort),
+		Debug:                envBool("DEBUG", false),
+		MongoURI:             strings.TrimSpace(os.Getenv("MONGO_URI")),
+		MongoDatabase:        envStr("MONGO_DATABASE", defaultMongoDatabase),
+		MinIOEndpoint:        strings.TrimSpace(os.Getenv("MINIO_ENDPOINT")),
+		MinIOPublicEndpoint:  strings.TrimSpace(os.Getenv("MINIO_PUBLIC_ENDPOINT")),
+		MinIOAccessKey:       strings.TrimSpace(os.Getenv("MINIO_ACCESS_KEY")),
+		MinIOSecretKey:       strings.TrimSpace(os.Getenv("MINIO_SECRET_KEY")),
+		MinIOBucketRaw:       envStr("MINIO_BUCKET_RAW", defaultMinIOBucketRaw),
+		MinIOBucketMD:        envStr("MINIO_BUCKET_MD", defaultMinIOBucketMD),
+		MinIOLegacyBucketTXT: envStr("MINIO_LEGACY_BUCKET_TXT", defaultMinIOLegacyBucket),
+		MinIOWebhookSecret:   strings.TrimSpace(os.Getenv("MINIO_WEBHOOK_SECRET")),
+		MinIORegion:          envStr("MINIO_REGION", defaultMinIORegion),
+		RedisAddr:            strings.TrimSpace(os.Getenv("REDIS_ADDR")),
+		RedisPassword:        strings.TrimSpace(os.Getenv("REDIS_PASSWORD")),
+		RedisStreamKey:       envStr("REDIS_STREAM_KEY", defaultRedisStreamKey),
+		RedisSentinelAddrs:   envList("REDIS_SENTINEL_ADDRS"),
+		RedisMasterName:      strings.TrimSpace(os.Getenv("REDIS_MASTER_NAME")),
+		InternalToken:        strings.TrimSpace(os.Getenv("INTERNAL_TOKEN")),
+		MaxPDFBytes:          envInt64("MAX_PDF_BYTES", defaultMaxPDFBytes),
+		ReconcileInterval:    time.Duration(envInt("RECONCILE_INTERVAL_MIN", defaultReconcileMin)) * time.Minute,
+		DocUploadGrace:       time.Duration(envInt("DOC_UPLOAD_GRACE_MIN", defaultDocUploadGraceMin)) * time.Minute,
+		MinSafetyAge:         time.Duration(envInt("MIN_SAFETY_AGE_MIN", defaultMinSafetyAgeMin)) * time.Minute,
+		DryRun:               envBool("RECONCILE_DRY_RUN", false),
 	}
 
 	if err := cfg.Validate(); err != nil {

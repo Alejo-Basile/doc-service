@@ -82,6 +82,14 @@ type ObjectStorage interface {
 	PresignGet(ctx context.Context, objectKey string, expiry time.Duration) (string, error)
 	// PresignGetMD genera una URL prefirmada de lectura del bucket extracted-md.
 	PresignGetMD(ctx context.Context, objectKey string, expiry time.Duration) (string, error)
+	// StatLegacyTXT verifica la existencia de un objeto (HEAD) en el bucket legacy
+	// de textos (compatibilidad de lectura D5). No hay DeleteLegacyTXT ni
+	// ListObjectsLegacyTXT a propósito: los objetos TXT históricos jamás se
+	// modifican ni eliminan desde doc-service.
+	StatLegacyTXT(ctx context.Context, objectKey string) (ObjectInfo, error)
+	// PresignGetLegacyTXT genera una URL prefirmada de lectura del bucket legacy
+	// de textos (fallback de descarga para documentos pre-md, D5).
+	PresignGetLegacyTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error)
 	// ListObjects lista todos los objetos del bucket raw (para purga de huérfanos).
 	ListObjects(ctx context.Context) ([]ObjectInfo, error)
 	// ListObjectsMD lista todos los objetos del bucket extracted-md.

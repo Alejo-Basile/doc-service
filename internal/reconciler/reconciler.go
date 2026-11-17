@@ -141,7 +141,7 @@ type Result struct {
 	Reenqueued        int               `json:"reenqueued"`
 	StuckDetected     int               `json:"stuck_detected"`
 	OrphansPurged     int               `json:"orphans_purged"`
-	CompletedNoMd     int               `json:"completed_no_md"` // COMPLETED sin .md en MinIO (S5-P2-03)
+	CompletedNoMd     int               `json:"completed_no_md"` // COMPLETED sin artefacto usable (md_ref o txt_ref legacy) en MinIO (S5-P2-03, D5)
 	Errors            int               `json:"errors"`
 	LockAcquired      bool              `json:"lock_acquired"`
 	CrossCheckReport  *CrossCheckReport `json:"cross_check,omitempty"` // S6-P2-01
@@ -166,7 +166,7 @@ type CrossCheckReport struct {
 	// Discrepancias
 	OrphanRawObjects  []string `json:"orphan_raw_objects"`  // en MinIO sin documento
 	MissingRawObjects []string `json:"missing_raw_objects"` // documento sin objeto en MinIO
-	CompletedNoMd     []string `json:"completed_no_md"`     // COMPLETED sin .md
+	CompletedNoMd     []string `json:"completed_no_md"`     // COMPLETED sin artefacto (md_ref o txt_ref legacy)
 	FailedNoReason    []string `json:"failed_no_reason"`    // FAILED sin failure_reason
 	// Seguridad
 	YoungUntouched int64 `json:"young_untouched"` // documentos < minSafetyAge no tocados
@@ -1015,25 +1015,32 @@ func (r *Reconciler) sweepCompletedMissingMd(ctx context.Context, now time.Time)
 		if now.Sub(doc.CreatedAt) < r.minSafetyAge {
 			continue
 		}
-		if doc.MdRef == "" {
+		// Fallback legacy (D5): md_ref primero; si no existe, txt_ref (bucket legacy).
+		ref, legacy := doc.ExtractedRef()
+		if ref == "" {
 			count++
-			slog.Warn("reconciler: documento COMPLETED sin md_ref",
+			slog.Warn("reconciler: documento COMPLETED sin artefacto (ni md_ref ni txt_ref)",
 				"document_id", doc.ID,
 			)
 			continue
 		}
-		// Verificar que el .md exista en MinIO.
-		_, err := r.storage.StatMD(ctx, doc.MdRef)
+		// Verificar que el artefacto exista en MinIO (bucket según el tipo de ref).
+		var err error
+		if legacy {
+			_, err = r.storage.StatLegacyTXT(ctx, ref)
+		} else {
+			_, err = r.storage.StatMD(ctx, ref)
+		}
 		if err != nil {
 			if isNotFound(err) {
 				count++
-				slog.Warn("reconciler: documento COMPLETED pero .md no existe en MinIO",
+				slog.Warn("reconciler: documento COMPLETED pero el artefacto no existe en MinIO",
 					"document_id", doc.ID,
-					"md_ref", doc.MdRef,
+					"ref", ref, "legacy", legacy,
 				)
 			} else {
-				slog.Error("reconciler: error verificando .md",
-					"document_id", doc.ID, "md_ref", doc.MdRef, "error", err)
+				slog.Error("reconciler: error verificando artefacto",
+					"document_id", doc.ID, "ref", ref, "legacy", legacy, "error", err)
 			}
 		}
 	}
@@ -1081,13 +1088,20 @@ func (r *Reconciler) crossCheck(ctx context.Context, now time.Time) (*CrossCheck
 			report.FailedNoReason = append(report.FailedNoReason, doc.ID)
 		}
 
-		// COMPLETED sin .md (S5-P2-03).
+		// COMPLETED sin artefacto verificable (S5-P2-03, fallback legacy D5).
 		if doc.Status == domain.StatusCompleted {
-			if doc.MdRef == "" {
+			ref, legacy := doc.ExtractedRef()
+			if ref == "" {
 				report.CompletedNoMd = append(report.CompletedNoMd, doc.ID)
 			} else if now.Sub(doc.CreatedAt) >= r.minSafetyAge {
 				// Solo verificar si pasó el umbral de seguridad.
-				if _, err := r.storage.StatMD(ctx, doc.MdRef); err != nil && isNotFound(err) {
+				var err error
+				if legacy {
+					_, err = r.storage.StatLegacyTXT(ctx, ref)
+				} else {
+					_, err = r.storage.StatMD(ctx, ref)
+				}
+				if err != nil && isNotFound(err) {
 					report.CompletedNoMd = append(report.CompletedNoMd, doc.ID)
 				}
 			}

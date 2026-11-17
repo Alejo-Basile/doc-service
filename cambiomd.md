@@ -29,7 +29,7 @@ Lo que **no** cambia:
 | D2 | Campo Mongo/API | `txt_ref` → `md_ref` (dominio `TxtRef` → `MdRef`) | asumido |
 | D3 | Clave de objeto | `<document_id>.txt` → `<document_id>.md` (la escribe el worker; doc-service solo la almacena/lee) | asumido |
 | D4 | Mecanismo de entrega | Sigue siendo URL prefirmada (`GET /documents/{id}/download`); cambia el campo `txt_ref`→`md_ref` en las respuestas | asumido |
-| D5 | Datos existentes (`txt_ref` en Mongo, objetos `.txt` legacy) | Fase 3: fallback temporal de lectura **o** script de migración | **pendiente de decisión** |
+| D5 | Datos existentes (`txt_ref` en Mongo, objetos `.txt` legacy) | **read-fallback** elegido por el usuario (2026-11-17): `md_ref` primero, `txt_ref` legacy si falta | decidido |
 | D6 | Contrato con `extraction-worker` (repo externo) | El worker debe escribir `md_ref` = `extracted-md/<id>.md`; coordinación en Fase 4 | **externo** |
 
 Si un supuesto no coincide con el cambio real (p. ej. infra fija otro nombre de bucket),
@@ -93,9 +93,9 @@ Reglas de la fase:
 
 ### Fase 3 — Migración y compatibilidad de datos existentes (decisión D5)
 
-- [ ] T3.1 Decidir estrategia: (a) fallback temporal de lectura (`md_ref` y, si falta, `txt_ref`) o (b) script de migración Mongo `txt_ref`→`md_ref` + retiro del bucket viejo
-- [ ] T3.2 Implementar la estrategia elegida con tests
-- [ ] T3.3 Runbook: objetos `.txt` legacy en `extracted-txt` (se conservan hasta el lifecycle o se migran)
+- [x] T3.1 Decidir estrategia: elegida (a) read-fallback de lectura (`md_ref` y, si falta, `txt_ref`) — decisión D5 del usuario
+- [x] T3.2 Implementar la estrategia elegida con tests — `ExtractedRef()` en dominio + `StatLegacyTXT`/`PresignGetLegacyTXT` (solo lectura) en puerto/adaptador/decorador; fallback en `DownloadDocument` y verificaciones COMPLETED del reconciliador; tests de ambos caminos + ausencia/error
+- [x] T3.3 Runbook: objetos `.txt` legacy en `extracted-txt` — `docs/design/legacy-txt-fallback.md` (se conservan hasta el lifecycle o se migran; retiro del fallback documentado)
 
 ### Fase 4 — Contrato con `extraction-worker` e infra
 
@@ -139,6 +139,16 @@ go test -race -count=1 $PKGS
 - Fase 5 agrega la verificación E2E con servicios reales.
 
 ## Registro de progreso
+
+- 2026-11-17: Fase 3 completada — D5 (read-fallback) implementada. `Document.TxtRef` (solo
+  lectura legacy) + `ExtractedRef()` (md_ref primero; txt_ref solo si md_ref vacío); métodos
+  de solo lectura `StatLegacyTXT`/`PresignGetLegacyTXT` (sin delete/list sobre el bucket legacy:
+  protección estructural de los objetos TXT históricos); fallback en `DownloadDocument` y en las
+  verificaciones COMPLETED del reconciliador/crossCheck; `MINIO_LEGACY_BUCKET_TXT`
+  (default `extracted-txt`). Runbook de retiro: `docs/design/legacy-txt-fallback.md`.
+  TDD: RED observado (domain/api/reconciler) → GREEN. Verificación: `gofmt` OK, `go vet` OK,
+  suite hermética 12/12 ok. Ejecutado inline (el writer delegado vuelve a fallar por el
+  bloqueo de región del modelo del runtime OpenCode, no por error de Gentle AI).
 
 - 2026-11-17: Fase 2 (docs) completada — T2.1–T2.6. Archivos: `docs/design/mongo-schema.md`,
   `docs/adr/ADR-0006-worker-completed-directo.md`, `docs/SPEC.md`, `docs/pasos-iniciales.md`.

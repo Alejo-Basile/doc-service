@@ -134,6 +134,16 @@ func (s *objectStorage) StatMD(ctx context.Context, objectKey string) (ports.Obj
 	return info, err
 }
 
+func (s *objectStorage) StatLegacyTXT(ctx context.Context, objectKey string) (ports.ObjectInfo, error) {
+	var info ports.ObjectInfo
+	err := s.b.Do(func() error {
+		var err error
+		info, err = s.inner.StatLegacyTXT(ctx, objectKey)
+		return err
+	})
+	return info, err
+}
+
 func (s *objectStorage) GetRange(ctx context.Context, objectKey string, start, end int64) ([]byte, error) {
 	var data []byte
 	err := s.b.Do(func() error {
@@ -167,6 +177,16 @@ func (s *objectStorage) PresignGetMD(ctx context.Context, objectKey string, expi
 	err := s.b.Do(func() error {
 		var err error
 		url, err = s.inner.PresignGetMD(ctx, objectKey, expiry)
+		return err
+	})
+	return url, err
+}
+
+func (s *objectStorage) PresignGetLegacyTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
+	var url string
+	err := s.b.Do(func() error {
+		var err error
+		url, err = s.inner.PresignGetLegacyTXT(ctx, objectKey, expiry)
 		return err
 	})
 	return url, err

@@ -124,7 +124,7 @@ func TestDocument_BSONOpcionalesVacios(t *testing.T) {
 	}
 
 	// object_key, md_ref y failure_reason están vacíos → no deben aparecer.
-	for _, campo := range []string{"object_key", "md_ref", "failure_reason"} {
+	for _, campo := range []string{"object_key", "md_ref", "txt_ref", "failure_reason"} {
 		if _, ok := m[campo]; ok {
 			t.Errorf("campo %q no debería aparecer en BSON cuando está vacío (omitempty)", campo)
 		}
@@ -145,4 +145,50 @@ func keys(m bson.M) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestDocument_BSONLegacyTxtRef verifica que un documento legacy conserva
+// txt_ref en el roundtrip BSON (compatibilidad de lectura D5).
+func TestDocument_BSONLegacyTxtRef(t *testing.T) {
+	original := &Document{
+		ID:            "01LEGACYTXTREF000000000000",
+		Status:        StatusCompleted,
+		ObjectKey:     "raw-pdfs/01LEGACYTXTREF000000000000.pdf",
+		TxtRef:        "extracted-txt/01LEGACYTXTREF000000000000.txt",
+		CorrelationID: "corr-legacy-1",
+		SchemaVersion: 1,
+		ExpiresAt:     time.Now().UTC().Add(time.Hour).Truncate(time.Millisecond),
+		CreatedAt:     time.Now().UTC().Truncate(time.Millisecond),
+		UpdatedAt:     time.Now().UTC().Truncate(time.Millisecond),
+		History: []StatusEntry{
+			{Status: StatusCompleted, Actor: ActorWorker, CorrelationID: "corr-legacy-1", At: time.Now().UTC().Truncate(time.Millisecond)},
+		},
+	}
+
+	data, err := bson.Marshal(original)
+	if err != nil {
+		t.Fatalf("bson.Marshal falló: %v", err)
+	}
+	var m bson.M
+	if err := bson.Unmarshal(data, &m); err != nil {
+		t.Fatalf("bson.Unmarshal a mapa falló: %v", err)
+	}
+	if got, ok := m["txt_ref"].(string); !ok || got != original.TxtRef {
+		t.Errorf("txt_ref = %v, want %q", m["txt_ref"], original.TxtRef)
+	}
+	// md_ref vacío no debe aparecer en un documento legacy.
+	if _, ok := m["md_ref"]; ok {
+		t.Error("md_ref no debería aparecer cuando está vacío (omitempty)")
+	}
+
+	var roundtrip Document
+	if err := bson.Unmarshal(data, &roundtrip); err != nil {
+		t.Fatalf("bson.Unmarshal a Document falló: %v", err)
+	}
+	if roundtrip.TxtRef != original.TxtRef {
+		t.Errorf("TxtRef roundtrip = %q, want %q", roundtrip.TxtRef, original.TxtRef)
+	}
+	if ref, legacy := roundtrip.ExtractedRef(); ref != original.TxtRef || !legacy {
+		t.Errorf("ExtractedRef() = (%q, %v), want (%q, true)", ref, legacy, original.TxtRef)
+	}
 }

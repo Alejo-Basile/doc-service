@@ -62,20 +62,21 @@ func newTestStorage(t *testing.T, publicEndpoint string) *ObjectStorage {
 		publicEndpoint = ""
 	}
 	s, err := New(Config{
-		Endpoint:       endpoint,
-		PublicEndpoint: publicEndpoint,
-		AccessKey:      accessKey,
-		SecretKey:      secretKey,
-		UseSSL:         false,
-		BucketRaw:      "raw-pdfs",
-		BucketMD:       "extracted-md",
+		Endpoint:        endpoint,
+		PublicEndpoint:  publicEndpoint,
+		AccessKey:       accessKey,
+		SecretKey:       secretKey,
+		UseSSL:          false,
+		BucketRaw:       "raw-pdfs",
+		BucketMD:        "extracted-md",
+		BucketLegacyTXT: "extracted-txt",
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
 	ctx := context.Background()
-	for _, b := range []string{"raw-pdfs", "extracted-md"} {
+	for _, b := range []string{"raw-pdfs", "extracted-md", "extracted-txt"} {
 		exists, err := s.BucketExists(ctx, b)
 		if err != nil {
 			t.Fatalf("BucketExists(%s): %v", b, err)
@@ -357,13 +358,14 @@ func credentialRegion(t *testing.T, raw string) string {
 func newOfflineStorage(t *testing.T, region string) *ObjectStorage {
 	t.Helper()
 	s, err := New(Config{
-		Endpoint:       "127.0.0.1:1",
-		PublicEndpoint: "http://127.0.0.1:1",
-		AccessKey:      "minioadmin",
-		SecretKey:      "minioadmin123",
-		BucketRaw:      "raw-pdfs",
-		BucketMD:       "extracted-md",
-		Region:         region,
+		Endpoint:        "127.0.0.1:1",
+		PublicEndpoint:  "http://127.0.0.1:1",
+		AccessKey:       "minioadmin",
+		SecretKey:       "minioadmin123",
+		BucketRaw:       "raw-pdfs",
+		BucketMD:        "extracted-md",
+		BucketLegacyTXT: "extracted-txt",
+		Region:          region,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -393,6 +395,16 @@ func TestPresign_SinRed_RegionPorDefecto(t *testing.T) {
 		t.Errorf("path = %q", u2)
 	}
 	if got := credentialRegion(t, u2); got != "us-east-1" {
+		t.Errorf("region = %q, want us-east-1", got)
+	}
+	u3, err := s.PresignGetLegacyTXT(ctx, "abc.txt", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("PresignGetLegacyTXT: %v", err)
+	}
+	if !strings.Contains(u3, "/extracted-txt/abc.txt") {
+		t.Errorf("path = %q, want /extracted-txt/abc.txt", u3)
+	}
+	if got := credentialRegion(t, u3); got != "us-east-1" {
 		t.Errorf("region = %q, want us-east-1", got)
 	}
 	res, err := s.PresignPost(ctx, "raw-pdfs/doc.pdf", ports.PresignPostOptions{Expiration: 15 * time.Minute})
@@ -478,5 +490,23 @@ func TestDeleteMD_EliminaDelBucketMD(t *testing.T) {
 	// El bucket raw no debe verse afectado por DeleteMD.
 	if _, err := s.Stat(ctx, key); err != nil {
 		t.Errorf("DeleteMD borró el objeto homónimo del bucket raw: %v", err)
+	}
+}
+
+// TestPresignGetLegacyTXT_UsaBucketLegacy verifica que la URL legacy apunta al
+// bucket de textos y respeta el host público (fallback D5). Requiere MinIO vivo.
+func TestPresignGetLegacyTXT_UsaBucketLegacy(t *testing.T) {
+	_, _, _, publicEP := testMinIOConfig(t)
+	s := newTestStorage(t, publicEP)
+
+	u, err := s.PresignGetLegacyTXT(context.Background(), "abc.txt", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("PresignGetLegacyTXT: %v", err)
+	}
+	if !strings.Contains(u, "/extracted-txt/abc.txt") {
+		t.Errorf("PresignGetLegacyTXT URL = %q, want path /extracted-txt/abc.txt", u)
+	}
+	if !strings.HasPrefix(u, publicEP+"/") {
+		t.Errorf("PresignGetLegacyTXT URL = %q, want prefijo host público %q", u, publicEP)
 	}
 }
