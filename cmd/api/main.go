@@ -19,6 +19,7 @@ import (
 	"github.com/Alejo-Basile/doc-service/internal/adapters/relay"
 	"github.com/Alejo-Basile/doc-service/internal/api"
 	"github.com/Alejo-Basile/doc-service/internal/config"
+	"github.com/Alejo-Basile/doc-service/internal/configkv"
 	"github.com/Alejo-Basile/doc-service/internal/metrics"
 	"github.com/Alejo-Basile/doc-service/internal/pdfsvc"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
@@ -56,6 +57,8 @@ func main() {
 		)
 		os.Exit(1)
 	}
+
+	cfgkv := configkv.NewManager(cfg)
 
 	slog.Info("iniciando doc-service",
 		"service", "doc-service",
@@ -188,6 +191,18 @@ func main() {
 	// --- Goroutines de fondo: Change Stream relay + reconciliador + metrics collector ---
 	// Se detienen con cancelBackground() después de drenar el HTTP.
 	backgroundCtx, cancelBackground := context.WithCancel(context.Background())
+	cfgkv.Start(backgroundCtx)
+	configSource := "defaults"
+	if cfgkv.Applied() {
+		configSource = "kv"
+	} else if !cfgkv.Disabled {
+		// KV unavailable at startup: the cached last-known-good set, when
+		// present, is what the manager actually applied.
+		if cached, err := cfgkv.CacheLoad(); err == nil && len(cached) > 0 {
+			configSource = "cache"
+		}
+	}
+	slog.Info("config_source", "source", configSource, "kv_disabled", cfgkv.Disabled)
 	relayCfg := relay.DefaultConfig()
 	slog.Info("relay configurado",
 		"max_retries", relayCfg.MaxRetries,
