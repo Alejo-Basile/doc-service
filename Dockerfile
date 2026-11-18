@@ -21,6 +21,7 @@ FROM alpine:3.24
 RUN apk upgrade --no-cache \
  && apk add --no-cache ca-certificates wget \
  && adduser -D -u 10001 appuser
+RUN mkdir -p /var/lib/doc-service && chown 10001:10001 /var/lib/doc-service
 COPY --from=build /out/api /usr/local/bin/api
 USER 10001
 EXPOSE 8080
