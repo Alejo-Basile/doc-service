@@ -99,58 +99,124 @@ func (m *Manager) EffectiveValues() map[string]any {
 	return out
 }
 
-func (m *Manager) ApplyValues(incoming map[string]string) []Rejection {
-	// convert to map[string]any
-	values := map[string]any{}
-	for k, v := range incoming {
-		var val any
-		if err := json.Unmarshal([]byte(v), &val); err != nil {
-			// keep as string? schema expects typed; try raw
-			values[k] = v
+func configToMap(c *config.Config) map[string]any {
+	return map[string]any{
+		"max_pdf_bytes":                 c.MaxPDFBytes,
+		"presign_upload_ttl_seconds":    int64(c.PresignUploadTTL / time.Second),
+		"presign_download_ttl_seconds":  int64(c.PresignDownloadTTL / time.Second),
+		"reconcile_interval_minutes":    int64(c.ReconcileInterval / time.Minute),
+		"reconcile_stuck_after_minutes": int64(c.ReconcileStuckAfter / time.Minute),
+		"doc_upload_grace_minutes":      int64(c.DocUploadGrace / time.Minute),
+		"min_safety_age_minutes":        int64(c.MinSafetyAge / time.Minute),
+		"reconcile_dry_run":             c.DryRun,
+	}
+}
+
+func parseOverlay(raw map[string]string) map[string]any {
+	out := make(map[string]any, len(raw))
+	for k, v := range raw {
+		var parsed any
+		if err := json.Unmarshal([]byte(v), &parsed); err != nil {
+			out[k] = v
 			continue
 		}
-		values[k] = val
+		out[k] = parsed
 	}
-	m.mu.Lock()
-	current := map[string]any{}
-	for k, v := range m.Effective {
-		var val any
-		if err := json.Unmarshal([]byte(v), &val); err != nil {
-			current[k] = v
-		} else {
-			current[k] = val
+	return out
+}
+
+func equalOverlay(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
 		}
 	}
-	m.mu.Unlock()
+	return true
+}
 
-	accepted, rejections := Apply(current, values)
-	// convert accepted map[string]any back to effective strings
-	accStr := map[string]string{}
-	for k, v := range accepted {
-		b, _ := json.Marshal(v)
-		accStr[k] = string(b)
+func mergeOverlay(base *config.Config, overlay map[string]string) map[string]any {
+	cur := configToMap(base)
+	for k, v := range parseOverlay(overlay) {
+		cur[k] = v
 	}
-	// rebuild effective: keep previous for rejected keys, apply accepted
+	return cur
+}
+
+type applyOpts struct {
+	saveCache   bool
+	markSuccess bool
+}
+
+func (m *Manager) apply(incoming map[string]any, opts applyOpts) []Rejection {
 	m.mu.Lock()
-	if m.Effective == nil {
-		m.Effective = map[string]string{}
+	prev := make(map[string]string, len(m.Effective))
+	for k, v := range m.Effective {
+		prev[k] = v
 	}
-	for k, v := range accStr {
-		m.Effective[k] = v
+	accepted, rejections := Apply(mergeOverlay(m.Base, prev), incoming)
+	rejected := make(map[string]bool, len(rejections))
+	for _, r := range rejections {
+		rejected[r.Key] = true
 	}
-	m.mu.Unlock()
-
+	next := make(map[string]string, len(prev)+len(incoming))
+	for k, v := range prev {
+		next[k] = v
+	}
+	for k := range incoming {
+		if rejected[k] {
+			continue
+		}
+		if v, ok := accepted[k]; ok {
+			if b, err := json.Marshal(v); err == nil {
+				next[k] = string(b)
+			}
+		}
+	}
+	candidate := *m.Base
+	applyToConfig(&candidate, next)
+	if err := candidate.ValidateTunables(); err != nil {
+		for k := range incoming {
+			if !rejected[k] {
+				rejected[k] = true
+				rejections = append(rejections, Rejection{Key: k, Reason: "coherence"})
+			}
+		}
+		for _, r := range rejections {
+			slog.Warn("configkv rejection", "key", r.Key, "reason", r.Reason)
+			metrics.ConfigKVRejected.WithLabelValues(r.Key).Inc()
+		}
+		m.mu.Unlock()
+		slog.Warn("configkv apply rolled back", "err", err.Error())
+		return rejections
+	}
 	for _, r := range rejections {
 		slog.Warn("configkv rejection", "key", r.Key, "reason", r.Reason)
 		metrics.ConfigKVRejected.WithLabelValues(r.Key).Inc()
 	}
-
-	// apply to config
-	cfg := *m.Base
-	applyToConfig(&cfg, m.snapshotEffective())
-	m.Ptr.Store(&cfg)
+	m.Effective = next
+	m.Ptr.Store(&candidate)
+	if opts.markSuccess {
+		m.LastSuccess = time.Now()
+		m.applied.Store(true)
+		metrics.ConfigKVLastSuccess.Set(float64(m.LastSuccess.Unix()))
+		metrics.ConfigKVStale.Set(0)
+	}
+	m.mu.Unlock()
 	m.notify()
+	// Only rewrite the cache when the overlay actually changed: the watcher
+	// re-applies the same payload every poll and a needless rewrite races with
+	// callers that remove the cache directory (tests) or read it concurrently.
+	if opts.saveCache && !equalOverlay(prev, next) {
+		_ = SaveAtomic(m.CachePath, next)
+	}
 	return rejections
+}
+
+func (m *Manager) ApplyValues(incoming map[string]string) []Rejection {
+	return m.apply(parseOverlay(incoming), applyOpts{})
 }
 
 func (m *Manager) CacheSave(eff map[string]string) error { return SaveAtomic(m.CachePath, eff) }
@@ -158,29 +224,8 @@ func (m *Manager) CacheSave(eff map[string]string) error { return SaveAtomic(m.C
 func (m *Manager) CacheLoad() (map[string]string, error) { return LoadCache(m.CachePath) }
 
 func (m *Manager) Validate(key, value string, current map[string]string) []Rejection {
-	incoming := map[string]string{key: value}
-	// delegate through ApplyValues-like but without mutating? spec says exported testable.
-	// We'll compute rejections without mutating by using Apply directly.
-	vals := map[string]any{}
-	for k, v := range incoming {
-		var val any
-		if err := json.Unmarshal([]byte(v), &val); err != nil {
-			vals[k] = v
-		} else {
-			vals[k] = val
-		}
-	}
-	cur := map[string]any{}
-	for k, v := range current {
-		var val any
-		if err := json.Unmarshal([]byte(v), &val); err != nil {
-			cur[k] = v
-		} else {
-			cur[k] = val
-		}
-	}
-	_, rejections := Apply(cur, vals)
-	return rejections
+	_, rej := Apply(mergeOverlay(m.Base, current), parseOverlay(map[string]string{key: value}))
+	return rej
 }
 
 func (m *Manager) Start(ctx context.Context) {
@@ -191,117 +236,21 @@ func (m *Manager) Start(ctx context.Context) {
 	}
 	// load cache
 	if v, err := LoadCache(m.CachePath); err == nil && v != nil {
-		values := map[string]any{}
-		for k, val := range v {
-			var parsed any
-			if err := json.Unmarshal([]byte(val), &parsed); err != nil {
-				continue
-			}
-			values[k] = parsed
-		}
-		accepted, _ := Apply(nil, values)
-		accStr := map[string]string{}
-		for k, val := range accepted {
-			b, _ := json.Marshal(val)
-			accStr[k] = string(b)
-		}
-		m.mu.Lock()
-		if m.Effective == nil {
-			m.Effective = map[string]string{}
-		}
-		for k, v := range accStr {
-			m.Effective[k] = v
-		}
-		m.mu.Unlock()
-		cfg := *m.Base
-		applyToConfig(&cfg, m.snapshotEffective())
-		m.Ptr.Store(&cfg)
-		m.notify()
+		m.apply(parseOverlay(v), applyOpts{})
 	}
 
 	kvCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	raw, _, err := m.Client.LoadInitial(kvCtx)
 	if err == nil {
-		values := map[string]any{}
-		for k, val := range raw {
-			var parsed any
-			if err := json.Unmarshal([]byte(val), &parsed); err != nil {
-				continue
-			}
-			values[k] = parsed
-		}
-		accepted, rejs := Apply(nil, values)
-		for _, r := range rejs {
-			slog.Warn("configkv rejection", "key", r.Key, "reason", r.Reason)
-			metrics.ConfigKVRejected.WithLabelValues(r.Key).Inc()
-		}
-		m.mu.Lock()
-		if m.Effective == nil {
-			m.Effective = map[string]string{}
-		}
-		for k, val := range accepted {
-			b, _ := json.Marshal(val)
-			m.Effective[k] = string(b)
-		}
-		m.mu.Unlock()
-		cfg := *m.Base
-		applyToConfig(&cfg, m.snapshotEffective())
-		m.Ptr.Store(&cfg)
-		m.notify()
-		m.LastSuccess = time.Now()
-		m.applied.Store(true)
-		metrics.ConfigKVLastSuccess.Set(float64(m.LastSuccess.Unix()))
-		metrics.ConfigKVStale.Set(0)
-		_ = SaveAtomic(m.CachePath, m.snapshotEffective())
+		m.apply(parseOverlay(raw), applyOpts{saveCache: true, markSuccess: true})
 	} else {
 		metrics.ConfigKVStale.Set(1)
 		slog.Warn("configkv load failed", "err", err.Error())
 	}
 
-	go m.Client.Watch(ctx, func(mm map[string]string, i uint64) {
-		values := map[string]any{}
-		for k, val := range mm {
-			var parsed any
-			if err := json.Unmarshal([]byte(val), &parsed); err != nil {
-				continue
-			}
-			values[k] = parsed
-		}
-		m.mu.Lock()
-		current := map[string]any{}
-		for k, v := range m.Effective {
-			var val any
-			if err := json.Unmarshal([]byte(v), &val); err != nil {
-				current[k] = v
-			} else {
-				current[k] = val
-			}
-		}
-		m.mu.Unlock()
-		accepted, rejs := Apply(current, values)
-		for _, r := range rejs {
-			slog.Warn("configkv rejection", "key", r.Key, "reason", r.Reason)
-			metrics.ConfigKVRejected.WithLabelValues(r.Key).Inc()
-		}
-		m.mu.Lock()
-		if m.Effective == nil {
-			m.Effective = map[string]string{}
-		}
-		for k, val := range accepted {
-			b, _ := json.Marshal(val)
-			m.Effective[k] = string(b)
-		}
-		m.mu.Unlock()
-		cfg := *m.Base
-		applyToConfig(&cfg, m.snapshotEffective())
-		m.Ptr.Store(&cfg)
-		m.notify()
-		m.LastSuccess = time.Now()
-		m.applied.Store(true)
-		metrics.ConfigKVLastSuccess.Set(float64(m.LastSuccess.Unix()))
-		metrics.ConfigKVStale.Set(0)
-		_ = SaveAtomic(m.CachePath, m.snapshotEffective())
+	go m.Client.Watch(ctx, func(mm map[string]string, _ uint64) {
+		m.apply(parseOverlay(mm), applyOpts{saveCache: true, markSuccess: true})
 	})
 }
 
