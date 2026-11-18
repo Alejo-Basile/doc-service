@@ -281,5 +281,3 @@ func TestWatchResyncsOnLowerIndex(t *testing.T) {
 		t.Fatalf("third query %s", got[2])
 	}
 }
-
-
