@@ -116,3 +116,11 @@ var (
 		Help:      "1 when last valid read is older than 15 min.",
 	})
 )
+
+// ReconcileDryRun cuenta los sweeps del reconciliador en modo dry-run que
+// planificaron al menos una acción (SPEC §6.5, S11-P1-C16).
+var ReconcileDryRun = promauto.NewCounter(prometheus.CounterOpts{
+	Namespace: "docservice",
+	Name:      "reconcile_dry_run_total",
+	Help:      "Total de sweeps del reconciliador en modo dry-run con acciones planificadas.",
+})

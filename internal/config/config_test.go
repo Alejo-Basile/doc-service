@@ -443,3 +443,25 @@ func TestValidate_PresignDownloadTTLFueraDeRango_Falla(t *testing.T) {
 		t.Errorf("el error debe mencionar PRESIGN_DOWNLOAD_TTL_SECONDS, got: %v", err)
 	}
 }
+
+func TestValidate_StuckAfterRango(t *testing.T) {
+	base := func(sa time.Duration) *Config {
+		return &Config{
+			HTTPPort: 8080, MongoURI: "m", MinIOEndpoint: "e", MinIOPublicEndpoint: "p",
+			MinIOAccessKey: "a", MinIOSecretKey: "s", MinIOWebhookSecret: "w",
+			RedisPassword: "rp", InternalToken: "t", MaxPDFBytes: 1, PresignUploadTTL: 60 * time.Second,
+			PresignDownloadTTL: 60 * time.Second, ReconcileInterval: 10 * time.Minute,
+			ReconcileStuckAfter: sa, DocUploadGrace: 30 * time.Minute, MinSafetyAge: 15 * time.Minute,
+			RedisAddr: "r:6379",
+		}
+	}
+	if err := base(4 * time.Minute).Validate(); err == nil || !strings.Contains(err.Error(), "RECONCILE_STUCK_AFTER_MIN") {
+		t.Fatalf("expected error for 4m, got %v", err)
+	}
+	if err := base(721 * time.Minute).Validate(); err == nil || !strings.Contains(err.Error(), "RECONCILE_STUCK_AFTER_MIN") {
+		t.Fatalf("expected error for 721m, got %v", err)
+	}
+	if err := base(30 * time.Minute).Validate(); err != nil {
+		t.Fatalf("expected no error for 30m, got %v", err)
+	}
+}
