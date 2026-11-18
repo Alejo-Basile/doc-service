@@ -263,12 +263,14 @@ func main() {
 		}
 	}()
 
-	// Registro en Consul (S11-P1-C14): no bloqueante y con reintento. Si Consul
-	// no responde, el servicio arranca igual y sigue sirviendo; el fallo se
-	// loguea, suma docservice_consul_registration_failed_total y se reintenta
-	// con backoff hasta que el agente vuelva.
+	// Registro en Consul (S11-P1-C14): no bloqueante, con reintento y
+	// re-afirmación periódica para sobrevivir reinicios del agente. Si
+	// Consul no responde, el servicio arranca igual y sigue sirviendo; el
+	// fallo se loguea, suma docservice_consul_registration_failed_total y
+	// se reintenta con backoff hasta que el agente vuelva.
 	registrar := consulreg.NewFromEnv(cfg.HTTPPort)
-	go registrar.RegisterWithRetry(backgroundCtx)
+	regCtx, stopReg := context.WithCancel(backgroundCtx)
+	go registrar.KeepRegistered(regCtx)
 
 	// Esperar señal de apagado o error del servidor.
 	select {
@@ -289,6 +291,7 @@ func main() {
 	// Desregistro en Consul (presupuesto propio de 2 s, antes de drenar HTTP).
 	// No alarga los 15 s de shutdownTimeout ni cambia el exit code: si falla,
 	// el DeregisterCriticalServiceAfter del check limpia el catálogo.
+	stopReg()
 	deregCtx, cancelDereg := context.WithTimeout(context.Background(), consulDeregistrationTimeout)
 	if err := registrar.Deregister(deregCtx); err != nil {
 		slog.Warn("desregistro de Consul fallido, el catálogo se limpia por el check",
