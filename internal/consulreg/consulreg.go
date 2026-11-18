@@ -55,6 +55,8 @@ const (
 	retryInitialDelay = 5 * time.Second
 	retryMaxDelay     = 60 * time.Second
 	registerAttempt   = 5 * time.Second
+
+	reassertInterval = 30 * time.Second
 )
 
 // Config reúne los parámetros de registro. AddressProbe es inyectable para
@@ -69,6 +71,9 @@ type Config struct {
 	// cero usan los defaults (5 s y 60 s). Los tests los reducen.
 	RetryInitial time.Duration
 	RetryMax     time.Duration
+	// ReassertEvery es el intervalo entre re-registros periódicos. En cero
+	// usa reassertInterval (30 s).
+	ReassertEvery time.Duration
 }
 
 // Registrar publica esta réplica en el catálogo de Consul.
@@ -99,6 +104,9 @@ func New(cfg Config, client *configkv.Client) *Registrar {
 	if cfg.RetryMax <= 0 {
 		cfg.RetryMax = retryMaxDelay
 	}
+	if cfg.ReassertEvery <= 0 {
+		cfg.ReassertEvery = reassertInterval
+	}
 	return &Registrar{cfg: cfg, client: client, id: serviceID()}
 }
 
@@ -117,11 +125,25 @@ func NewFromEnv(httpPort int) *Registrar {
 	// default /run/secrets/consul_doc_service_token): una sola credencial por
 	// servicio, nunca inline.
 	client := configkv.NewClient(agentAddr, "", "", 0)
+
+	reassertEvery := time.Duration(0)
+	if raw := os.Getenv("CONSUL_REASSERT_SECS"); raw != "" {
+		// parse positive integer
+		var secs int
+		if _, err := fmt.Sscanf(raw, "%d", &secs); err != nil || secs <= 0 {
+			slog.Warn("valor inválido de CONSUL_REASSERT_SECS, usando default",
+				"value", raw, "default", reassertInterval.String())
+		} else {
+			reassertEvery = time.Duration(secs) * time.Second
+		}
+	}
+
 	return New(Config{
-		ServiceName: serviceName,
-		AgentAddr:   agentAddr,
-		HTTPPort:    httpPort,
-		Disabled:    os.Getenv("CONSUL_REGISTRATION_DISABLED") == "true",
+		ServiceName:   serviceName,
+		AgentAddr:     agentAddr,
+		HTTPPort:      httpPort,
+		Disabled:      os.Getenv("CONSUL_REGISTRATION_DISABLED") == "true",
+		ReassertEvery: reassertEvery,
 	}, client)
 }
 
@@ -214,6 +236,12 @@ func (r *Registrar) Register(ctx context.Context) error {
 // apps, o un agente que se reinicia, terminan con las réplicas registradas sin
 // intervención manual: el reintento no bloquea el arranque ni el servicio.
 func (r *Registrar) RegisterWithRetry(ctx context.Context) {
+	r.registerWithRetry(ctx, false)
+}
+
+// registerWithRetry es el bucle de reintento. Con quiet=true el éxito se
+// registra a nivel debug: la re-afirmación periódica no debe inundar los logs.
+func (r *Registrar) registerWithRetry(ctx context.Context, quiet bool) {
 	if !r.Enabled() {
 		return
 	}
@@ -223,8 +251,13 @@ func (r *Registrar) RegisterWithRetry(ctx context.Context) {
 		err := r.Register(attemptCtx)
 		cancel()
 		if err == nil {
-			slog.Info("registrado en Consul",
-				"id", r.ID(), "address", r.Address(), "port", r.cfg.HTTPPort)
+			if quiet {
+				slog.Debug("re-registrado en Consul",
+					"id", r.ID(), "address", r.Address(), "port", r.cfg.HTTPPort)
+			} else {
+				slog.Info("registrado en Consul",
+					"id", r.ID(), "address", r.Address(), "port", r.cfg.HTTPPort)
+			}
 			return
 		}
 		slog.Warn("registro en Consul fallido, el servicio sigue operando y se reintentará",
@@ -239,6 +272,28 @@ func (r *Registrar) RegisterWithRetry(ctx context.Context) {
 			if backoff > r.cfg.RetryMax {
 				backoff = r.cfg.RetryMax
 			}
+		}
+	}
+}
+
+// KeepRegistered re-afirma el registro periódicamente para que, si el agente
+// de Consul se reinicia y pierde los servicios registrados por API, la réplica
+// vuelva a aparecer sin reinicio manual.
+func (r *Registrar) KeepRegistered(ctx context.Context) {
+	if !r.Enabled() {
+		return
+	}
+	first := true
+	for {
+		r.registerWithRetry(ctx, !first)
+		first = false
+		if ctx.Err() != nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(r.cfg.ReassertEvery):
 		}
 	}
 }

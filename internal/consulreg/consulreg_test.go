@@ -1,17 +1,22 @@
 package consulreg
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Alejo-Basile/doc-service/internal/configkv"
+	"github.com/Alejo-Basile/doc-service/internal/metrics"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // newTestRegistrar devuelve un Registrar apuntando a un servidor de prueba.
@@ -255,5 +260,130 @@ func TestRegisterWithRetryStopsOnCancel(t *testing.T) {
 
 	if calls < 2 {
 		t.Fatalf("se esperaba más de un intento antes de cancelar, hubo %d", calls)
+	}
+}
+
+// TestKeepRegisteredReassertsPeriodically ensures the loop re-registers.
+func TestKeepRegisteredReassertsPeriodically(t *testing.T) {
+	var mu sync.Mutex
+	var bodies [][]byte
+	calls := 0
+	ch := make(chan struct{}, 16)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		calls++
+		bodies = append(bodies, b)
+		mu.Unlock()
+		ch <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	r := newTestRegistrar(t, srv, func(c *Config) {
+		c.ReassertEvery = 20 * time.Millisecond
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.KeepRegistered(ctx)
+
+	deadline := time.After(2 * time.Second)
+	got := 0
+	for got < 3 {
+		select {
+		case <-ch:
+			got++
+		case <-deadline:
+			t.Fatalf("solo se vieron %d requests", got)
+		}
+	}
+	cancel()
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls < 3 {
+		t.Fatalf("calls = %d, se esperaban >= 3", calls)
+	}
+	for i := 1; i < len(bodies); i++ {
+		if !bytes.Equal(bodies[0], bodies[i]) {
+			t.Fatalf("body %d difiere del primero", i)
+		}
+	}
+}
+
+// TestKeepRegisteredRecoversAfterReassertFailure
+func TestKeepRegisteredRecoversAfterReassertFailure(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	ch := make(chan struct{}, 16)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		c := calls
+		mu.Unlock()
+		_ = c
+		ch <- struct{}{}
+		if c == 2 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	before := testutil.ToFloat64(metrics.ConsulRegistrationFailed)
+	r := newTestRegistrar(t, srv, func(c *Config) {
+		c.ReassertEvery = 20 * time.Millisecond
+		c.RetryInitial = time.Millisecond
+		c.RetryMax = 2 * time.Millisecond
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.KeepRegistered(ctx)
+
+	got := 0
+	deadline := time.After(2 * time.Second)
+	for got < 3 {
+		select {
+		case <-ch:
+			got++
+		case <-deadline:
+			t.Fatalf("solo se vieron %d requests", got)
+		}
+	}
+	cancel()
+	time.Sleep(50 * time.Millisecond)
+
+	after := testutil.ToFloat64(metrics.ConsulRegistrationFailed)
+	if after <= before {
+		t.Fatalf("counter no aumentó: antes=%v después=%v", before, after)
+	}
+}
+
+// TestKeepRegisteredStopsOnCancel
+func TestKeepRegisteredStopsOnCancel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	r := newTestRegistrar(t, srv, func(c *Config) {
+		c.ReassertEvery = 20 * time.Millisecond
+		c.RetryInitial = time.Millisecond
+		c.RetryMax = 2 * time.Millisecond
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		r.KeepRegistered(ctx)
+		close(done)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("KeepRegistered no retornó")
 	}
 }
