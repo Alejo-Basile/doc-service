@@ -51,11 +51,12 @@ type Config struct {
 	InternalToken string
 
 	// Reglas de negocio
-	MaxPDFBytes        int64
-	PresignUploadTTL   time.Duration
-	PresignDownloadTTL time.Duration
-	ReconcileInterval  time.Duration
-	DocUploadGrace     time.Duration
+	MaxPDFBytes         int64
+	PresignUploadTTL    time.Duration
+	PresignDownloadTTL  time.Duration
+	ReconcileInterval   time.Duration
+	ReconcileStuckAfter time.Duration
+	DocUploadGrace      time.Duration
 	// MinSafetyAge es la edad mínima antes de que el reconciliador toque un documento (S6-P2-02).
 	// Documentos más jóvenes que esto nunca son alterados bajo ninguna condición.
 	MinSafetyAge time.Duration
@@ -73,17 +74,18 @@ const (
 )
 
 const (
-	defaultHTTPPort          = 8080
-	defaultMongoDatabase     = "documents"
-	defaultMinIOBucketRaw    = "raw-pdfs"
-	defaultMinIOBucketMD     = "extracted-md"
-	defaultMinIOLegacyBucket = "extracted-txt"
-	defaultMinIORegion       = "us-east-1"
-	defaultRedisStreamKey    = "stream:pdf-processing"
-	defaultMaxPDFBytes       = 26214400 // 25 MB (SPEC §5.1)
-	defaultReconcileMin      = 10
-	defaultDocUploadGraceMin = 30 // >= 2x reconcil interval (SPEC §4)
-	defaultMinSafetyAgeMin   = 15 // >= 1x reconcil interval (S6-P2-02)
+	defaultHTTPPort               = 8080
+	defaultMongoDatabase          = "documents"
+	defaultMinIOBucketRaw         = "raw-pdfs"
+	defaultMinIOBucketMD          = "extracted-md"
+	defaultMinIOLegacyBucket      = "extracted-txt"
+	defaultMinIORegion            = "us-east-1"
+	defaultRedisStreamKey         = "stream:pdf-processing"
+	defaultMaxPDFBytes            = 26214400 // 25 MB (SPEC §5.1)
+	defaultReconcileMin           = 10
+	defaultReconcileStuckAfterMin = 30
+	defaultDocUploadGraceMin      = 30 // >= 2x reconcil interval (SPEC §4)
+	defaultMinSafetyAgeMin        = 15 // >= 1x reconcil interval (S6-P2-02)
 )
 
 // Load lee las variables de entorno, aplica defaults y valida.
@@ -113,6 +115,7 @@ func Load() (*Config, error) {
 		PresignUploadTTL:     time.Duration(envInt("PRESIGN_UPLOAD_TTL_SECONDS", int(DefaultPresignUploadTTL/time.Second))) * time.Second,
 		PresignDownloadTTL:   time.Duration(envInt("PRESIGN_DOWNLOAD_TTL_SECONDS", int(DefaultPresignDownloadTTL/time.Second))) * time.Second,
 		ReconcileInterval:    time.Duration(envInt("RECONCILE_INTERVAL_MIN", defaultReconcileMin)) * time.Minute,
+		ReconcileStuckAfter:  time.Duration(envInt("RECONCILE_STUCK_AFTER_MIN", defaultReconcileStuckAfterMin)) * time.Minute,
 		DocUploadGrace:       time.Duration(envInt("DOC_UPLOAD_GRACE_MIN", defaultDocUploadGraceMin)) * time.Minute,
 		MinSafetyAge:         time.Duration(envInt("MIN_SAFETY_AGE_MIN", defaultMinSafetyAgeMin)) * time.Minute,
 		DryRun:               envBool("RECONCILE_DRY_RUN", false),
@@ -191,6 +194,13 @@ func (c *Config) Validate() error {
 			"configuración inválida: DOC_UPLOAD_GRACE_MIN (%s) debe ser >= 2x RECONCILE_INTERVAL_MIN (%s)",
 			c.DocUploadGrace, minGrace,
 		)
+	}
+	if c.ReconcileStuckAfter <= 0 {
+		c.ReconcileStuckAfter = defaultReconcileStuckAfterMin * time.Minute
+	}
+	// SPEC §3.1 / S11-P1-C16: rango del umbral de documento trabado.
+	if c.ReconcileStuckAfter < 5*time.Minute || c.ReconcileStuckAfter > 720*time.Minute {
+		return fmt.Errorf("configuración inválida: RECONCILE_STUCK_AFTER_MIN (%s) fuera de rango [5-720m]", c.ReconcileStuckAfter)
 	}
 	// S6-P2-02: la edad mínima de seguridad debe ser >= 1x el intervalo,
 	// para que el reconciliador nunca toque documentos en tránsito legítimo.

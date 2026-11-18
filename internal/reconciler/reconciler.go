@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/Alejo-Basile/doc-service/internal/domain"
+	"github.com/Alejo-Basile/doc-service/internal/metrics"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
 	httpserver "github.com/Alejo-Basile/doc-service/internal/transport/http"
 	"github.com/gin-gonic/gin"
@@ -43,7 +44,20 @@ type Reconciler struct {
 	minSafetyAge  time.Duration // edad mínima: documentos más jóvenes nunca se tocan (S6-P2-02)
 	internalToken string        // token compartido para proteger el endpoint manual (SPEC §9)
 	dryRun        bool          // modo planificado: detecta y loguea, no muta nada (SPEC §6.5)
+
+	configSource  ConfigSource
+	configChanges <-chan struct{}
 }
+
+// LiveConfig es la configuración del reconciliador leída al inicio de cada sweep.
+type LiveConfig struct {
+	Interval   time.Duration
+	StuckAfter time.Duration
+	DryRun     bool
+}
+
+// ConfigSource devuelve la configuración viva del reconciliador.
+type ConfigSource func() LiveConfig
 
 // Option configura un Reconciler en construcción (functional options).
 type Option func(*Reconciler)
@@ -58,6 +72,14 @@ func WithInternalToken(token string) Option {
 // planifican y loguean, pero ninguna se ejecuta (SPEC §6.5).
 func WithDryRun(enabled bool) Option {
 	return func(r *Reconciler) { r.dryRun = enabled }
+}
+
+func WithConfigSource(src ConfigSource) Option {
+	return func(r *Reconciler) { r.configSource = src }
+}
+
+func WithConfigChanges(ch <-chan struct{}) Option {
+	return func(r *Reconciler) { r.configChanges = ch }
 }
 
 // New crea un Reconciler con dependencias inyectadas.
@@ -79,6 +101,7 @@ func New(
 	if minSafetyAge <= 0 {
 		minSafetyAge = interval // default: al menos 1x intervalo
 	}
+	// minSafetyAge es boot-time: la coherencia del conjunto se valida por configkv/Validate().
 	r := &Reconciler{
 		repo:         repo,
 		storage:      storage,
@@ -95,13 +118,28 @@ func New(
 	return r
 }
 
+// resolve devuelve el snapshot vigente de la configuración del reconciliador.
+func (r *Reconciler) resolve() LiveConfig {
+	if r.configSource == nil {
+		return LiveConfig{Interval: r.interval, StuckAfter: r.stuckAfter, DryRun: r.dryRun}
+	}
+	snap := r.configSource()
+	if snap.Interval <= 0 {
+		snap.Interval = r.interval
+	}
+	if snap.StuckAfter <= 0 {
+		snap.StuckAfter = r.stuckAfter
+	}
+	return snap
+}
+
 // RegisterRoutes expone el endpoint manual de reconciliación (para testing/ops).
 // Protegido con el token interno: no debe quedar accesible sin autenticación.
 func (r *Reconciler) RegisterRoutes(engine *gin.Engine) {
 	internal := engine.Group("/internal")
 	internal.Use(httpserver.InternalTokenMiddleware(r.internalToken))
 	internal.POST("/reconcile", func(c *gin.Context) {
-		dryRun := r.dryRun
+		var dryRunOverride *bool
 		if raw, ok := c.GetQuery("dry_run"); ok {
 			v, err := strconv.ParseBool(raw)
 			if err != nil {
@@ -110,9 +148,9 @@ func (r *Reconciler) RegisterRoutes(engine *gin.Engine) {
 				})
 				return
 			}
-			dryRun = v // override puntual del modo configurado
+			dryRunOverride = &v
 		}
-		result, err := r.runOnce(c.Request.Context(), dryRun)
+		result, err := r.runOnce(c.Request.Context(), dryRunOverride)
 		if err != nil {
 			c.JSON(500, gin.H{"error": err.Error()})
 			return
@@ -175,15 +213,18 @@ type CrossCheckReport struct {
 // Start ejecuta el sweep en loop con el intervalo configurado.
 // Bloquea hasta que el contexto se cancele (graceful shutdown).
 func (r *Reconciler) Start(ctx context.Context) {
-	// Ojo: el handler JSON de slog serializa time.Duration como nanosegundos
-	// crudos, por eso se loguea explícitamente con String() (formato legible).
+	snap := r.resolve()
 	slog.Info("reconciler iniciado",
-		"interval", r.interval.String(),
-		"stuck_after", r.stuckAfter.String(),
-		"dry_run", r.dryRun,
+		"interval", snap.Interval.String(),
+		"stuck_after", snap.StuckAfter.String(),
+		"dry_run", snap.DryRun,
 	)
 
-	ticker := time.NewTicker(r.interval)
+	interval := snap.Interval
+	if interval <= 0 {
+		interval = r.interval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -191,6 +232,14 @@ func (r *Reconciler) Start(ctx context.Context) {
 		case <-ctx.Done():
 			slog.Info("reconciler detenido (context cancelado)")
 			return
+		case <-r.configChanges:
+			newSnap := r.resolve()
+			newInterval := newSnap.Interval
+			if newInterval > 0 && newInterval != interval {
+				ticker.Reset(newInterval)
+				interval = newInterval
+				slog.Info("reconciler: intervalo actualizado", "interval", interval.String())
+			}
 		case <-ticker.C:
 			result, err := r.RunOnce(ctx)
 			if err != nil {
@@ -216,13 +265,18 @@ func (r *Reconciler) Start(ctx context.Context) {
 // RunOnce ejecuta un sweep completo y devuelve el resultado.
 // Si hay lease configurado y no se puede adquirir, retorna resultado vacío sin error.
 func (r *Reconciler) RunOnce(ctx context.Context) (*Result, error) {
-	return r.runOnce(ctx, r.dryRun)
+	return r.runOnce(ctx, nil)
 }
 
 // runOnce implementa el sweep con el modo (dry-run o ejecución) resuelto por el
 // llamador: el loop periódico usa el configurado y el endpoint manual permite
 // override por invocación (SPEC §6.5).
-func (r *Reconciler) runOnce(ctx context.Context, dryRun bool) (*Result, error) {
+func (r *Reconciler) runOnce(ctx context.Context, dryRunOverride *bool) (*Result, error) {
+	snap := r.resolve()
+	dryRun := snap.DryRun
+	if dryRunOverride != nil {
+		dryRun = *dryRunOverride
+	}
 	result := &Result{DryRun: dryRun}
 	actions := &actionReport{}
 	now := r.clock.Now()
@@ -254,14 +308,14 @@ func (r *Reconciler) runOnce(ctx context.Context, dryRun bool) (*Result, error) 
 	result.RecoveredUploaded = expiredPending.recovered
 
 	// 2. Documentos UPLOADED estancados → transición + reencolar (S4-P2-01/07).
-	reenqueued, err := r.sweepStuckUploaded(ctx, now, dryRun, actions)
+	reenqueued, err := r.sweepStuckUploaded(ctx, now, dryRun, actions, snap.StuckAfter)
 	if err != nil {
 		return nil, fmt.Errorf("sweep stuck uploaded: %w", err)
 	}
 	result.Reenqueued = reenqueued
 
 	// 2b. Documentos QUEUED estancados → reencolar sin cambiar estado (cierra ventana de crash).
-	reenqueued2, err := r.sweepStuckQueued(ctx, now, dryRun, actions)
+	reenqueued2, err := r.sweepStuckQueued(ctx, now, dryRun, actions, snap.StuckAfter)
 	if err != nil {
 		return nil, fmt.Errorf("sweep stuck queued: %w", err)
 	}
@@ -269,7 +323,7 @@ func (r *Reconciler) runOnce(ctx context.Context, dryRun bool) (*Result, error) 
 
 	// 3. Documentos en estado intermedio con updated_at antiguo: reencolar si el
 	// objeto existe o completar la vía de fallo hasta FAILED (SPEC §6.5, T3).
-	stuck, stuckReenqueued, err := r.sweepStuckIntermediate(ctx, now, dryRun, actions)
+	stuck, stuckReenqueued, err := r.sweepStuckIntermediate(ctx, now, dryRun, actions, snap.StuckAfter)
 	if err != nil {
 		return nil, fmt.Errorf("sweep stuck: %w", err)
 	}
@@ -300,6 +354,7 @@ func (r *Reconciler) runOnce(ctx context.Context, dryRun bool) (*Result, error) 
 	result.PlannedActions = actions.planned
 	result.ExecutedActions = actions.executed
 	if dryRun && actions.planned > 0 {
+		metrics.ReconcileDryRun.Inc()
 		slog.Info("reconciler: dry-run completado (ninguna mutación ejecutada)",
 			"planned_actions", actions.planned,
 		)
@@ -475,13 +530,13 @@ func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time, dry
 
 // sweepStuckUploaded busca documentos UPLOADED estancados cuyo objeto exista
 // y los reencola a Redis Streams (S4-P2-01/07).
-func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time, dryRun bool, actions *actionReport) (int, error) {
+func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time, dryRun bool, actions *actionReport, stuckAfter time.Duration) (int, error) {
 	if r.queue == nil {
 		return 0, nil // sin queue configurado
 	}
 
 	reenqueued := 0
-	cutoff := now.Add(-r.stuckAfter)
+	cutoff := now.Add(-stuckAfter)
 
 	docs, _, err := r.repo.List(ctx, ports.ListFilter{
 		Status: domain.StatusUploaded,
@@ -568,12 +623,12 @@ func (r *Reconciler) sweepStuckUploaded(ctx context.Context, now time.Time, dryR
 
 // sweepStuckQueued reencola documentos QUEUED cuyo mensaje pudo haberse perdido
 // (crash entre transición y XADD, o ACK espurio). No cambia el estado.
-func (r *Reconciler) sweepStuckQueued(ctx context.Context, now time.Time, dryRun bool, actions *actionReport) (int, error) {
+func (r *Reconciler) sweepStuckQueued(ctx context.Context, now time.Time, dryRun bool, actions *actionReport, stuckAfter time.Duration) (int, error) {
 	if r.queue == nil {
 		return 0, nil
 	}
 	reenqueued := 0
-	cutoff := now.Add(-r.stuckAfter)
+	cutoff := now.Add(-stuckAfter)
 
 	docs, _, err := r.repo.List(ctx, ports.ListFilter{
 		Status: domain.StatusQueued,
@@ -813,10 +868,10 @@ func (r *Reconciler) objectExists(ctx context.Context, objectKey string) (bool, 
 //
 // Devuelve cuántos documentos trabados detectó y cuántos se reencolaron
 // (planificados en dry-run).
-func (r *Reconciler) sweepStuckIntermediate(ctx context.Context, now time.Time, dryRun bool, actions *actionReport) (int, int, error) {
+func (r *Reconciler) sweepStuckIntermediate(ctx context.Context, now time.Time, dryRun bool, actions *actionReport, stuckAfter time.Duration) (int, int, error) {
 	stuckCount := 0
 	reenqueued := 0
-	cutoff := now.Add(-r.stuckAfter)
+	cutoff := now.Add(-stuckAfter)
 
 	intermediateStatuses := []domain.Status{
 		domain.StatusQueued,
@@ -843,7 +898,7 @@ func (r *Reconciler) sweepStuckIntermediate(ctx context.Context, now time.Time, 
 				"document_id", doc.ID,
 				"status", doc.Status,
 				"updated_at", doc.UpdatedAt,
-				"stuck_since", r.stuckAfter,
+				"stuck_since", stuckAfter,
 			)
 
 			switch doc.Status {

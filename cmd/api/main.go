@@ -175,9 +175,14 @@ func main() {
 	webhookHandler := webhook.NewHandler(repo, storage, cfg.MinIOWebhookSecret, cfg.MinIOBucketRaw, objectKeyPrefix)
 	rel := reconciler.New(
 		repo, storage, queue, lease, ports.SystemClock{},
-		cfg.ReconcileInterval, 30*time.Minute, cfg.MinSafetyAge,
+		cfg.ReconcileInterval, cfg.ReconcileStuckAfter, cfg.MinSafetyAge,
 		reconciler.WithInternalToken(cfg.InternalToken),
 		reconciler.WithDryRun(cfg.DryRun),
+		reconciler.WithConfigSource(func() reconciler.LiveConfig {
+			c := cfgkv.CurrentConfig()
+			return reconciler.LiveConfig{Interval: c.ReconcileInterval, StuckAfter: c.ReconcileStuckAfter, DryRun: c.DryRun}
+		}),
+		reconciler.WithConfigChanges(cfgkv.Notify()),
 	)
 
 	// --- Servidor HTTP ---

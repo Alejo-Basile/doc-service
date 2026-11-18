@@ -24,6 +24,8 @@ type Manager struct {
 	Effective   map[string]string
 	LastSuccess time.Time
 	applied     atomic.Bool
+
+	notifyCh chan struct{}
 }
 
 func NewManager(base *config.Config) *Manager {
@@ -38,6 +40,7 @@ func NewManager(base *config.Config) *Manager {
 		Ptr:       &atomic.Pointer[config.Config]{},
 		Base:      base,
 		Effective: map[string]string{},
+		notifyCh:  make(chan struct{}, 1),
 	}
 	m.Ptr.Store(base)
 	return m
@@ -59,6 +62,15 @@ func (m *Manager) CurrentConfig() *config.Config { return m.Ptr.Load() }
 // Applied reports whether at least one KV apply succeeded, so callers can
 // report the effective configuration source truthfully.
 func (m *Manager) Applied() bool { return m.applied.Load() }
+
+func (m *Manager) Notify() <-chan struct{} { return m.notifyCh }
+
+func (m *Manager) notify() {
+	select {
+	case m.notifyCh <- struct{}{}:
+	default:
+	}
+}
 
 // snapshotEffective returns a copy of the effective raw value set. Callers must
 // not read m.Effective directly: the watcher writes it from another goroutine.
@@ -137,6 +149,7 @@ func (m *Manager) ApplyValues(incoming map[string]string) []Rejection {
 	cfg := *m.Base
 	applyToConfig(&cfg, m.snapshotEffective())
 	m.Ptr.Store(&cfg)
+	m.notify()
 	return rejections
 }
 
@@ -203,6 +216,7 @@ func (m *Manager) Start(ctx context.Context) {
 		cfg := *m.Base
 		applyToConfig(&cfg, m.snapshotEffective())
 		m.Ptr.Store(&cfg)
+		m.notify()
 	}
 
 	kvCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -234,6 +248,7 @@ func (m *Manager) Start(ctx context.Context) {
 		cfg := *m.Base
 		applyToConfig(&cfg, m.snapshotEffective())
 		m.Ptr.Store(&cfg)
+		m.notify()
 		m.LastSuccess = time.Now()
 		m.applied.Store(true)
 		metrics.ConfigKVLastSuccess.Set(float64(m.LastSuccess.Unix()))
@@ -281,6 +296,7 @@ func (m *Manager) Start(ctx context.Context) {
 		cfg := *m.Base
 		applyToConfig(&cfg, m.snapshotEffective())
 		m.Ptr.Store(&cfg)
+		m.notify()
 		m.LastSuccess = time.Now()
 		m.applied.Store(true)
 		metrics.ConfigKVLastSuccess.Set(float64(m.LastSuccess.Unix()))
@@ -331,6 +347,13 @@ func applyToConfig(cfg *config.Config, eff map[string]string) {
 		json.Unmarshal([]byte(v), &n)
 		if n > 0 {
 			cfg.ReconcileInterval = time.Duration(n) * time.Minute
+		}
+	}
+	if v, ok := eff["reconcile_stuck_after_minutes"]; ok {
+		var n int
+		json.Unmarshal([]byte(v), &n)
+		if n > 0 {
+			cfg.ReconcileStuckAfter = time.Duration(n) * time.Minute
 		}
 	}
 	if v, ok := eff["doc_upload_grace_minutes"]; ok {

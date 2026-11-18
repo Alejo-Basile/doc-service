@@ -11,9 +11,11 @@ import (
 	"time"
 
 	"github.com/Alejo-Basile/doc-service/internal/domain"
+	"github.com/Alejo-Basile/doc-service/internal/metrics"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
 	"github.com/gin-gonic/gin"
 	minio "github.com/minio/minio-go/v7"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // mockClock implementa ports.Clock para tests.
@@ -2124,5 +2126,106 @@ func TestRunOnce_CompletedMdRefFaltanteSigueDetectando(t *testing.T) {
 	}
 	if result.CompletedNoMd != 1 {
 		t.Errorf("CompletedNoMd = %d, want 1 (md_ref presente pero objeto ausente)", result.CompletedNoMd)
+	}
+}
+
+func TestRunOnce_ConfigSource_DryRunVivo(t *testing.T) {
+	repo := newMockRepo()
+	storage := newMockStorage()
+	now := time.Now().UTC()
+	repo.docs["d1"] = &domain.Document{ID: "d1", Status: domain.StatusPendingUpload, CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now.Add(-2 * time.Hour), ExpiresAt: now.Add(-1 * time.Hour), ObjectKey: "k"}
+	src := func() LiveConfig {
+		return LiveConfig{Interval: 10 * time.Minute, StuckAfter: 30 * time.Minute, DryRun: true}
+	}
+	r := New(repo, storage, nil, nil, &mockClock{t: now}, 10*time.Minute, 30*time.Minute, 10*time.Minute, WithDryRun(false), WithConfigSource(src))
+	res, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.updateCalls) != 0 {
+		t.Fatalf("expected no update calls, got %d", len(repo.updateCalls))
+	}
+	if !res.DryRun || res.ExecutedActions != 0 || res.PlannedActions <= 0 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	// flip
+	src2 := func() LiveConfig {
+		return LiveConfig{Interval: 10 * time.Minute, StuckAfter: 30 * time.Minute, DryRun: false}
+	}
+	r2 := New(repo, storage, nil, nil, &mockClock{t: now}, 10*time.Minute, 30*time.Minute, 10*time.Minute, WithDryRun(false), WithConfigSource(src2))
+	_, err = r2.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.updateCalls) == 0 {
+		t.Fatal("expected mutations after flip")
+	}
+}
+
+func TestRunOnce_ConfigSource_StuckAfterVivo(t *testing.T) {
+	repo := newMockRepo()
+	storage := newMockStorage()
+	q := &mockQueue{}
+	now := time.Now().UTC()
+	doc := &domain.Document{ID: "d2", Status: domain.StatusQueued, CreatedAt: now.Add(-20 * time.Minute), UpdatedAt: now.Add(-10 * time.Minute), ObjectKey: "k"}
+	repo.docs[doc.ID] = doc
+	src := func() LiveConfig {
+		return LiveConfig{Interval: 10 * time.Minute, StuckAfter: 1 * time.Minute, DryRun: false}
+	}
+	r := New(repo, storage, q, nil, &mockClock{t: now}, 10*time.Minute, 2*time.Hour, 10*time.Minute, WithConfigSource(src))
+	res, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Reenqueued < 1 || len(q.enqueued) < 1 {
+		t.Fatalf("expected reenqueue, got %+v", res)
+	}
+}
+
+func TestStart_RearmaTickerAlCambiarIntervalo(t *testing.T) {
+	repo := newMockRepo()
+	lease := &mockLease{}
+	ch := make(chan struct{}, 1)
+	var iv time.Duration = 200 * time.Millisecond
+	src := func() LiveConfig { return LiveConfig{Interval: iv, StuckAfter: 30 * time.Minute, DryRun: false} }
+	r := New(repo, nil, nil, lease, &mockClock{t: time.Now()}, 200*time.Millisecond, 30*time.Minute, 10*time.Minute, WithConfigSource(src), WithConfigChanges(ch))
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	go func() {
+		time.Sleep(60 * time.Millisecond)
+		iv = 20 * time.Millisecond
+		ch <- struct{}{}
+	}()
+	r.Start(ctx)
+	if lease.acquires < 5 {
+		t.Fatalf("expected >=5 acquires, got %d", lease.acquires)
+	}
+}
+
+func TestRunOnce_DryRunMetric_UnaVezPorSweep(t *testing.T) {
+	repo := newMockRepo()
+	storage := newMockStorage()
+	now := time.Now().UTC()
+	repo.docs["d3"] = &domain.Document{ID: "d3", Status: domain.StatusPendingUpload, CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now.Add(-2 * time.Hour), ExpiresAt: now.Add(-1 * time.Hour), ObjectKey: "k"}
+	src := func() LiveConfig {
+		return LiveConfig{Interval: 10 * time.Minute, StuckAfter: 30 * time.Minute, DryRun: true}
+	}
+	r := New(repo, storage, nil, nil, &mockClock{t: now}, 10*time.Minute, 30*time.Minute, 10*time.Minute, WithConfigSource(src))
+	before := testutil.ToFloat64(metrics.ReconcileDryRun)
+	_, _ = r.RunOnce(context.Background())
+	after := testutil.ToFloat64(metrics.ReconcileDryRun)
+	if after != before+1 {
+		t.Fatalf("metric did not increment: %v -> %v", before, after)
+	}
+	// non-dry-run
+	src2 := func() LiveConfig {
+		return LiveConfig{Interval: 10 * time.Minute, StuckAfter: 30 * time.Minute, DryRun: false}
+	}
+	r2 := New(repo, storage, nil, nil, &mockClock{t: now}, 10*time.Minute, 30*time.Minute, 10*time.Minute, WithConfigSource(src2))
+	before2 := testutil.ToFloat64(metrics.ReconcileDryRun)
+	_, _ = r2.RunOnce(context.Background())
+	after2 := testutil.ToFloat64(metrics.ReconcileDryRun)
+	if after2 != before2 {
+		t.Fatalf("metric moved on non-dry-run: %v -> %v", before2, after2)
 	}
 }
