@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Alejo-Basile/doc-service/internal/config"
 	"github.com/Alejo-Basile/doc-service/internal/domain"
 	"github.com/Alejo-Basile/doc-service/internal/pdfsvc"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
@@ -117,9 +119,14 @@ func (m *mockRepo) ListByCursor(ctx context.Context, filter ports.CursorFilter) 
 }
 
 // mockStorage implementa ports.ObjectStorage.
-type mockStorage struct{}
+type mockStorage struct {
+	lastPostOpts        ports.PresignPostOptions
+	lastGetExpiry       time.Duration
+	lastLegacyGetExpiry time.Duration
+}
 
 func (m *mockStorage) PresignPost(ctx context.Context, objectKey string, opts ports.PresignPostOptions) (*ports.PresignPostResult, error) {
+	m.lastPostOpts = opts
 	return &ports.PresignPostResult{
 		UploadURL: "https://s3.example.com/upload/" + objectKey,
 		Fields: map[string]string{
@@ -151,6 +158,7 @@ func (m *mockStorage) PresignGet(ctx context.Context, objectKey string, expiry t
 }
 
 func (m *mockStorage) PresignGetMD(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
+	m.lastGetExpiry = expiry
 	return "https://s3.example.com/extracted-md/" + objectKey, nil
 }
 
@@ -159,6 +167,7 @@ func (m *mockStorage) StatLegacyTXT(ctx context.Context, objectKey string) (port
 }
 
 func (m *mockStorage) PresignGetLegacyTXT(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
+	m.lastLegacyGetExpiry = expiry
 	return "https://s3.example.com/extracted-txt/" + objectKey, nil
 }
 
@@ -172,7 +181,12 @@ func (m *mockStorage) ListObjectsMD(ctx context.Context) ([]ports.ObjectInfo, er
 
 // --- helpers ---
 
-func setupTestServer(t *testing.T) (*gin.Engine, *mockRepo) {
+type fakeLiveConfig struct{ ptr atomic.Pointer[config.Config] }
+
+func (f *fakeLiveConfig) CurrentConfig() *config.Config { return f.ptr.Load() }
+func (f *fakeLiveConfig) set(cfg *config.Config)        { f.ptr.Store(cfg) }
+
+func setupTestServerWithConfig(t *testing.T) (*gin.Engine, *mockRepo, *mockStorage, *fakeLiveConfig) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 
@@ -180,7 +194,9 @@ func setupTestServer(t *testing.T) (*gin.Engine, *mockRepo) {
 	storage := &mockStorage{}
 	validator := pdfsvc.NewValidator(storage)
 
-	handler := NewDocumentHandler(repo, storage, validator, 25*1024*1024, 30*time.Minute, "raw-pdfs")
+	live := &fakeLiveConfig{}
+	live.set(&config.Config{MaxPDFBytes: 25 * 1024 * 1024, PresignUploadTTL: 15 * time.Minute, PresignDownloadTTL: 5 * time.Minute})
+	handler := NewDocumentHandler(repo, storage, validator, live, 30*time.Minute, "raw-pdfs")
 
 	engine := gin.New()
 	engine.Use(func(c *gin.Context) {
@@ -188,7 +204,12 @@ func setupTestServer(t *testing.T) (*gin.Engine, *mockRepo) {
 		c.Next()
 	})
 	handler.RegisterRoutes(engine)
+	return engine, repo, storage, live
+}
 
+func setupTestServer(t *testing.T) (*gin.Engine, *mockRepo) {
+	t.Helper()
+	engine, repo, _, _ := setupTestServerWithConfig(t)
 	return engine, repo
 }
 
@@ -699,5 +720,226 @@ func TestDownloadDocument_SinReferencias_Conflict(t *testing.T) {
 
 	if w.Code != http.StatusConflict {
 		t.Fatalf("status esperado 409, got %d; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// --- C15: configuración viva desde el snapshot de Consul KV ---
+
+func TestCreateDocument_UsaTTLDeSubidaVigente(t *testing.T) {
+	engine, _, storage, live := setupTestServerWithConfig(t)
+	live.set(&config.Config{
+		MaxPDFBytes:        25 * 1024 * 1024,
+		PresignUploadTTL:   120 * time.Second,
+		PresignDownloadTTL: 90 * time.Second,
+	})
+
+	before := time.Now().UTC()
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/documents", bytes.NewBufferString(`{"size_bytes": 1024}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status esperado 201, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	var resp CreateDocumentResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("JSON inválido: %v", err)
+	}
+	if resp.ExpiresIn != 120 {
+		t.Errorf("expires_in = %d, want 120", resp.ExpiresIn)
+	}
+	if storage.lastPostOpts.Expiration != 2*time.Minute {
+		t.Errorf("PresignPost.Expiration = %s, want 2m", storage.lastPostOpts.Expiration)
+	}
+
+	got, err := time.Parse(time.RFC3339, resp.ExpiresAt)
+	if err != nil {
+		t.Fatalf("expires_at inválido: %v", err)
+	}
+	want := before.Add(120 * time.Second).Add(30 * time.Minute)
+	if delta := got.Sub(want); delta < -5*time.Second || delta > 5*time.Second {
+		t.Errorf("expires_at = %s, want ~%s (delta %s)", got, want, delta)
+	}
+}
+
+func TestCreateDocument_RechazaSobreMaxVigente(t *testing.T) {
+	engine, _, _, live := setupTestServerWithConfig(t)
+	live.set(&config.Config{
+		MaxPDFBytes:        1048576,
+		PresignUploadTTL:   15 * time.Minute,
+		PresignDownloadTTL: 5 * time.Minute,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/documents", bytes.NewBufferString(`{"size_bytes": 1048577}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status esperado 400, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	var problem map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("JSON inválido: %v", err)
+	}
+	want := "size_bytes excede el máximo permitido: 1048576 bytes"
+	if problem["detail"] != want {
+		t.Errorf("detail = %v, want %q", problem["detail"], want)
+	}
+}
+
+func TestDownloadDocument_UsaTTLDescargaVigente(t *testing.T) {
+	engine, repo, storage, live := setupTestServerWithConfig(t)
+	live.set(&config.Config{
+		MaxPDFBytes:        25 * 1024 * 1024,
+		PresignUploadTTL:   15 * time.Minute,
+		PresignDownloadTTL: 90 * time.Second,
+	})
+
+	mdDoc := domain.NewDocument("corr-c15-md", time.Now().UTC().Add(30*time.Minute))
+	mdDoc.Status = domain.StatusCompleted
+	mdDoc.MdRef = "extracted-md/c15-md.md"
+	_ = repo.Insert(context.Background(), mdDoc)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/documents/"+mdDoc.ID+"/download", nil)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status esperado 200, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	if storage.lastGetExpiry != 90*time.Second {
+		t.Errorf("PresignGetMD expiry = %s, want 90s", storage.lastGetExpiry)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("JSON inválido: %v", err)
+	}
+	if resp["expires_in"] != float64(90) {
+		t.Errorf("expires_in = %v, want 90", resp["expires_in"])
+	}
+
+	legacyDoc := domain.NewDocument("corr-c15-txt", time.Now().UTC().Add(30*time.Minute))
+	legacyDoc.Status = domain.StatusCompleted
+	legacyDoc.TxtRef = "extracted-txt/c15-txt.txt"
+	_ = repo.Insert(context.Background(), legacyDoc)
+
+	reqLegacy := httptest.NewRequest(http.MethodGet, "/api/v2/documents/"+legacyDoc.ID+"/download", nil)
+	wLegacy := httptest.NewRecorder()
+	engine.ServeHTTP(wLegacy, reqLegacy)
+
+	if wLegacy.Code != http.StatusOK {
+		t.Fatalf("legacy: status esperado 200, got %d (body: %s)", wLegacy.Code, wLegacy.Body.String())
+	}
+	if storage.lastLegacyGetExpiry != 90*time.Second {
+		t.Errorf("PresignGetLegacyTXT expiry = %s, want 90s", storage.lastLegacyGetExpiry)
+	}
+}
+
+func TestURLYaEmitidaNoCambia(t *testing.T) {
+	engine, _, storage, live := setupTestServerWithConfig(t)
+	live.set(&config.Config{
+		MaxPDFBytes:        25 * 1024 * 1024,
+		PresignUploadTTL:   120 * time.Second,
+		PresignDownloadTTL: 5 * time.Minute,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/documents", bytes.NewBufferString(`{"size_bytes": 1024}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status esperado 201, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	var first CreateDocumentResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &first); err != nil {
+		t.Fatalf("JSON inválido: %v", err)
+	}
+	firstExpiration := storage.lastPostOpts.Expiration
+	firstFields := make(map[string]string, len(first.Fields))
+	for k, v := range first.Fields {
+		firstFields[k] = v
+	}
+
+	// Sube el TTL vigente: las URLs ya firmadas no se reescriben.
+	live.set(&config.Config{
+		MaxPDFBytes:        25 * 1024 * 1024,
+		PresignUploadTTL:   600 * time.Second,
+		PresignDownloadTTL: 5 * time.Minute,
+	})
+
+	if first.ExpiresIn != 120 {
+		t.Errorf("expires_in de la URL ya emitida = %d, want 120", first.ExpiresIn)
+	}
+	if firstExpiration != 2*time.Minute {
+		t.Errorf("Expiration de la URL ya emitida = %s, want 2m", firstExpiration)
+	}
+	for k, v := range firstFields {
+		if first.Fields[k] != v {
+			t.Errorf("campo %q de la URL ya emitida cambió: %q -> %q", k, v, first.Fields[k])
+		}
+	}
+
+	reqNew := httptest.NewRequest(http.MethodPost, "/api/v2/documents", bytes.NewBufferString(`{"size_bytes": 1024}`))
+	reqNew.Header.Set("Content-Type", "application/json")
+	wNew := httptest.NewRecorder()
+	engine.ServeHTTP(wNew, reqNew)
+
+	if wNew.Code != http.StatusCreated {
+		t.Fatalf("nueva URL: status esperado 201, got %d (body: %s)", wNew.Code, wNew.Body.String())
+	}
+	var next CreateDocumentResponse
+	if err := json.Unmarshal(wNew.Body.Bytes(), &next); err != nil {
+		t.Fatalf("JSON inválido: %v", err)
+	}
+	if next.ExpiresIn != 600 {
+		t.Errorf("expires_in de la URL nueva = %d, want 600", next.ExpiresIn)
+	}
+	if storage.lastPostOpts.Expiration != 10*time.Minute {
+		t.Errorf("Expiration de la URL nueva = %s, want 10m", storage.lastPostOpts.Expiration)
+	}
+}
+
+func TestCreateDocument_DefaultsPreservanContrato(t *testing.T) {
+	engine, _, storage, _ := setupTestServerWithConfig(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/documents", bytes.NewBufferString(`{"size_bytes": 1024}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status esperado 201, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	var resp CreateDocumentResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("JSON inválido: %v", err)
+	}
+	if resp.ExpiresIn != 900 {
+		t.Errorf("expires_in = %d, want 900", resp.ExpiresIn)
+	}
+	if storage.lastPostOpts.Expiration != 15*time.Minute {
+		t.Errorf("PresignPost.Expiration = %s, want 15m", storage.lastPostOpts.Expiration)
+	}
+
+	reqBig := httptest.NewRequest(http.MethodPost, "/api/v2/documents", bytes.NewBufferString(`{"size_bytes": 26214401}`))
+	reqBig.Header.Set("Content-Type", "application/json")
+	wBig := httptest.NewRecorder()
+	engine.ServeHTTP(wBig, reqBig)
+
+	if wBig.Code != http.StatusBadRequest {
+		t.Fatalf("status esperado 400, got %d (body: %s)", wBig.Code, wBig.Body.String())
+	}
+	var problem map[string]any
+	if err := json.Unmarshal(wBig.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("JSON inválido: %v", err)
+	}
+	want := "size_bytes excede el máximo permitido: 26214400 bytes"
+	if problem["detail"] != want {
+		t.Errorf("detail = %v, want %q", problem["detail"], want)
 	}
 }

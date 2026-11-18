@@ -312,6 +312,20 @@ func applyToConfig(cfg *config.Config, eff map[string]string) {
 			cfg.MaxPDFBytes = n
 		}
 	}
+	if v, ok := eff["presign_upload_ttl_seconds"]; ok {
+		var n int
+		json.Unmarshal([]byte(v), &n)
+		if n > 0 {
+			cfg.PresignUploadTTL = time.Duration(n) * time.Second
+		}
+	}
+	if v, ok := eff["presign_download_ttl_seconds"]; ok {
+		var n int
+		json.Unmarshal([]byte(v), &n)
+		if n > 0 {
+			cfg.PresignDownloadTTL = time.Duration(n) * time.Second
+		}
+	}
 	if v, ok := eff["reconcile_interval_minutes"]; ok {
 		var n int
 		json.Unmarshal([]byte(v), &n)

@@ -164,7 +164,7 @@ func main() {
 	// El prefijo de clave del contrato es "<bucket_raw>/" (SPEC §11.3:
 	// object_key = raw-pdfs/<id>.pdf), derivado de la config para no duplicarlo.
 	objectKeyPrefix := cfg.MinIOBucketRaw + "/"
-	docsHandler := api.NewDocumentHandler(repo, storage, validator, cfg.MaxPDFBytes, cfg.DocUploadGrace, cfg.MinIOBucketRaw)
+	docsHandler := api.NewDocumentHandler(repo, storage, validator, cfgkv, cfg.DocUploadGrace, cfg.MinIOBucketRaw)
 	internalHandler := api.NewInternalHandler(repo, storage, queue, cfg.InternalToken)
 	webhookHandler := webhook.NewHandler(repo, storage, cfg.MinIOWebhookSecret, cfg.MinIOBucketRaw, objectKeyPrefix)
 	rel := reconciler.New(

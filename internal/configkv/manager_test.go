@@ -34,6 +34,8 @@ func validBase(t *testing.T) *config.Config {
 		RedisPassword:       "redis-pass",
 		InternalToken:       "internal-token",
 		MaxPDFBytes:         26214400,
+		PresignUploadTTL:    15 * time.Minute,
+		PresignDownloadTTL:  5 * time.Minute,
 		ReconcileInterval:   10 * time.Minute,
 		DocUploadGrace:      30 * time.Minute,
 		MinSafetyAge:        15 * time.Minute,
@@ -244,5 +246,27 @@ func TestValidateDoesNotMutate(t *testing.T) {
 	}
 	if got := m.CurrentConfig().MaxPDFBytes; got != before {
 		t.Fatalf("Validate mutated config: %d -> %d", before, got)
+	}
+}
+
+func TestApplyValuesPresignTTLs(t *testing.T) {
+	srv, _ := kvServer(t, http.StatusOK, map[string]string{})
+	m := newManagerForTest(t, srv)
+	m.Start(context.Background())
+
+	rejections := m.ApplyValues(map[string]string{
+		"presign_upload_ttl_seconds":   "120",
+		"presign_download_ttl_seconds": "90",
+	})
+	if len(rejections) != 0 {
+		t.Fatalf("rejections = %+v, want none", rejections)
+	}
+
+	cfg := m.CurrentConfig()
+	if cfg.PresignUploadTTL != 120*time.Second {
+		t.Errorf("PresignUploadTTL = %s, want 2m", cfg.PresignUploadTTL)
+	}
+	if cfg.PresignDownloadTTL != 90*time.Second {
+		t.Errorf("PresignDownloadTTL = %s, want 90s", cfg.PresignDownloadTTL)
 	}
 }

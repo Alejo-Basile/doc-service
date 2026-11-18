@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Alejo-Basile/doc-service/internal/config"
 	"github.com/Alejo-Basile/doc-service/internal/domain"
 	"github.com/Alejo-Basile/doc-service/internal/metrics"
 	"github.com/Alejo-Basile/doc-service/internal/pdfsvc"
@@ -16,15 +17,17 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// uploadWindow es la vigencia de la URL prefirmada POST (S3-P2-04).
-const uploadWindow = 15 * time.Minute
+// LiveConfig expone el snapshot de configuración vigente (C11).
+type LiveConfig interface {
+	CurrentConfig() *config.Config
+}
 
 // DocumentHandler implementa los endpoints de la API v2.
 type DocumentHandler struct {
 	repo        ports.DocumentRepository
 	storage     ports.ObjectStorage
 	validator   *pdfsvc.Validator
-	maxPDFBytes int64
+	cfg         LiveConfig
 	uploadGrace time.Duration
 	bucketRaw   string // bucket de subida (configurable, default raw-pdfs)
 }
@@ -34,7 +37,7 @@ func NewDocumentHandler(
 	repo ports.DocumentRepository,
 	storage ports.ObjectStorage,
 	validator *pdfsvc.Validator,
-	maxPDFBytes int64,
+	cfg LiveConfig,
 	uploadGrace time.Duration,
 	bucketRaw string,
 ) *DocumentHandler {
@@ -42,10 +45,36 @@ func NewDocumentHandler(
 		repo:        repo,
 		storage:     storage,
 		validator:   validator,
-		maxPDFBytes: maxPDFBytes,
+		cfg:         cfg,
 		uploadGrace: uploadGrace,
 		bucketRaw:   bucketRaw,
 	}
+}
+
+// liveConfig devuelve el snapshot vigente, con fallbacks a defaults documentados.
+func (h *DocumentHandler) liveConfig() *config.Config {
+	var base *config.Config
+	if h.cfg != nil {
+		base = h.cfg.CurrentConfig()
+	}
+	if base == nil {
+		return &config.Config{
+			MaxPDFBytes:        26214400,
+			PresignUploadTTL:   config.DefaultPresignUploadTTL,
+			PresignDownloadTTL: config.DefaultPresignDownloadTTL,
+		}
+	}
+	cp := *base
+	if cp.MaxPDFBytes <= 0 {
+		cp.MaxPDFBytes = 26214400
+	}
+	if cp.PresignUploadTTL <= 0 {
+		cp.PresignUploadTTL = config.DefaultPresignUploadTTL
+	}
+	if cp.PresignDownloadTTL <= 0 {
+		cp.PresignDownloadTTL = config.DefaultPresignDownloadTTL
+	}
+	return &cp
 }
 
 // RegisterRoutes registra las rutas de la API v2.
@@ -89,11 +118,13 @@ func (h *DocumentHandler) CreateDocument(c *gin.Context) {
 		return
 	}
 
+	cfg := h.liveConfig()
+
 	// Validar tamaño declarado si se provee.
-	if req.SizeBytes > 0 && h.maxPDFBytes > 0 && req.SizeBytes > h.maxPDFBytes {
+	if req.SizeBytes > 0 && cfg.MaxPDFBytes > 0 && req.SizeBytes > cfg.MaxPDFBytes {
 		respondProblem(c, http.StatusBadRequest, "validation",
 			"Error de validación",
-			"size_bytes excede el máximo permitido: "+strconv.FormatInt(h.maxPDFBytes, 10)+" bytes")
+			"size_bytes excede el máximo permitido: "+strconv.FormatInt(cfg.MaxPDFBytes, 10)+" bytes")
 		return
 	}
 
@@ -125,7 +156,7 @@ func (h *DocumentHandler) CreateDocument(c *gin.Context) {
 	// Crear documento. La entrada inicial de la timeline (PENDING_UPLOAD) la
 	// registra siempre NewDocument con actor "client" (S5-P2-04), tanto con
 	// idempotency key como sin ella.
-	expiresAt := time.Now().UTC().Add(uploadWindow).Add(h.uploadGrace)
+	expiresAt := time.Now().UTC().Add(cfg.PresignUploadTTL).Add(h.uploadGrace)
 	doc := domain.NewDocument(corrID, expiresAt)
 	if docID != "" {
 		doc.ID = docID
@@ -152,9 +183,9 @@ func (h *DocumentHandler) CreateDocument(c *gin.Context) {
 	// Generar URL prefirmada POST.
 	presignOpts := ports.PresignPostOptions{
 		Bucket:       h.bucketRaw,
-		MaxSizeBytes: h.maxPDFBytes,
+		MaxSizeBytes: cfg.MaxPDFBytes,
 		ContentType:  "application/pdf",
-		Expiration:   uploadWindow,
+		Expiration:   cfg.PresignUploadTTL,
 	}
 
 	result, err := h.storage.PresignPost(c.Request.Context(), doc.ObjectKey, presignOpts)
@@ -247,12 +278,14 @@ func (h *DocumentHandler) DownloadDocument(c *gin.Context) {
 		return
 	}
 
-	// URL prefirmada de lectura con expiración corta (5 min).
+	cfg := h.liveConfig()
+
+	// URL prefirmada de lectura con expiración corta (configurable).
 	var downloadURL string
 	if legacy {
-		downloadURL, err = h.storage.PresignGetLegacyTXT(c.Request.Context(), ref, 5*time.Minute)
+		downloadURL, err = h.storage.PresignGetLegacyTXT(c.Request.Context(), ref, cfg.PresignDownloadTTL)
 	} else {
-		downloadURL, err = h.storage.PresignGetMD(c.Request.Context(), ref, 5*time.Minute)
+		downloadURL, err = h.storage.PresignGetMD(c.Request.Context(), ref, cfg.PresignDownloadTTL)
 	}
 	if err != nil {
 		slog.Error("download: presign GET", "error", err, "document_id", id, "ref", ref, "legacy", legacy)
@@ -269,7 +302,7 @@ func (h *DocumentHandler) DownloadDocument(c *gin.Context) {
 		"status":         string(doc.Status),
 		"download_url":   downloadURL,
 		"method":         "GET",
-		"expires_in":     int((5 * time.Minute).Seconds()),
+		"expires_in":     int(cfg.PresignDownloadTTL.Seconds()),
 		"correlation_id": doc.CorrelationID,
 	})
 }
@@ -348,8 +381,9 @@ func (h *DocumentHandler) respondExisting(c *gin.Context, doc *domain.Document) 
 		"document_id", doc.ID,
 		"status", doc.Status,
 	)
+	cfg := h.liveConfig()
 	if doc.Status == domain.StatusPendingUpload {
-		newExpiresAt := time.Now().UTC().Add(uploadWindow).Add(h.uploadGrace)
+		newExpiresAt := time.Now().UTC().Add(cfg.PresignUploadTTL).Add(h.uploadGrace)
 		updated, err := h.repo.UpdateStatus(c.Request.Context(), doc.ID, domain.StatusPendingUpload, domain.StatusPendingUpload, map[string]any{"expires_at": newExpiresAt})
 		if err != nil {
 			slog.Error("extend expires_at on re-presign", "error", err, "document_id", doc.ID)
@@ -364,9 +398,9 @@ func (h *DocumentHandler) respondExisting(c *gin.Context, doc *domain.Document) 
 	// Regenerar URL prefirmada para el documento existente.
 	presignOpts := ports.PresignPostOptions{
 		Bucket:       h.bucketRaw,
-		MaxSizeBytes: h.maxPDFBytes,
+		MaxSizeBytes: cfg.MaxPDFBytes,
 		ContentType:  "application/pdf",
-		Expiration:   uploadWindow,
+		Expiration:   cfg.PresignUploadTTL,
 	}
 
 	result, err := h.storage.PresignPost(c.Request.Context(), doc.ObjectKey, presignOpts)

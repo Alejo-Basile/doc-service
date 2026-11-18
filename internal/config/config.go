@@ -51,9 +51,11 @@ type Config struct {
 	InternalToken string
 
 	// Reglas de negocio
-	MaxPDFBytes       int64
-	ReconcileInterval time.Duration
-	DocUploadGrace    time.Duration
+	MaxPDFBytes        int64
+	PresignUploadTTL   time.Duration
+	PresignDownloadTTL time.Duration
+	ReconcileInterval  time.Duration
+	DocUploadGrace     time.Duration
 	// MinSafetyAge es la edad mínima antes de que el reconciliador toque un documento (S6-P2-02).
 	// Documentos más jóvenes que esto nunca son alterados bajo ninguna condición.
 	MinSafetyAge time.Duration
@@ -63,6 +65,13 @@ type Config struct {
 }
 
 // default values documentados en SPEC §11.5.
+// DefaultPresignUploadTTL / DefaultPresignDownloadTTL son la fuente de verdad
+// única para los TTLs por defecto (C15). El handler de API no redefine estos números.
+const (
+	DefaultPresignUploadTTL   = 15 * time.Minute
+	DefaultPresignDownloadTTL = 5 * time.Minute
+)
+
 const (
 	defaultHTTPPort          = 8080
 	defaultMongoDatabase     = "documents"
@@ -101,6 +110,8 @@ func Load() (*Config, error) {
 		RedisMasterName:      strings.TrimSpace(os.Getenv("REDIS_MASTER_NAME")),
 		InternalToken:        strings.TrimSpace(os.Getenv("INTERNAL_TOKEN")),
 		MaxPDFBytes:          envInt64("MAX_PDF_BYTES", defaultMaxPDFBytes),
+		PresignUploadTTL:     time.Duration(envInt("PRESIGN_UPLOAD_TTL_SECONDS", int(DefaultPresignUploadTTL/time.Second))) * time.Second,
+		PresignDownloadTTL:   time.Duration(envInt("PRESIGN_DOWNLOAD_TTL_SECONDS", int(DefaultPresignDownloadTTL/time.Second))) * time.Second,
 		ReconcileInterval:    time.Duration(envInt("RECONCILE_INTERVAL_MIN", defaultReconcileMin)) * time.Minute,
 		DocUploadGrace:       time.Duration(envInt("DOC_UPLOAD_GRACE_MIN", defaultDocUploadGraceMin)) * time.Minute,
 		MinSafetyAge:         time.Duration(envInt("MIN_SAFETY_AGE_MIN", defaultMinSafetyAgeMin)) * time.Minute,
@@ -164,6 +175,12 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxPDFBytes <= 0 {
 		return fmt.Errorf("configuración inválida: MAX_PDF_BYTES debe ser positivo, got %d", c.MaxPDFBytes)
+	}
+	if c.PresignUploadTTL < 60*time.Second || c.PresignUploadTTL > 3600*time.Second {
+		return fmt.Errorf("configuración inválida: PRESIGN_UPLOAD_TTL_SECONDS (%s) fuera de rango [60-3600s]", c.PresignUploadTTL)
+	}
+	if c.PresignDownloadTTL < 60*time.Second || c.PresignDownloadTTL > 900*time.Second {
+		return fmt.Errorf("configuración inválida: PRESIGN_DOWNLOAD_TTL_SECONDS (%s) fuera de rango [60-900s]", c.PresignDownloadTTL)
 	}
 	// SPEC §4: DocUploadGrace es la gracia posterior a la ventana de subida;
 	// expires_at = created_at + ventana + gracia. La gracia debe ser >= 2x
