@@ -20,6 +20,7 @@ import (
 	"github.com/Alejo-Basile/doc-service/internal/api"
 	"github.com/Alejo-Basile/doc-service/internal/config"
 	"github.com/Alejo-Basile/doc-service/internal/configkv"
+	"github.com/Alejo-Basile/doc-service/internal/consulreg"
 	"github.com/Alejo-Basile/doc-service/internal/metrics"
 	"github.com/Alejo-Basile/doc-service/internal/pdfsvc"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
@@ -36,6 +37,11 @@ const shutdownTimeout = 15 * time.Second
 // startupTimeout acota la fase de arranque (Mongo, migraciones, MinIO, Redis)
 // para que una infraestructura caída no cuelgue el proceso: fail-fast.
 const startupTimeout = 30 * time.Second
+
+// consulDeregistrationTimeout es el presupuesto del desregistro en Consul
+// (S11-P1-C14). Es independiente de shutdownTimeout: no puede alargar el
+// apagado ni condicionar el exit code.
+const consulDeregistrationTimeout = 2 * time.Second
 
 // workSchemaVersion es la versión del contrato del mensaje en la cola
 // (SPEC §11.3: payload JSON liviano con schema_version).
@@ -252,6 +258,13 @@ func main() {
 		}
 	}()
 
+	// Registro en Consul (S11-P1-C14): no bloqueante y con reintento. Si Consul
+	// no responde, el servicio arranca igual y sigue sirviendo; el fallo se
+	// loguea, suma docservice_consul_registration_failed_total y se reintenta
+	// con backoff hasta que el agente vuelva.
+	registrar := consulreg.NewFromEnv(cfg.HTTPPort)
+	go registrar.RegisterWithRetry(backgroundCtx)
+
 	// Esperar señal de apagado o error del servidor.
 	select {
 	case sig := <-quit:
@@ -267,6 +280,18 @@ func main() {
 	// 1) http.Server.Shutdown drena las requests en vuelo hasta agotar el timeout.
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
+
+	// Desregistro en Consul (presupuesto propio de 2 s, antes de drenar HTTP).
+	// No alarga los 15 s de shutdownTimeout ni cambia el exit code: si falla,
+	// el DeregisterCriticalServiceAfter del check limpia el catálogo.
+	deregCtx, cancelDereg := context.WithTimeout(context.Background(), consulDeregistrationTimeout)
+	if err := registrar.Deregister(deregCtx); err != nil {
+		slog.Warn("desregistro de Consul fallido, el catálogo se limpia por el check",
+			"id", registrar.ID(),
+			"error", err.Error(),
+		)
+	}
+	cancelDereg()
 
 	exitCode := 0
 	if err := httpSrv.Shutdown(ctx); err != nil {

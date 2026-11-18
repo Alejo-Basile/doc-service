@@ -27,6 +27,16 @@ var (
 		Help:      "Total de eventos de webhook de MinIO procesados.",
 	})
 
+	// ConsulRegistrationFailed totaliza los fallos de registro/desregistro en
+	// Consul (S11-P1-C14). Un valor creciente señala que las réplicas no se
+	// están anunciando en el catálogo (registro inicial o desregistro fallido).
+	ConsulRegistrationFailed = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "docservice",
+		Subsystem: "consul",
+		Name:      "registration_failed_total",
+		Help:      "Total de fallos de registro o desregistro de doc-service en Consul.",
+	})
+
 	// RelayEnqueueErrors totaliza los fallos de encolado del relay tras agotar
 	// los reintentos (S4-P2-05). Un valor creciente señala documentos UPLOADED
 	// que quedaron sin encolar y que el reconciliador deberá recuperar: es la
