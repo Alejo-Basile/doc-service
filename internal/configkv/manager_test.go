@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"os"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -22,21 +22,21 @@ import (
 func validBase(t *testing.T) *config.Config {
 	t.Helper()
 	return &config.Config{
-		HTTPPort:          8080,
-		MongoURI:          "mongodb://user:pass@localhost:27017/documents?replicaSet=rs0",
-		MongoDatabase:     "documents",
-		MinIOEndpoint:     "minio:9000",
+		HTTPPort:            8080,
+		MongoURI:            "mongodb://user:pass@localhost:27017/documents?replicaSet=rs0",
+		MongoDatabase:       "documents",
+		MinIOEndpoint:       "minio:9000",
 		MinIOPublicEndpoint: "https://s3.localhost",
-		MinIOAccessKey:    "access",
-		MinIOSecretKey:    "secret",
-		MinIOWebhookSecret: "webhook-secret",
-		RedisAddr:         "redis:6379",
-		RedisPassword:     "redis-pass",
-		InternalToken:     "internal-token",
-		MaxPDFBytes:       26214400,
-		ReconcileInterval: 10 * time.Minute,
-		DocUploadGrace:    30 * time.Minute,
-		MinSafetyAge:      15 * time.Minute,
+		MinIOAccessKey:      "access",
+		MinIOSecretKey:      "secret",
+		MinIOWebhookSecret:  "webhook-secret",
+		RedisAddr:           "redis:6379",
+		RedisPassword:       "redis-pass",
+		InternalToken:       "internal-token",
+		MaxPDFBytes:         26214400,
+		ReconcileInterval:   10 * time.Minute,
+		DocUploadGrace:      30 * time.Minute,
+		MinSafetyAge:        15 * time.Minute,
 	}
 }
 
