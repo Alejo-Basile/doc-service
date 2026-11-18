@@ -270,3 +270,134 @@ func TestApplyValuesPresignTTLs(t *testing.T) {
 		t.Errorf("PresignDownloadTTL = %s, want 90s", cfg.PresignDownloadTTL)
 	}
 }
+
+// --- Coherencia KV validada contra la configuración de entorno ---
+
+func TestKVCoherenceUsesEnvBase(t *testing.T) {
+	srv, _ := kvServer(t, http.StatusOK, map[string]string{"reconcile_interval_minutes": "20"})
+	m := newManagerForTest(t, srv)
+	m.Base.DocUploadGrace = 60 * time.Minute
+	m.Base.MinSafetyAge = 20 * time.Minute
+
+	m.Start(context.Background())
+
+	if got := m.CurrentConfig().ReconcileInterval; got != 20*time.Minute {
+		t.Fatalf("ReconcileInterval = %s, want 20m: coherence must use env values, not schema defaults", got)
+	}
+}
+
+func TestKVGraceRejectedAgainstEnvInterval(t *testing.T) {
+	srv, _ := kvServer(t, http.StatusOK, map[string]string{"doc_upload_grace_minutes": "25"})
+	m := newManagerForTest(t, srv)
+	m.Base.ReconcileInterval = 20 * time.Minute
+	m.Base.DocUploadGrace = 50 * time.Minute
+	m.Base.MinSafetyAge = 20 * time.Minute
+
+	m.Start(context.Background())
+
+	if got := m.CurrentConfig().DocUploadGrace; got != 50*time.Minute {
+		t.Fatalf("DocUploadGrace = %s, want previous 50m when KV breaks 2x env interval", got)
+	}
+}
+
+func TestKVIntervalRejectedWhenBreaksEnvGrace(t *testing.T) {
+	srv, _ := kvServer(t, http.StatusOK, map[string]string{"reconcile_interval_minutes": "30"})
+	m := newManagerForTest(t, srv)
+	m.Base.ReconcileInterval = 20 * time.Minute
+	m.Base.DocUploadGrace = 50 * time.Minute
+	m.Base.MinSafetyAge = 20 * time.Minute
+
+	m.Start(context.Background())
+
+	if got := m.CurrentConfig().ReconcileInterval; got != 20*time.Minute {
+		t.Fatalf("ReconcileInterval = %s, want previous 20m when KV breaks env grace", got)
+	}
+}
+
+func TestKVCoherentBatchAcceptedAtomically(t *testing.T) {
+	srv, _ := kvServer(t, http.StatusOK, map[string]string{
+		"reconcile_interval_minutes": "25",
+		"doc_upload_grace_minutes":   "60",
+	})
+	m := newManagerForTest(t, srv)
+	m.Base.ReconcileInterval = 20 * time.Minute
+	m.Base.DocUploadGrace = 50 * time.Minute
+	m.Base.MinSafetyAge = 30 * time.Minute
+
+	m.Start(context.Background())
+
+	cfg := m.CurrentConfig()
+	if cfg.ReconcileInterval != 25*time.Minute || cfg.DocUploadGrace != 60*time.Minute {
+		t.Fatalf("interval/grace = %s/%s, want 25m/60m", cfg.ReconcileInterval, cfg.DocUploadGrace)
+	}
+}
+
+func TestCacheOverlayPreservedOnInitialKVLoad(t *testing.T) {
+	srv, _ := kvServer(t, http.StatusOK, map[string]string{"max_pdf_bytes": "1048576"})
+	m := newManagerForTest(t, srv)
+	if err := m.CacheSave(map[string]string{
+		"doc_upload_grace_minutes":   "40",
+		"reconcile_interval_minutes": "15",
+		"min_safety_age_minutes":     "20",
+	}); err != nil {
+		t.Fatalf("CacheSave: %v", err)
+	}
+
+	m.Start(context.Background())
+
+	cfg := m.CurrentConfig()
+	if cfg.DocUploadGrace != 40*time.Minute {
+		t.Fatalf("DocUploadGrace = %s, want 40m from cache overlay", cfg.DocUploadGrace)
+	}
+	if cfg.ReconcileInterval != 15*time.Minute {
+		t.Fatalf("ReconcileInterval = %s, want 15m from cache overlay", cfg.ReconcileInterval)
+	}
+}
+
+func TestRejectedApplyKeepsConfigAndCounts(t *testing.T) {
+	srv, _ := kvServer(t, http.StatusOK, map[string]string{"max_pdf_bytes": "1048576"})
+	m := newManagerForTest(t, srv)
+	m.Base.ReconcileInterval = 20 * time.Minute
+	m.Base.DocUploadGrace = 50 * time.Minute
+	m.Base.MinSafetyAge = 20 * time.Minute
+	m.Start(context.Background())
+
+	before := testutil.ToFloat64(metrics.ConfigKVRejected.WithLabelValues("doc_upload_grace_minutes"))
+	rejections := m.ApplyValues(map[string]string{"doc_upload_grace_minutes": "5"})
+	after := testutil.ToFloat64(metrics.ConfigKVRejected.WithLabelValues("doc_upload_grace_minutes"))
+
+	if len(rejections) != 1 || rejections[0].Key != "doc_upload_grace_minutes" || rejections[0].Reason != "coherence" {
+		t.Fatalf("rejections = %+v, want one {doc_upload_grace_minutes coherence}", rejections)
+	}
+	if after-before != 1 {
+		t.Fatalf("rejected counter delta = %v, want 1", after-before)
+	}
+	if got := m.CurrentConfig().DocUploadGrace; got != 50*time.Minute {
+		t.Fatalf("DocUploadGrace = %s, want previous 50m", got)
+	}
+}
+
+func TestOverlayNeverContainsEnvDerivedKeys(t *testing.T) {
+	srv, _ := kvServer(t, http.StatusOK, map[string]string{"max_pdf_bytes": "1048576"})
+	m := newManagerForTest(t, srv)
+	m.Start(context.Background())
+
+	eff := m.EffectiveValues()
+	if len(eff) != 1 {
+		t.Fatalf("EffectiveValues = %v, want only KV overlay keys", eff)
+	}
+	if _, ok := eff["max_pdf_bytes"]; !ok {
+		t.Fatalf("EffectiveValues = %v, want max_pdf_bytes", eff)
+	}
+
+	cached, err := LoadCache(m.CachePath)
+	if err != nil {
+		t.Fatalf("LoadCache: %v", err)
+	}
+	if len(cached) != 1 {
+		t.Fatalf("cache = %v, want only KV overlay keys", cached)
+	}
+	if _, ok := cached["max_pdf_bytes"]; !ok {
+		t.Fatalf("cache = %v, want max_pdf_bytes", cached)
+	}
+}

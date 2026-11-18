@@ -173,6 +173,11 @@ func (c *Config) Validate() error {
 	}
 
 	// Validaciones de coherencia entre valores.
+	return c.ValidateTunables()
+}
+
+// ValidateTunables contiene las validaciones de coherencia entre valores ajustables.
+func (c *Config) ValidateTunables() error {
 	if c.HTTPPort < 1 || c.HTTPPort > 65535 {
 		return fmt.Errorf("configuración inválida: HTTP_PORT=%d fuera de rango [1-65535]", c.HTTPPort)
 	}
