@@ -20,6 +20,7 @@ func setEnv(t *testing.T, vars map[string]string) {
 		"REDIS_SENTINEL_ADDRS", "REDIS_MASTER_NAME", "INTERNAL_TOKEN",
 		"MAX_PDF_BYTES", "RECONCILE_INTERVAL_MIN", "DOC_UPLOAD_GRACE_MIN",
 		"MIN_SAFETY_AGE_MIN", "RECONCILE_DRY_RUN",
+		"PRESIGN_UPLOAD_TTL_SECONDS", "PRESIGN_DOWNLOAD_TTL_SECONDS",
 	}
 	for _, k := range claves {
 		os.Unsetenv(k)
@@ -371,5 +372,74 @@ func TestLoad_MinIOLegacyBucketTXTPersonalizado(t *testing.T) {
 	}
 	if cfg.MinIOLegacyBucketTXT != "txt-viejo" {
 		t.Errorf("MinIOLegacyBucketTXT = %q, want 'txt-viejo'", cfg.MinIOLegacyBucketTXT)
+	}
+}
+
+// --- C15: TTLs de URL prefirmada (configuración viva) ---
+
+func TestLoad_PresignTTLDefaults(t *testing.T) {
+	setEnv(t, completeVars())
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() no debía fallar: %v", err)
+	}
+	if cfg.PresignUploadTTL != DefaultPresignUploadTTL {
+		t.Errorf("PresignUploadTTL = %s, want %s", cfg.PresignUploadTTL, DefaultPresignUploadTTL)
+	}
+	if cfg.PresignDownloadTTL != DefaultPresignDownloadTTL {
+		t.Errorf("PresignDownloadTTL = %s, want %s", cfg.PresignDownloadTTL, DefaultPresignDownloadTTL)
+	}
+	if cfg.PresignUploadTTL != 15*time.Minute {
+		t.Errorf("PresignUploadTTL default esperado 15m, got %s", cfg.PresignUploadTTL)
+	}
+	if cfg.PresignDownloadTTL != 5*time.Minute {
+		t.Errorf("PresignDownloadTTL default esperado 5m, got %s", cfg.PresignDownloadTTL)
+	}
+}
+
+func TestLoad_PresignTTLDesdeEnv(t *testing.T) {
+	vars := completeVars()
+	vars["PRESIGN_UPLOAD_TTL_SECONDS"] = "120"
+	vars["PRESIGN_DOWNLOAD_TTL_SECONDS"] = "90"
+	setEnv(t, vars)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() no debía fallar: %v", err)
+	}
+	if cfg.PresignUploadTTL != 120*time.Second {
+		t.Errorf("PresignUploadTTL = %s, want 2m", cfg.PresignUploadTTL)
+	}
+	if cfg.PresignDownloadTTL != 90*time.Second {
+		t.Errorf("PresignDownloadTTL = %s, want 90s", cfg.PresignDownloadTTL)
+	}
+}
+
+func TestValidate_PresignUploadTTLFueraDeRango_Falla(t *testing.T) {
+	vars := completeVars()
+	vars["PRESIGN_UPLOAD_TTL_SECONDS"] = "10"
+	setEnv(t, vars)
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() debía fallar con PRESIGN_UPLOAD_TTL_SECONDS=10")
+	}
+	if !strings.Contains(err.Error(), "PRESIGN_UPLOAD_TTL_SECONDS") {
+		t.Errorf("el error debe mencionar PRESIGN_UPLOAD_TTL_SECONDS, got: %v", err)
+	}
+}
+
+func TestValidate_PresignDownloadTTLFueraDeRango_Falla(t *testing.T) {
+	vars := completeVars()
+	vars["PRESIGN_DOWNLOAD_TTL_SECONDS"] = "901"
+	setEnv(t, vars)
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() debía fallar con PRESIGN_DOWNLOAD_TTL_SECONDS=901")
+	}
+	if !strings.Contains(err.Error(), "PRESIGN_DOWNLOAD_TTL_SECONDS") {
+		t.Errorf("el error debe mencionar PRESIGN_DOWNLOAD_TTL_SECONDS, got: %v", err)
 	}
 }
