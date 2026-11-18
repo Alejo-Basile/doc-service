@@ -84,3 +84,25 @@ var (
 		Help:      "Antigüedad en segundos del documento más viejo por estado intermedio operativo (excluye PENDING_UPLOAD).",
 	}, []string{"status"})
 )
+
+// Config KV metrics (S11-P1-C11).
+var (
+	ConfigKVLastSuccess = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "docservice",
+		Subsystem: "config",
+		Name:      "kv_last_success_timestamp_seconds",
+		Help:      "Unix timestamp of last successful KV apply.",
+	})
+	ConfigKVRejected = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "docservice",
+		Subsystem: "config",
+		Name:      "kv_rejected_total",
+		Help:      "Total rejected KV values by key.",
+	}, []string{"key"})
+	ConfigKVStale = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "docservice",
+		Subsystem: "config",
+		Name:      "kv_stale",
+		Help:      "1 when last valid read is older than 15 min.",
+	})
+)
