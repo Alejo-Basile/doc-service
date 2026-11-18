@@ -726,12 +726,21 @@ func TestWatcher_RecuperaTrasTokenInvalido(t *testing.T) {
 		t.Fatalf("UpdateStatus falló: ok=%v err=%v", ok, err)
 	}
 
+	// El catch-up del stream fresco puede reentregar doc A (quedó en UPLOADED):
+	// el relay es idempotente, así que lo que importa es que doc B llegue.
 	deadline = time.After(5 * time.Second)
+	var got *Event
 	for {
 		mu.Lock()
-		n := len(received)
+		for i := range received {
+			if received[i].DocumentID == docB.ID {
+				event := received[i]
+				got = &event
+				break
+			}
+		}
 		mu.Unlock()
-		if n >= 1 {
+		if got != nil {
 			break
 		}
 		select {
@@ -741,11 +750,8 @@ func TestWatcher_RecuperaTrasTokenInvalido(t *testing.T) {
 		}
 	}
 
-	mu.Lock()
-	got := received[0]
-	mu.Unlock()
-	if got.DocumentID != docB.ID || got.Status != "UPLOADED" {
-		t.Errorf("evento recibido inesperado: %+v", got)
+	if got.Status != "UPLOADED" {
+		t.Errorf("evento recibido inesperado: %+v", *got)
 	}
 
 	// 3) A partir de acá el resume token se persiste de nuevo (reanudación sana).
@@ -833,5 +839,122 @@ func TestWatcher_ClienteSinTimeout_SuperaVentanaDeOperacion(t *testing.T) {
 			t.Fatal("el watcher no entregó el evento UPLOADED: stream murió por Timeout de cliente reintroducido")
 		case <-time.After(100 * time.Millisecond):
 		}
+	}
+}
+
+// TestWatcher_CatchUpProcesaUPLOADEDAlIniciarSinToken cubre la pérdida de
+// eventos cuando el resume token se descarta (p.ej. tras un reinicio de Mongo
+// que devuelve "cannot resume stream"): un stream fresco arranca en el
+// presente y el documento que quedó en UPLOADED nunca se relayaba. El catch-up
+// de arranque debe procesarlo aunque no haya evento en el stream.
+func TestWatcher_CatchUpProcesaUPLOADEDAlIniciarSinToken(t *testing.T) {
+	h, ctx, cleanup := setupHarness(t)
+	defer cleanup()
+
+	doc := domain.NewDocument("corr-catchup-1", time.Now().UTC().Add(24*time.Hour))
+	doc.SetObjectKey("raw-pdfs")
+	if err := h.repo.Insert(ctx, doc); err != nil {
+		t.Fatalf("Insert falló: %v", err)
+	}
+	ok, err := h.repo.UpdateStatus(ctx, doc.ID,
+		domain.StatusPendingUpload, domain.StatusUploaded,
+		map[string]any{"object_key": doc.ObjectKey},
+	)
+	if err != nil || !ok {
+		t.Fatalf("UpdateStatus falló: ok=%v err=%v", ok, err)
+	}
+
+	var mu sync.Mutex
+	var received []Event
+	handler := func(_ context.Context, event Event) error {
+		mu.Lock()
+		received = append(received, event)
+		mu.Unlock()
+		return nil
+	}
+
+	w := NewWatcher(h.client, h.tokenStore, handler, DefaultWatcherConfig())
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		_ = w.Run(wctx)
+	}()
+
+	deadline := time.After(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(received)
+		mu.Unlock()
+		if n >= 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("el catch-up no procesó el documento UPLOADED previo al arranque")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	mu.Lock()
+	event := received[0]
+	mu.Unlock()
+	if event.DocumentID != doc.ID {
+		t.Errorf("DocumentID esperado %q, got %q", doc.ID, event.DocumentID)
+	}
+	if event.Status != string(domain.StatusUploaded) {
+		t.Errorf("Status esperado UPLOADED, got %q", event.Status)
+	}
+
+	cancel()
+	select {
+	case <-watcherDone:
+	case <-time.After(2 * time.Second):
+	}
+}
+
+// TestWatcher_CatchUpIgnoraEstadosNoPublicables verifica que el catch-up no
+// reenvía documentos que ya avanzaron más allá de UPLOADED.
+func TestWatcher_CatchUpIgnoraEstadosNoPublicables(t *testing.T) {
+	h, ctx, cleanup := setupHarness(t)
+	defer cleanup()
+
+	doc := domain.NewDocument("corr-catchup-2", time.Now().UTC().Add(24*time.Hour))
+	doc.SetObjectKey("raw-pdfs")
+	if err := h.repo.Insert(ctx, doc); err != nil {
+		t.Fatalf("Insert falló: %v", err)
+	}
+	for _, status := range []domain.Status{domain.StatusUploaded, domain.StatusQueued} {
+		from := domain.StatusPendingUpload
+		if status == domain.StatusQueued {
+			from = domain.StatusUploaded
+		}
+		ok, err := h.repo.UpdateStatus(ctx, doc.ID, from, status, map[string]any{"object_key": doc.ObjectKey})
+		if err != nil || !ok {
+			t.Fatalf("UpdateStatus %s falló: ok=%v err=%v", status, ok, err)
+		}
+	}
+
+	var mu sync.Mutex
+	received := 0
+	handler := func(_ context.Context, _ Event) error {
+		mu.Lock()
+		received++
+		mu.Unlock()
+		return nil
+	}
+
+	w := NewWatcher(h.client, h.tokenStore, handler, DefaultWatcherConfig())
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { _ = w.Run(wctx) }()
+
+	time.Sleep(2 * time.Second)
+	mu.Lock()
+	n := received
+	mu.Unlock()
+	if n != 0 {
+		t.Errorf("el catch-up no debía procesar documentos en QUEUED, got %d", n)
 	}
 }
