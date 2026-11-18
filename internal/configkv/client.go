@@ -1,6 +1,7 @@
 package configkv
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -82,6 +83,21 @@ func NewClient(addr, token, cachePath string, timeout time.Duration) *Client {
 }
 
 func NewClientFromEnv() *Client { return NewClient("", "", "", 0) }
+
+func (c *Client) Put(ctx context.Context, path string, body []byte) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, "PUT", c.Addr+path, bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, nil
+}
 
 func (c *Client) do(req *http.Request) (*http.Response, error) {
 	if c.Token != "" {
