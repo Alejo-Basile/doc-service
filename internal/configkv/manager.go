@@ -14,11 +14,11 @@ import (
 )
 
 type Manager struct {
-	Client     *Client
-	CachePath  string
-	Disabled   bool
-	Ptr        *atomic.Pointer[config.Config]
-	Base       *config.Config
+	Client    *Client
+	CachePath string
+	Disabled  bool
+	Ptr       *atomic.Pointer[config.Config]
+	Base      *config.Config
 
 	mu          sync.Mutex
 	Effective   map[string]string

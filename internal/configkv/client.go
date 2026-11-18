@@ -168,7 +168,7 @@ func (c *Client) Watch(ctx context.Context, onChange func(map[string]string, uin
 		}
 		pairs, newIdx, status, err := c.Get(ctx, "config/doc-service", idx, c.Wait)
 		if err != nil || status >= 500 {
-			jitter := time.Duration(rand.Int63n(int64(backoff / 4) + 1))
+			jitter := time.Duration(rand.Int63n(int64(backoff/4) + 1))
 			select {
 			case <-ctx.Done():
 				return
