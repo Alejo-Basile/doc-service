@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -143,5 +144,103 @@ func DefaultMigrations() []Migration {
 				return nil
 			},
 		},
+		{
+			Version: 2,
+			Name:    "retention_at_ttl_and_backfill",
+			Apply: func(ctx context.Context, db *mongo.Database) error {
+				coll := db.Collection("documents")
+				const (
+					pendingRetention  = int64(60 * 60 * 1000)       // 60 min en ms
+					terminalRetention = int64(168 * 60 * 60 * 1000) // 168 h en ms
+				)
+				now := time.Now().UTC()
+
+				// (a) Backfill de retention_at. El TTL deja de gobernarse por
+				// expires_at: ese campo marca cuándo el reconciliador puede
+				// decidir, y retention_at cuándo el TTL puede recolectar
+				// (SPEC §4: el TTL recolecta estados ya decididos).
+				if err := backfillRetention(ctx, coll, []bson.M{
+					{"status": string("PENDING_UPLOAD"), "retention_at": bson.M{"$exists": false}},
+				}, bson.D{{Key: "$add", Value: bson.A{
+					// Garantiza al menos una ventana completa de retención a
+					// partir de ahora: un documento ya vencido al migrar debe
+					// seguir siendo decidible por el reconciliador.
+					bson.D{{Key: "$max", Value: bson.A{"$expires_at", "$$NOW"}}},
+					pendingRetention,
+				}}}); err != nil {
+					return fmt.Errorf("backfill retention pending: %w", err)
+				}
+				if err := backfillRetention(ctx, coll, []bson.M{
+					{"status": bson.M{"$in": bson.A{"COMPLETED", "FAILED", "REJECTED", "UPLOAD_EXPIRED"}}, "retention_at": bson.M{"$exists": false}},
+				}, bson.D{{Key: "$add", Value: bson.A{now, terminalRetention}}}); err != nil {
+					return fmt.Errorf("backfill retention terminal: %w", err)
+				}
+				if err := backfillRetention(ctx, coll, []bson.M{
+					{"status": bson.M{"$nin": bson.A{"PENDING_UPLOAD", "COMPLETED", "FAILED", "REJECTED", "UPLOAD_EXPIRED"}}, "retention_at": bson.M{"$exists": false}},
+				}, bson.D{{Key: "$add", Value: bson.A{now, pendingRetention}}}); err != nil {
+					return fmt.Errorf("backfill retention intermediate: %w", err)
+				}
+
+				// (b) Índice TTL sobre retention_at.
+				if _, err := coll.Indexes().CreateOne(ctx, mongo.IndexModel{
+					Keys:    bson.D{{Key: "retention_at", Value: 1}},
+					Options: options.Index().SetName("retention_at_ttl").SetExpireAfterSeconds(0),
+				}); err != nil {
+					return fmt.Errorf("create index retention_at TTL: %w", err)
+				}
+
+				// (c) Recién con (a) y (b) aplicados, retirar el TTL viejo.
+				// Nunca se dropea si el índice nuevo no está presente.
+				names, err := indexNames(ctx, coll)
+				if err != nil {
+					return fmt.Errorf("list indexes: %w", err)
+				}
+				if names["retention_at_ttl"] && names["expires_at_1"] {
+					if err := coll.Indexes().DropOne(ctx, "expires_at_1"); err != nil {
+						return fmt.Errorf("drop index expires_at_1: %w", err)
+					}
+				}
+
+				return nil
+			},
+		},
 	}
+}
+
+// backfillRetention aplica el pipeline $set de retention_at a los documentos
+// que matchean alguno de los filtros. Idempotente: sólo toca los que no tienen
+// el campo.
+func backfillRetention(ctx context.Context, coll *mongo.Collection, filters []bson.M, add bson.D) error {
+	for _, f := range filters {
+		pipeline := mongo.Pipeline{
+			{{Key: "$set", Value: bson.D{{Key: "retention_at", Value: add}}}},
+		}
+		if _, err := coll.UpdateMany(ctx, f, pipeline); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// indexNames devuelve el conjunto de nombres de índice de la colección.
+func indexNames(ctx context.Context, coll *mongo.Collection) (map[string]bool, error) {
+	cur, err := coll.Indexes().List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+
+	out := map[string]bool{}
+	for cur.Next(ctx) {
+		var spec struct {
+			Name string `bson:"name"`
+		}
+		if err := cur.Decode(&spec); err != nil {
+			return nil, err
+		}
+		if spec.Name != "" {
+			out[spec.Name] = true
+		}
+	}
+	return out, cur.Err()
 }

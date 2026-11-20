@@ -56,7 +56,9 @@ type Config struct {
 	PresignDownloadTTL  time.Duration
 	ReconcileInterval   time.Duration
 	ReconcileStuckAfter time.Duration
-	DocUploadGrace      time.Duration
+	DocUploadGrace        time.Duration
+	DocPendingRetention   time.Duration
+	DocTerminalRetention  time.Duration
 	// MinSafetyAge es la edad mínima antes de que el reconciliador toque un documento (S6-P2-02).
 	// Documentos más jóvenes que esto nunca son alterados bajo ninguna condición.
 	MinSafetyAge time.Duration
@@ -85,6 +87,8 @@ const (
 	defaultReconcileMin           = 10
 	defaultReconcileStuckAfterMin = 30
 	defaultDocUploadGraceMin      = 30 // >= 2x reconcil interval (SPEC §4)
+	defaultDocPendingRetentionMin = 60
+	defaultDocTerminalRetentionH  = 168
 	defaultMinSafetyAgeMin        = 15 // >= 1x reconcil interval (S6-P2-02)
 )
 
@@ -117,6 +121,8 @@ func Load() (*Config, error) {
 		ReconcileInterval:    time.Duration(envInt("RECONCILE_INTERVAL_MIN", defaultReconcileMin)) * time.Minute,
 		ReconcileStuckAfter:  time.Duration(envInt("RECONCILE_STUCK_AFTER_MIN", defaultReconcileStuckAfterMin)) * time.Minute,
 		DocUploadGrace:       time.Duration(envInt("DOC_UPLOAD_GRACE_MIN", defaultDocUploadGraceMin)) * time.Minute,
+		DocPendingRetention:  time.Duration(envInt("DOC_PENDING_RETENTION_MIN", defaultDocPendingRetentionMin)) * time.Minute,
+		DocTerminalRetention: time.Duration(envInt("DOC_TERMINAL_RETENTION_HOURS", defaultDocTerminalRetentionH)) * time.Hour,
 		MinSafetyAge:         time.Duration(envInt("MIN_SAFETY_AGE_MIN", defaultMinSafetyAgeMin)) * time.Minute,
 		DryRun:               envBool("RECONCILE_DRY_RUN", false),
 	}
@@ -198,6 +204,13 @@ func (c *Config) ValidateTunables() error {
 		return fmt.Errorf(
 			"configuración inválida: DOC_UPLOAD_GRACE_MIN (%s) debe ser >= 2x RECONCILE_INTERVAL_MIN (%s)",
 			c.DocUploadGrace, minGrace,
+		)
+	}
+	minPending := 2 * c.ReconcileInterval
+	if c.DocPendingRetention > 0 && c.DocPendingRetention < minPending {
+		return fmt.Errorf(
+			"configuración inválida: DOC_PENDING_RETENTION_MIN (%s) debe ser >= 2x RECONCILE_INTERVAL_MIN (%s)",
+			c.DocPendingRetention, minPending,
 		)
 	}
 	if c.ReconcileStuckAfter <= 0 {

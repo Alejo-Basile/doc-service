@@ -122,8 +122,15 @@ func main() {
 	redisBreaker := resilience.NewBreaker("redis")
 
 	repo := resilience.NewDocumentRepository(
-		mongoadapter.NewDocumentRepository(mongoClient, "documents"), mongoBreaker)
+		mongoadapter.NewDocumentRepository(mongoClient, "documents").
+			WithRetention(cfg.DocPendingRetention, cfg.DocTerminalRetention), mongoBreaker)
 	storage := resilience.NewObjectStorage(rawStorage, minioBreaker)
+
+	// El reconciliador hace barridos masivos de HEAD/purga: usa su PROPIO
+	// breaker para que una ráfaga de probes no abra el breaker que protege
+	// PresignPost/Stat de los handlers (S9: un sweep abrió el breaker
+	// compartido y devolvió 500 en POST /api/v2/documents durante ~30 s).
+	probeStorage := resilience.NewObjectStorage(rawStorage, resilience.NewBreaker("minio-probe"))
 
 	redisClientCfg := redisadapter.ClientConfig{
 		Addr:          cfg.RedisAddr,
@@ -174,10 +181,11 @@ func main() {
 	internalHandler := api.NewInternalHandler(repo, storage, queue, cfg.InternalToken)
 	webhookHandler := webhook.NewHandler(repo, storage, cfg.MinIOWebhookSecret, cfg.MinIOBucketRaw, objectKeyPrefix)
 	rel := reconciler.New(
-		repo, storage, queue, lease, ports.SystemClock{},
+		repo, probeStorage, queue, lease, ports.SystemClock{},
 		cfg.ReconcileInterval, cfg.ReconcileStuckAfter, cfg.MinSafetyAge,
 		reconciler.WithInternalToken(cfg.InternalToken),
 		reconciler.WithDryRun(cfg.DryRun),
+		reconciler.WithTerminalRetention(cfg.DocTerminalRetention),
 		reconciler.WithConfigSource(func() reconciler.LiveConfig {
 			c := cfgkv.CurrentConfig()
 			return reconciler.LiveConfig{Interval: c.ReconcileInterval, StuckAfter: c.ReconcileStuckAfter, DryRun: c.DryRun}
