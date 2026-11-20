@@ -189,18 +189,18 @@ func (r *Reconciler) CrossCheckNow(ctx context.Context) (*CrossCheckReport, erro
 
 // Result resume lo que hizo un sweep.
 type Result struct {
-	ExpiredPending    int               `json:"expired_pending"`
-	RecoveredUploaded int               `json:"recovered_uploaded"`
-	Reenqueued        int               `json:"reenqueued"`
-	StuckDetected     int               `json:"stuck_detected"`
-	OrphansPurged     int               `json:"orphans_purged"`
-	CompletedNoMd     int               `json:"completed_no_md"` // COMPLETED sin artefacto usable (md_ref o txt_ref legacy) en MinIO (S5-P2-03, D5)
+	ExpiredPending    int `json:"expired_pending"`
+	RecoveredUploaded int `json:"recovered_uploaded"`
+	Reenqueued        int `json:"reenqueued"`
+	StuckDetected     int `json:"stuck_detected"`
+	OrphansPurged     int `json:"orphans_purged"`
+	CompletedNoMd     int `json:"completed_no_md"` // COMPLETED sin artefacto usable (md_ref o txt_ref legacy) en MinIO (S5-P2-03, D5)
 	// RetentionBackfilled cuenta documentos terminales a los que se les fijó
 	// retention_at (el worker en Rust escribe COMPLETED sin ese campo).
-	RetentionBackfilled int `json:"retention_backfilled"`
-	Errors            int               `json:"errors"`
-	LockAcquired      bool              `json:"lock_acquired"`
-	CrossCheckReport  *CrossCheckReport `json:"cross_check,omitempty"` // S6-P2-01
+	RetentionBackfilled int               `json:"retention_backfilled"`
+	Errors              int               `json:"errors"`
+	LockAcquired        bool              `json:"lock_acquired"`
+	CrossCheckReport    *CrossCheckReport `json:"cross_check,omitempty"` // S6-P2-01
 	// DryRun indica que la corrida solo planificó. PlannedActions cuenta las
 	// acciones que el sweep propuso y ExecutedActions las que se aplicaron
 	// (en dry-run queda siempre en 0, SPEC §6.5, T1).
