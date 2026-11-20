@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
+
 	"github.com/Alejo-Basile/doc-service/internal/domain"
 	"github.com/Alejo-Basile/doc-service/internal/ports"
 )
@@ -316,9 +318,11 @@ func TestMigrator_UpIdempotente(t *testing.T) {
 	client, _, ctx, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	migrator := NewMigrator(client, DefaultMigrations()...)
+	migrations := DefaultMigrations()
+	want := migrations[len(migrations)-1].Version
+	migrator := NewMigrator(client, migrations...)
 
-	// Primera vez: debe aplicar la migración v1.
+	// Primera vez: aplica todas las migraciones.
 	if err := migrator.Up(ctx); err != nil {
 		t.Fatalf("primer Up falló: %v", err)
 	}
@@ -327,11 +331,11 @@ func TestMigrator_UpIdempotente(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CurrentVersion falló: %v", err)
 	}
-	if v != 1 {
-		t.Errorf("versión esperada 1, got %d", v)
+	if v != want {
+		t.Errorf("versión esperada %d, got %d", want, v)
 	}
 
-	// Segunda vez: idempotente, no debe fallar.
+	// Segunda vez: idempotente, no debe fallar ni avanzar versión.
 	if err := migrator.Up(ctx); err != nil {
 		t.Fatalf("segundo Up falló (debía ser idempotente): %v", err)
 	}
@@ -340,8 +344,8 @@ func TestMigrator_UpIdempotente(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CurrentVersion falló: %v", err)
 	}
-	if v != 1 {
-		t.Errorf("versión esperada 1 tras segundo Up, got %d", v)
+	if v != want {
+		t.Errorf("versión esperada %d tras segundo Up, got %d", want, v)
 	}
 }
 
@@ -672,5 +676,158 @@ func TestListByCursor_Vacio(t *testing.T) {
 	}
 	if nextCursor != "" {
 		t.Errorf("nextCursor = %q, want vacío", nextCursor)
+	}
+}
+
+// S9: el TTL dejó de gobernarse por expires_at. Estas pruebas fijan el contrato
+// de retention_at y del orden de listado que usa el reconciliador.
+
+func TestList_SortByExpires_DevuelveLosMasViejos(t *testing.T) {
+	_, repo, ctx, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	now := time.Now().UTC()
+	// Los ids más nuevos tienen expires_at más reciente: con el orden por
+	// defecto (_id DESC) se devolverían estos y no los vencidos.
+	docs := []*domain.Document{
+		{ID: "zzz-newest", Status: domain.StatusPendingUpload, ExpiresAt: now.Add(3 * time.Hour), CreatedAt: now, UpdatedAt: now},
+		{ID: "mmm-mid", Status: domain.StatusPendingUpload, ExpiresAt: now.Add(-1 * time.Hour), CreatedAt: now, UpdatedAt: now},
+		{ID: "aaa-oldest", Status: domain.StatusPendingUpload, ExpiresAt: now.Add(-2 * time.Hour), CreatedAt: now, UpdatedAt: now},
+	}
+	for _, d := range docs {
+		d.SetObjectKey("raw-pdfs")
+		if err := repo.Insert(ctx, d); err != nil {
+			t.Fatalf("insert %s: %v", d.ID, err)
+		}
+	}
+
+	got, total, err := repo.List(ctx, ports.ListFilter{
+		Status:        domain.StatusPendingUpload,
+		Limit:         2,
+		ExpiredBefore: now,
+		SortByExpires: true,
+	})
+	if err != nil {
+		t.Fatalf("List error: %v", err)
+	}
+	if total != 2 {
+		t.Fatalf("total = %d, want 2 (sólo vencidos)", total)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2", len(got))
+	}
+	if got[0].ID != "aaa-oldest" || got[1].ID != "mmm-mid" {
+		t.Fatalf("orden = [%s, %s], want [aaa-oldest, mmm-mid]", got[0].ID, got[1].ID)
+	}
+}
+
+func TestInsert_PoblaRetentionAtDesdedExpires(t *testing.T) {
+	_, repo, ctx, cleanup := setupTestDB(t)
+	defer cleanup()
+	repo.WithRetention(30*time.Minute, 48*time.Hour)
+
+	expires := time.Now().UTC().Add(15 * time.Minute).Truncate(time.Millisecond)
+	doc := &domain.Document{
+		ID:        "ret-1",
+		Status:    domain.StatusPendingUpload,
+		ExpiresAt: expires,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	doc.SetObjectKey("raw-pdfs")
+	if err := repo.Insert(ctx, doc); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	stored, err := repo.GetByID(ctx, "ret-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if want := expires.Add(30 * time.Minute); !stored.RetentionAt.Equal(want) {
+		t.Fatalf("RetentionAt = %s, want %s", stored.RetentionAt, want)
+	}
+}
+
+func TestUpdateStatus_TerminalFijaRetencionTerminal(t *testing.T) {
+	_, repo, ctx, cleanup := setupTestDB(t)
+	defer cleanup()
+	repo.WithRetention(30*time.Minute, 48*time.Hour)
+
+	now := time.Now().UTC()
+	doc := &domain.Document{
+		ID:        "ret-2",
+		Status:    domain.StatusPendingUpload,
+		ExpiresAt: now.Add(-time.Hour), // ya vencido: el TTL viejo lo habría borrado
+		CreatedAt: now.Add(-2 * time.Hour),
+		UpdatedAt: now,
+	}
+	doc.SetObjectKey("raw-pdfs")
+	if err := repo.Insert(ctx, doc); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	ok, err := repo.UpdateStatus(ctx, "ret-2", domain.StatusPendingUpload, domain.StatusUploadExpired, nil)
+	if err != nil || !ok {
+		t.Fatalf("UpdateStatus ok=%v err=%v", ok, err)
+	}
+
+	stored, err := repo.GetByID(ctx, "ret-2")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if stored.RetentionAt.Before(now.Add(47 * time.Hour)) {
+		t.Fatalf("RetentionAt = %s, want ~now+48h", stored.RetentionAt)
+	}
+	// expires_at sigue en el pasado: prueba de que ya no gobierna el TTL.
+	if !stored.ExpiresAt.Before(now) {
+		t.Fatalf("ExpiresAt = %s, se esperaba en el pasado", stored.ExpiresAt)
+	}
+}
+
+func TestMigrations_RetentionTTLIdempotente(t *testing.T) {
+	client, _, ctx, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	coll := client.DB().Collection("documents")
+	now := time.Now().UTC()
+	// Documento previo a la migración: con TTL viejo habría sido elegible.
+	if _, err := coll.InsertOne(ctx, bson.M{
+		"_id":        "legacy-pending",
+		"status":     "PENDING_UPLOAD",
+		"expires_at": now.Add(-10 * time.Minute),
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	migrator := NewMigrator(client, DefaultMigrations()...)
+	if err := migrator.Up(ctx); err != nil {
+		t.Fatalf("primera migración: %v", err)
+	}
+	if err := migrator.Up(ctx); err != nil {
+		t.Fatalf("segunda migración (idempotencia): %v", err)
+	}
+
+	names, err := indexNames(ctx, coll)
+	if err != nil {
+		t.Fatalf("indexNames: %v", err)
+	}
+	if !names["retention_at_ttl"] {
+		t.Fatalf("falta retention_at_ttl; índices=%v", names)
+	}
+	if names["expires_at_1"] {
+		t.Fatalf("expires_at_1 no debería existir; índices=%v", names)
+	}
+
+	var got struct {
+		RetentionAt time.Time `bson:"retention_at"`
+	}
+	if err := coll.FindOne(ctx, bson.M{"_id": "legacy-pending"}).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.RetentionAt.IsZero() {
+		t.Fatalf("retention_at no fue backfilleado")
+	}
+	if !got.RetentionAt.After(now) {
+		t.Fatalf("retention_at = %s, debe quedar en el futuro", got.RetentionAt)
 	}
 }

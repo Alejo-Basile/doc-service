@@ -47,6 +47,19 @@ type ListFilter struct {
 	Limit      int64
 	BeforeTime time.Time
 	BeforeID   string
+
+	// ExpiredBefore acota a documentos cuyo expires_at es anterior al instante
+	// indicado. Lo usa el reconciliador para decidir PENDING_UPLOAD vencidos
+	// (SPEC §4, §6.5).
+	ExpiredBefore time.Time
+	// ExpiredCursorAt/ExpiredCursorID implementan el cursor compuesto
+	// (expires_at, _id) para paginar vencidos sin repetir ni saltar registros.
+	ExpiredCursorAt time.Time
+	ExpiredCursorID string
+	// SortByExpires ordena por (expires_at ASC, _id ASC) en lugar del orden
+	// por defecto (_id DESC), de modo que con Limit se recorre a los documentos
+	// vencidos más antiguos primero.
+	SortByExpires bool
 }
 
 // CursorFilter representa los criterios de paginación por cursor (S3-P2-10).

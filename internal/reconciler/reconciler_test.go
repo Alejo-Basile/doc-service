@@ -27,6 +27,9 @@ func (c *mockClock) Now() time.Time { return c.t }
 type mockRepo struct {
 	docs        map[string]*domain.Document
 	updateCalls []updateCall
+	// listFilters registra los filtros usados por List, para probar que el
+	// sweep de vencidos pagina por expires_at y no por el orden por defecto.
+	listFilters []ports.ListFilter
 	// order, si no es nil, registra "transition" para probar el orden
 	// transición → encolado en los sweeps del reconciliador.
 	order *[]string
@@ -63,10 +66,18 @@ func (m *mockRepo) UpdateStatus(ctx context.Context, id string, from, to domain.
 	}
 	doc.Status = to
 	doc.UpdatedAt = time.Now().UTC()
+	// Espeja al adaptador Mongo para los campos que el reconciliador setea.
+	if v, ok := fields["retention_at"].(time.Time); ok {
+		doc.RetentionAt = v
+	}
+	if v, ok := fields["expires_at"].(time.Time); ok {
+		doc.ExpiresAt = v
+	}
 	return true, nil
 }
 
 func (m *mockRepo) List(ctx context.Context, filter ports.ListFilter) ([]*domain.Document, int64, error) {
+	m.listFilters = append(m.listFilters, filter)
 	var result []*domain.Document
 	for _, doc := range m.docs {
 		if filter.Status == "" || doc.Status == filter.Status {
@@ -552,23 +563,27 @@ func TestRunOnce_CompletedSinMd_Detectado(t *testing.T) {
 	storage := newMockStorage()
 
 	// Documento COMPLETED sin md_ref, creado hace 1h (pasó safety age).
+	// RetentionAt poblado: modela un documento ya backfilleado por la migración
+	// v2; el sweep de retención terminal no debe tocarlo (solo detección).
 	doc := &domain.Document{
-		ID:        "doc-no-md",
-		Status:    domain.StatusCompleted,
-		ObjectKey: "raw-pdfs/doc-no-md.pdf",
-		CreatedAt: now.Add(-time.Hour),
-		UpdatedAt: now.Add(-time.Hour),
+		ID:          "doc-no-md",
+		Status:      domain.StatusCompleted,
+		ObjectKey:   "raw-pdfs/doc-no-md.pdf",
+		CreatedAt:   now.Add(-time.Hour),
+		UpdatedAt:   now.Add(-time.Hour),
+		RetentionAt: now.Add(time.Hour),
 	}
 	repo.docs["doc-no-md"] = doc
 
 	// Segundo documento COMPLETED con md_ref que no existe en MinIO.
 	doc2 := &domain.Document{
-		ID:        "doc-md-missing",
-		Status:    domain.StatusCompleted,
-		ObjectKey: "raw-pdfs/doc-md-missing.pdf",
-		MdRef:     "extracted-md/doc-md-missing.md",
-		CreatedAt: now.Add(-time.Hour),
-		UpdatedAt: now.Add(-time.Hour),
+		ID:          "doc-md-missing",
+		Status:      domain.StatusCompleted,
+		ObjectKey:   "raw-pdfs/doc-md-missing.pdf",
+		MdRef:       "extracted-md/doc-md-missing.md",
+		CreatedAt:   now.Add(-time.Hour),
+		UpdatedAt:   now.Add(-time.Hour),
+		RetentionAt: now.Add(time.Hour),
 	}
 	repo.docs["doc-md-missing"] = doc2
 
@@ -2227,5 +2242,79 @@ func TestRunOnce_DryRunMetric_UnaVezPorSweep(t *testing.T) {
 	after2 := testutil.ToFloat64(metrics.ReconcileDryRun)
 	if after2 != before2 {
 		t.Fatalf("metric moved on non-dry-run: %v -> %v", before2, after2)
+	}
+}
+
+// TestSweepExpiredPending_PaginaPorExpires prueba la regresión que dejaba los
+// lotes grandes de PENDING_UPLOAD vencidos sin decisión: se consultaba List con
+// el orden por defecto (_id DESC), que devolvía sólo los documentos más nuevos
+// y todavía vigentes. El sweep debe pedir ExpiredBefore + SortByExpires.
+func TestSweepExpiredPending_PaginaPorExpires(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+
+	repo.docs["d1"] = &domain.Document{
+		ID:        "d1",
+		Status:    domain.StatusPendingUpload,
+		ObjectKey: "raw-pdfs/d1.pdf",
+		CreatedAt: now.Add(-time.Hour),
+		ExpiresAt: now.Add(-time.Minute),
+	}
+	storage.objects["raw-pdfs/d1.pdf"] = true
+
+	r := New(repo, storage, nil, nil, &mockClock{t: now}, 10*time.Minute, 30*time.Minute, 10*time.Minute)
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+	if result.RecoveredUploaded != 1 {
+		t.Fatalf("recovered = %d, want 1", result.RecoveredUploaded)
+	}
+
+	found := false
+	for _, f := range repo.listFilters {
+		if f.Status == domain.StatusPendingUpload && f.SortByExpires && f.ExpiredBefore.Equal(now) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("el sweep de vencidos debe consultar con ExpiredBefore+SortByExpires; filtros: %+v", repo.listFilters)
+	}
+}
+
+// TestSweepMissingRetention_FijaRetencionTerminal cubre los COMPLETED escritos
+// por el worker (sin retention_at): sin esta red nunca serían recolectados.
+func TestSweepMissingRetention_FijaRetencionTerminal(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newMockRepo()
+	storage := newMockStorage()
+	storage.mdObjects = make(map[string]bool)
+
+	repo.docs["worker-doc"] = &domain.Document{
+		ID:        "worker-doc",
+		Status:    domain.StatusCompleted,
+		ObjectKey: "raw-pdfs/worker-doc.pdf",
+		MdRef:     "extracted-md/worker-doc.md",
+		CreatedAt: now.Add(-time.Hour),
+		UpdatedAt: now.Add(-time.Hour),
+	}
+	storage.mdObjects["extracted-md/worker-doc.md"] = true
+
+	terminal := 48 * time.Hour
+	r := New(repo, storage, nil, nil, &mockClock{t: now}, 10*time.Minute, 30*time.Minute, 10*time.Minute,
+		WithTerminalRetention(terminal))
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce error: %v", err)
+	}
+	if result.RetentionBackfilled != 1 {
+		t.Fatalf("retention_backfilled = %d, want 1", result.RetentionBackfilled)
+	}
+	got := repo.docs["worker-doc"].RetentionAt
+	want := now.Add(terminal)
+	if !got.Equal(want) {
+		t.Fatalf("RetentionAt = %s, want %s", got, want)
 	}
 }

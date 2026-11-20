@@ -194,6 +194,7 @@ type Document struct {
 	CorrelationID string        `bson:"correlation_id" json:"correlation_id"`
 	SchemaVersion int           `bson:"schema_version" json:"schema_version"`
 	ExpiresAt     time.Time     `bson:"expires_at" json:"expires_at"`
+	RetentionAt   time.Time     `bson:"retention_at,omitempty" json:"-"`
 	CreatedAt     time.Time     `bson:"created_at" json:"created_at"`
 	UpdatedAt     time.Time     `bson:"updated_at" json:"updated_at"`
 	History       []StatusEntry `bson:"history" json:"history"`
