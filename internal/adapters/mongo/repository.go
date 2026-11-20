@@ -48,18 +48,49 @@ var ErrNotFound = ports.ErrNotFound
 // Toda escritura de estado usa transición condicional (SPEC §4, §11.1).
 type DocumentRepository struct {
 	coll *mongo.Collection
+
+	// pendingRetention separa la elegibilidad del reconciliador (expires_at)
+	// de la recolección del TTL (retention_at), para que el TTL nunca borre un
+	// documento antes de que el reconciliador lo haya decidido (SPEC §4).
+	pendingRetention time.Duration
+	// terminalRetention mantiene los documentos terminales un tiempo de
+	// retención propio: el TTL no debe gobiernarse por expires_at, que es un
+	// campo de la ventana de subida y no de la retención (SPEC §4).
+	terminalRetention time.Duration
 }
+
+const (
+	defaultPendingRetention  = 60 * time.Minute
+	defaultTerminalRetention = 168 * time.Hour
+)
 
 // NewDocumentRepository crea un repositorio sobre la colección indicada.
 func NewDocumentRepository(client *Client, collectionName string) *DocumentRepository {
 	return &DocumentRepository{
-		coll: client.Collection(collectionName),
+		coll:              client.Collection(collectionName),
+		pendingRetention:  defaultPendingRetention,
+		terminalRetention: defaultTerminalRetention,
 	}
+}
+
+// WithRetention configura las ventanas de retención usadas para poblar
+// retention_at. Valores <= 0 conservan el default.
+func (r *DocumentRepository) WithRetention(pending, terminal time.Duration) *DocumentRepository {
+	if pending > 0 {
+		r.pendingRetention = pending
+	}
+	if terminal > 0 {
+		r.terminalRetention = terminal
+	}
+	return r
 }
 
 // Insert inserta un documento nuevo. Idempotente por _id: si ya existe,
 // devuelve el error de duplicado de MongoDB (E11000).
 func (r *DocumentRepository) Insert(ctx context.Context, doc *domain.Document) error {
+	if doc.RetentionAt.IsZero() && !doc.ExpiresAt.IsZero() {
+		doc.RetentionAt = doc.ExpiresAt.Add(r.pendingRetention)
+	}
 	_, err := r.coll.InsertOne(ctx, doc)
 	if err != nil {
 		if mongo.IsDuplicateKeyError(err) {
@@ -83,6 +114,25 @@ func (r *DocumentRepository) GetByID(ctx context.Context, id string) (*domain.Do
 	return &doc, nil
 }
 
+// applyRetention mantiene retention_at coherente con la transición: los
+// terminales heredan la retención terminal y un re-presign extiende la
+// retención pendiente. Nunca pisa un valor explícito del llamador.
+func (r *DocumentRepository) applyRetention(set bson.M, to domain.Status) {
+	if _, ok := set["retention_at"]; ok {
+		return
+	}
+	now := time.Now().UTC()
+	if to.IsTerminal() {
+		set["retention_at"] = now.Add(r.terminalRetention)
+		return
+	}
+	if to == domain.StatusPendingUpload {
+		if exp, ok := set["expires_at"].(time.Time); ok && !exp.IsZero() {
+			set["retention_at"] = exp.Add(r.pendingRetention)
+		}
+	}
+}
+
 // UpdateStatus aplica una transición condicional:
 // updateOne({_id, status: from}, {$set: {status: to, ...}}).
 // Devuelve (false, nil) si el filtro no matcheó (SPEC §11.1).
@@ -100,6 +150,7 @@ func (r *DocumentRepository) UpdateStatus(
 	for k, v := range fields {
 		set[k] = v
 	}
+	r.applyRetention(set, to)
 
 	filter := bson.M{
 		"_id":    id,
@@ -130,10 +181,33 @@ func (r *DocumentRepository) List(ctx context.Context, filter ports.ListFilter) 
 	if filter.Status != "" {
 		q["status"] = filter.Status
 	}
+	if !filter.ExpiredBefore.IsZero() {
+		q["expires_at"] = bson.M{"$lt": filter.ExpiredBefore}
+	}
+	// Cursor compuesto (expires_at, _id) sólo para el recorrido de vencidos:
+	// estrictamente mayor, para no repetir el último documento de la página.
+	if filter.SortByExpires && (!filter.ExpiredCursorAt.IsZero() || filter.ExpiredCursorID != "") {
+		q["$or"] = bson.A{
+			bson.M{"expires_at": bson.M{"$gt": filter.ExpiredCursorAt}},
+			bson.M{
+				"expires_at": filter.ExpiredCursorAt,
+				"_id":        bson.M{"$gt": filter.ExpiredCursorID},
+			},
+		}
+	}
 
 	opts := options.Find().
 		SetSort(bson.D{{Key: "_id", Value: -1}}).
 		SetLimit(filter.Limit)
+
+	if filter.SortByExpires {
+		// Los vencidos más antiguos primero: con Limit fijo este orden es el
+		// único que garantiza que el reconciliador los alcance antes del TTL.
+		opts.SetSort(bson.D{
+			{Key: "expires_at", Value: 1},
+			{Key: "_id", Value: 1},
+		})
+	}
 
 	if filter.Limit <= 0 {
 		opts.SetLimit(50)
@@ -243,6 +317,7 @@ func (r *DocumentRepository) UpdateStatusWithHistory(
 	for k, v := range extraSet {
 		set[k] = v
 	}
+	r.applyRetention(set, to)
 
 	filter := bson.M{
 		"_id":    id,

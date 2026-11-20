@@ -45,6 +45,10 @@ type Reconciler struct {
 	internalToken string        // token compartido para proteger el endpoint manual (SPEC §9)
 	dryRun        bool          // modo planificado: detecta y loguea, no muta nada (SPEC §6.5)
 
+	// terminalRetention es la retención aplicada a documentos terminales que
+	// llegan sin retention_at (el worker en Rust escribe COMPLETED directo).
+	terminalRetention time.Duration
+
 	configSource  ConfigSource
 	configChanges <-chan struct{}
 }
@@ -82,6 +86,16 @@ func WithConfigChanges(ch <-chan struct{}) Option {
 	return func(r *Reconciler) { r.configChanges = ch }
 }
 
+// WithTerminalRetention configura cuánto se retiene un documento terminal al
+// que le falta retention_at (SPEC §4: el TTL recolecta, no decide).
+func WithTerminalRetention(d time.Duration) Option {
+	return func(r *Reconciler) {
+		if d > 0 {
+			r.terminalRetention = d
+		}
+	}
+}
+
 // New crea un Reconciler con dependencias inyectadas.
 // queue y lease pueden ser nil (funciona sin reencolado ni bloqueo).
 func New(
@@ -103,14 +117,15 @@ func New(
 	}
 	// minSafetyAge es boot-time: la coherencia del conjunto se valida por configkv/Validate().
 	r := &Reconciler{
-		repo:         repo,
-		storage:      storage,
-		queue:        queue,
-		lease:        lease,
-		clock:        clock,
-		interval:     interval,
-		stuckAfter:   stuckAfter,
-		minSafetyAge: minSafetyAge,
+		repo:              repo,
+		storage:           storage,
+		queue:             queue,
+		lease:             lease,
+		clock:             clock,
+		interval:          interval,
+		stuckAfter:        stuckAfter,
+		minSafetyAge:      minSafetyAge,
+		terminalRetention: 168 * time.Hour,
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -180,6 +195,9 @@ type Result struct {
 	StuckDetected     int               `json:"stuck_detected"`
 	OrphansPurged     int               `json:"orphans_purged"`
 	CompletedNoMd     int               `json:"completed_no_md"` // COMPLETED sin artefacto usable (md_ref o txt_ref legacy) en MinIO (S5-P2-03, D5)
+	// RetentionBackfilled cuenta documentos terminales a los que se les fijó
+	// retention_at (el worker en Rust escribe COMPLETED sin ese campo).
+	RetentionBackfilled int `json:"retention_backfilled"`
 	Errors            int               `json:"errors"`
 	LockAcquired      bool              `json:"lock_acquired"`
 	CrossCheckReport  *CrossCheckReport `json:"cross_check,omitempty"` // S6-P2-01
@@ -344,6 +362,13 @@ func (r *Reconciler) runOnce(ctx context.Context, dryRunOverride *bool) (*Result
 	}
 	result.CompletedNoMd = completedNoMd
 
+	// 5b. Retención terminal faltante (el worker escribe COMPLETED directo).
+	retentionFixed, err := r.sweepMissingRetention(ctx, now)
+	if err != nil {
+		slog.Warn("reconciler: sweep retención terminal falló (no crítico)", "error", err)
+	}
+	result.RetentionBackfilled = retentionFixed
+
 	// 6. Reporte de verificación cruzada (S6-P2-01).
 	report, err := r.crossCheck(ctx, now)
 	if err != nil {
@@ -454,19 +479,70 @@ type sweepResult struct {
 	recovered int
 }
 
+// Límites del recorrido de vencidos. El TTL ya no compite con este sweep
+// (opera sobre retention_at), pero el barrido acota cuánto trabajo hace por
+// corrida para no monopolizar MinIO.
+const (
+	expiredPendingPageSize = 200
+	expiredPendingMaxPages = 10
+)
+
 // sweepExpiredPending busca documentos PENDING_UPLOAD vencidos y actúa.
 // Respeta el umbral de seguridad: documentos más jóvenes que minSafetyAge no se tocan.
+//
+// S9: pagina por (expires_at ASC, _id ASC). El orden por defecto de List es
+// _id DESC y traía sólo los documentos más nuevos, que todavía no vencieron;
+// con un lote grande de vencidos el sweep no decidía ninguno y el TTL los
+// borraba sin estado terminal (SPEC §4: el TTL recolecta, no decide).
 func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time, dryRun bool, actions *actionReport) (*sweepResult, error) {
 	result := &sweepResult{}
 
-	docs, _, err := r.repo.List(ctx, ports.ListFilter{
-		Status: domain.StatusPendingUpload,
-		Limit:  200,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("list pending upload: %w", err)
+	var cursorAt time.Time
+	var cursorID string
+	seen := make(map[string]struct{}, expiredPendingPageSize)
+	for page := 0; page < expiredPendingMaxPages; page++ {
+		docs, _, err := r.repo.List(ctx, ports.ListFilter{
+			Status:          domain.StatusPendingUpload,
+			Limit:           expiredPendingPageSize,
+			ExpiredBefore:   now,
+			SortByExpires:   true,
+			ExpiredCursorAt: cursorAt,
+			ExpiredCursorID: cursorID,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list pending upload: %w", err)
+		}
+		if len(docs) == 0 {
+			break
+		}
+		fresh := make([]*domain.Document, 0, len(docs))
+		for _, doc := range docs {
+			if _, ok := seen[doc.ID]; ok {
+				continue
+			}
+			seen[doc.ID] = struct{}{}
+			fresh = append(fresh, doc)
+		}
+		// Guarda contra repositorios que ignoren el cursor: si la página no
+		// trae nada nuevo, cortar evita reprocesar el mismo lote.
+		if len(fresh) == 0 {
+			break
+		}
+		r.processExpiredPage(ctx, now, dryRun, actions, result, fresh)
+		last := docs[len(docs)-1]
+		cursorAt, cursorID = last.ExpiresAt, last.ID
+		if len(docs) < expiredPendingPageSize {
+			break
+		}
 	}
+	return result, nil
+}
 
+// processExpiredPage decide una página de documentos vencidos.
+func (r *Reconciler) processExpiredPage(
+	ctx context.Context, now time.Time, dryRun bool,
+	actions *actionReport, result *sweepResult, docs []*domain.Document,
+) {
 	for _, doc := range docs {
 		// S6-P2-02: umbral de seguridad — documentos recién creados no se tocan.
 		if now.Sub(doc.CreatedAt) < r.minSafetyAge {
@@ -524,8 +600,6 @@ func (r *Reconciler) sweepExpiredPending(ctx context.Context, now time.Time, dry
 			}
 		}
 	}
-
-	return result, nil
 }
 
 // sweepStuckUploaded busca documentos UPLOADED estancados cuyo objeto exista
@@ -1052,13 +1126,49 @@ func (r *Reconciler) failStuckCompensating(ctx context.Context, doc *domain.Docu
 	return nil
 }
 
-// sweepCompletedMissingMd detecta documentos COMPLETED cuyo .md no existe en MinIO (S5-P2-03).
-// Solo detecta y alerta: no transiciona automáticamente (eso es trabajo del operador).
-// Respeta el umbral de seguridad.
-func (r *Reconciler) sweepCompletedMissingMd(ctx context.Context, now time.Time) (int, error) {
+// sweepMissingRetention fija retention_at en documentos terminales que no lo
+// tienen. El worker en Rust cierra COMPLETED con un update condicional propio y
+// no conoce el campo; sin esta red, esos documentos nunca serían recolectados
+// por el TTL (crecimiento sin límite). Es idempotente y acotado por corrida.
+func (r *Reconciler) sweepMissingRetention(ctx context.Context, now time.Time) (int, error) {
 	docs, _, err := r.repo.List(ctx, ports.ListFilter{
 		Status: domain.StatusCompleted,
 		Limit:  200,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("list completed for retention: %w", err)
+	}
+
+	fixed := 0
+	for _, doc := range docs {
+		if !doc.RetentionAt.IsZero() {
+			continue
+		}
+		ok, err := r.repo.UpdateStatus(ctx, doc.ID,
+			domain.StatusCompleted, domain.StatusCompleted,
+			map[string]any{"retention_at": now.Add(r.terminalRetention)},
+		)
+		if err != nil {
+			slog.Warn("reconciler: no se pudo fijar retención terminal",
+				"document_id", doc.ID, "error", err)
+			continue
+		}
+		if ok {
+			fixed++
+		}
+	}
+	return fixed, nil
+}
+
+// sweepCompletedMissingMd detecta documentos COMPLETED cuyo .md no existe en MinIO (S5-P2-03).// Solo detecta y alerta: no transiciona automáticamente (eso es trabajo del operador).
+// Respeta el umbral de seguridad.
+func (r *Reconciler) sweepCompletedMissingMd(ctx context.Context, now time.Time) (int, error) {
+	// S9: se limita la página a 50 HEADs por corrida. Con 200 por sweep el
+	// barrido saturaba MinIO y consumía el presupuesto del breaker compartido,
+	// devolviendo 500 en POST /api/v2/documents durante ~30 s.
+	docs, _, err := r.repo.List(ctx, ports.ListFilter{
+		Status: domain.StatusCompleted,
+		Limit:  50,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("list completed: %w", err)
