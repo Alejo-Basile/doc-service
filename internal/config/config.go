@@ -51,14 +51,14 @@ type Config struct {
 	InternalToken string
 
 	// Reglas de negocio
-	MaxPDFBytes         int64
-	PresignUploadTTL    time.Duration
-	PresignDownloadTTL  time.Duration
-	ReconcileInterval   time.Duration
-	ReconcileStuckAfter time.Duration
-	DocUploadGrace        time.Duration
-	DocPendingRetention   time.Duration
-	DocTerminalRetention  time.Duration
+	MaxPDFBytes          int64
+	PresignUploadTTL     time.Duration
+	PresignDownloadTTL   time.Duration
+	ReconcileInterval    time.Duration
+	ReconcileStuckAfter  time.Duration
+	DocUploadGrace       time.Duration
+	DocPendingRetention  time.Duration
+	DocTerminalRetention time.Duration
 	// MinSafetyAge es la edad mínima antes de que el reconciliador toque un documento (S6-P2-02).
 	// Documentos más jóvenes que esto nunca son alterados bajo ninguna condición.
 	MinSafetyAge time.Duration
