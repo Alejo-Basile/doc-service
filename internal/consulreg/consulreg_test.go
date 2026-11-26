@@ -170,9 +170,9 @@ func TestRegisterTransportError(t *testing.T) {
 	}
 }
 
-// TestAddressProbeFallback asserts a failing probe degrades to the hostname
-// instead of leaving Address empty.
-func TestAddressProbeFallback(t *testing.T) {
+// TestAddressProbeFailureReturnsError asserts a failing probe surfaces an
+// error instead of publishing the hostname or an arbitrary interface.
+func TestAddressProbeFailureReturnsError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -181,8 +181,129 @@ func TestAddressProbeFallback(t *testing.T) {
 	r := newTestRegistrar(t, srv, func(c *Config) {
 		c.AddressProbe = func(string) (string, error) { return "", errors.New("sin interfaz") }
 	})
-	if got := r.Address(); got != hostname() {
-		t.Fatalf("Address = %q, se esperaba el hostname %q", got, hostname())
+	if got, err := r.Address(); err == nil || got != "" {
+		t.Fatalf("Address = %q, err = %v; se esperaba error", got, err)
+	}
+}
+
+// TestAddressEmptyProbeReturnsError asserts a probe that succeeds without an
+// address is treated as a failure, not as an empty registration address.
+func TestAddressEmptyProbeReturnsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	r := newTestRegistrar(t, srv, func(c *Config) {
+		c.AddressProbe = func(string) (string, error) { return "", nil }
+	})
+	if got, err := r.Address(); err == nil || got != "" {
+		t.Fatalf("Address = %q, err = %v; se esperaba error", got, err)
+	}
+}
+
+// TestAddressNotCachedOnFailure asserts a failed resolution is retried on the
+// next call, so a Consul agent that resolves later still yields its interface.
+func TestAddressNotCachedOnFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	probes := 0
+	r := newTestRegistrar(t, srv, func(c *Config) {
+		c.AddressProbe = func(string) (string, error) {
+			probes++
+			if probes == 1 {
+				return "", errors.New("dns no listo")
+			}
+			return "172.24.0.9", nil
+		}
+	})
+
+	if _, err := r.Address(); err == nil {
+		t.Fatal("el primer Address() debía fallar")
+	}
+	got, err := r.Address()
+	if err != nil || got != "172.24.0.9" {
+		t.Fatalf("segundo Address() = %q, err = %v; se esperaba 172.24.0.9", got, err)
+	}
+	if probes != 2 {
+		t.Fatalf("probe llamado %d veces, se esperaban 2", probes)
+	}
+	if _, err := r.Address(); err != nil {
+		t.Fatalf("Address() tras resolver: %v", err)
+	}
+	if probes != 2 {
+		t.Fatalf("el éxito debía cachearse; probe llamado %d veces", probes)
+	}
+}
+
+// TestServiceAddrSkipsProbe asserts an explicit address wins and the probe is
+// never consulted.
+func TestServiceAddrSkipsProbe(t *testing.T) {
+	var body registerPayload
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("payload no decodificable: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	probes := 0
+	r := newTestRegistrar(t, srv, func(c *Config) {
+		c.ServiceAddr = "10.9.8.7"
+		c.AddressProbe = func(string) (string, error) {
+			probes++
+			return "", errors.New("el probe no debía llamarse")
+		}
+	})
+	if err := r.Register(context.Background()); err != nil {
+		t.Fatalf("Register devolvió error: %v", err)
+	}
+	if probes != 0 {
+		t.Fatalf("probe llamado %d veces con ServiceAddr definido", probes)
+	}
+	if body.Address != "10.9.8.7" {
+		t.Fatalf("Address = %q, se esperaba 10.9.8.7", body.Address)
+	}
+	if body.Check.HTTP != "http://10.9.8.7:8080/healthz" {
+		t.Fatalf("Check.HTTP = %q", body.Check.HTTP)
+	}
+}
+
+// TestRegisterUnresolvedAddressDoesNotRegister asserts an unresolved address
+// fails the registration instead of publishing a wrong one; the retry loop is
+// the mechanism that keeps trying once the agent is resolvable.
+func TestRegisterUnresolvedAddressDoesNotRegister(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	r := newTestRegistrar(t, srv, func(c *Config) {
+		c.AddressProbe = func(string) (string, error) { return "", errors.New("agente no resoluble") }
+	})
+	if err := r.Register(context.Background()); err == nil {
+		t.Fatal("Register con dirección irresoluble devolvió nil")
+	}
+	if calls != 0 {
+		t.Fatalf("se enviaron %d registros con dirección irresoluble", calls)
+	}
+}
+
+// TestNewFromEnvServiceAddr asserts CONSUL_SERVICE_ADDR is read from the
+// environment and used without a network probe.
+func TestNewFromEnvServiceAddr(t *testing.T) {
+	t.Setenv("CONSUL_SERVICE_ADDR", " 172.24.0.10 ")
+
+	r := NewFromEnv(8080)
+	got, err := r.Address()
+	if err != nil || got != "172.24.0.10" {
+		t.Fatalf("Address() = %q, err = %v; se esperaba 172.24.0.10", got, err)
 	}
 }
 

@@ -64,6 +64,7 @@ const (
 type Config struct {
 	ServiceName  string
 	AgentAddr    string
+	ServiceAddr  string
 	HTTPPort     int
 	Disabled     bool
 	AddressProbe func(target string) (string, error)
@@ -141,6 +142,7 @@ func NewFromEnv(httpPort int) *Registrar {
 	return New(Config{
 		ServiceName:   serviceName,
 		AgentAddr:     agentAddr,
+		ServiceAddr:   strings.TrimSpace(os.Getenv("CONSUL_SERVICE_ADDR")),
 		HTTPPort:      httpPort,
 		Disabled:      os.Getenv("CONSUL_REGISTRATION_DISABLED") == "true",
 		ReassertEvery: reassertEvery,
@@ -157,20 +159,27 @@ func (r *Registrar) ID() string { return r.id }
 // (rollback de la tarea, §9).
 func (r *Registrar) Enabled() bool { return !r.cfg.Disabled }
 
-// Address devuelve la dirección publicada, resolviéndola una sola vez.
-func (r *Registrar) Address() string {
+// Address devuelve la dirección publicada. Si Config.ServiceAddr está definido
+// se usa verbatim y nunca se llama al probe. De lo contrario se resuelve con el
+// probe y se cachea solo cuando tiene éxito.
+func (r *Registrar) Address() (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.address == "" {
-		addr, err := r.cfg.AddressProbe(r.cfg.AgentAddr)
-		if err != nil || addr == "" {
-			// Último recurso: el hostname. Puede no resolver desde el agente,
-			// pero es preferible a no publicar nada.
-			addr = hostname()
-		}
-		r.address = addr
+	if r.cfg.ServiceAddr != "" {
+		return r.cfg.ServiceAddr, nil
 	}
-	return r.address
+	if r.address != "" {
+		return r.address, nil
+	}
+	addr, err := r.cfg.AddressProbe(r.cfg.AgentAddr)
+	if err != nil {
+		return "", fmt.Errorf("consul register: no se pudo resolver la dirección: %w", err)
+	}
+	if strings.TrimSpace(addr) == "" {
+		return "", fmt.Errorf("consul register: el probe no devolvió una dirección")
+	}
+	r.address = strings.TrimSpace(addr)
+	return r.address, nil
 }
 
 // registerPayload es el body de PUT /v1/agent/service/register. Los nombres
@@ -192,8 +201,11 @@ type check struct {
 }
 
 // payload arma el objeto de registro de esta réplica.
-func (r *Registrar) payload() registerPayload {
-	addr := r.Address()
+func (r *Registrar) payload() (registerPayload, error) {
+	addr, err := r.Address()
+	if err != nil {
+		return registerPayload{}, err
+	}
 	return registerPayload{
 		ID:      r.id,
 		Name:    "svc-" + r.cfg.ServiceName,
@@ -206,7 +218,7 @@ func (r *Registrar) payload() registerPayload {
 			Timeout:                        checkTimeout,
 			DeregisterCriticalServiceAfter: checkDeregister,
 		},
-	}
+	}, nil
 }
 
 // Register publica la réplica. Un fallo no aborta el arranque: el llamador
@@ -215,7 +227,12 @@ func (r *Registrar) Register(ctx context.Context) error {
 	if !r.Enabled() {
 		return nil
 	}
-	body, err := json.Marshal(r.payload())
+	p, err := r.payload()
+	if err != nil {
+		metrics.ConsulRegistrationFailed.Inc()
+		return err
+	}
+	body, err := json.Marshal(p)
 	if err != nil {
 		return fmt.Errorf("consul register: marshal payload: %w", err)
 	}
@@ -251,17 +268,19 @@ func (r *Registrar) registerWithRetry(ctx context.Context, quiet bool) {
 		err := r.Register(attemptCtx)
 		cancel()
 		if err == nil {
+			addr, _ := r.Address()
 			if quiet {
 				slog.Debug("re-registrado en Consul",
-					"id", r.ID(), "address", r.Address(), "port", r.cfg.HTTPPort)
+					"id", r.ID(), "address", addr, "port", r.cfg.HTTPPort)
 			} else {
 				slog.Info("registrado en Consul",
-					"id", r.ID(), "address", r.Address(), "port", r.cfg.HTTPPort)
+					"id", r.ID(), "address", addr, "port", r.cfg.HTTPPort)
 			}
 			return
 		}
+		addr, _ := r.Address()
 		slog.Warn("registro en Consul fallido, el servicio sigue operando y se reintentará",
-			"id", r.ID(), "address", r.Address(), "error", err.Error(), "retry_in", backoff.String())
+			"id", r.ID(), "address", addr, "error", err.Error(), "retry_in", backoff.String())
 		select {
 		case <-ctx.Done():
 			return
@@ -336,17 +355,23 @@ func hostname() string {
 // contra un nombre irresoluble quedaría crítico para siempre.
 func deriveLocalAddress(target string) (string, error) {
 	host := hostFromAddr(target)
-	// Dial UDP: fija la ruta de salida sin enviar paquetes ni esperar
-	// handshake; LocalAddr es la IP de la interfaz que alcanza al agente.
-	conn, err := net.Dial("udp", net.JoinHostPort(host, agentProbePort))
-	if err == nil {
-		defer conn.Close()
-		if udpAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok &&
-			udpAddr.IP != nil && !udpAddr.IP.IsLoopback() {
-			return udpAddr.IP.String(), nil
-		}
+	port := agentProbePort
+	if u, err := url.Parse(target); err == nil && u.Port() != "" {
+		port = u.Port()
 	}
-	return firstGlobalIPv4()
+	if port == "" {
+		port = agentProbePort
+	}
+	conn, err := net.Dial("udp", net.JoinHostPort(host, port))
+	if err != nil {
+		return "", fmt.Errorf("consul register: no se pudo resolver la IP local: %w", err)
+	}
+	defer conn.Close()
+	udpAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || udpAddr.IP == nil || udpAddr.IP.IsLoopback() || udpAddr.IP.To4() == nil {
+		return "", fmt.Errorf("consul register: ninguna IPv4 utilizable alcanza al agente")
+	}
+	return udpAddr.IP.String(), nil
 }
 
 // hostFromAddr extrae el host de una dirección de Consul ("https://h:8501").
@@ -362,32 +387,4 @@ func hostFromAddr(raw string) string {
 		return raw[:i]
 	}
 	return raw
-}
-
-// firstGlobalIPv4 es el fallback cuando el dial no puede resolver el destino.
-func firstGlobalIPv4() (string, error) {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return "", err
-	}
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 {
-			continue
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, a := range addrs {
-			ipNet, ok := a.(*net.IPNet)
-			if !ok {
-				continue
-			}
-			ip := ipNet.IP
-			if ip.To4() != nil && !ip.IsLoopback() && ip.IsGlobalUnicast() {
-				return ip.String(), nil
-			}
-		}
-	}
-	return "", fmt.Errorf("consul register: ninguna IPv4 utilizable")
 }
